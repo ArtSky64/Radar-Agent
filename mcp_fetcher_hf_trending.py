@@ -1,0 +1,122 @@
+import asyncio
+import logging
+import os
+import re
+
+from mcp import ClientSession, StdioServerParameters
+from mcp.client.stdio import stdio_client
+from dotenv import load_dotenv
+
+load_dotenv()
+logger = logging.getLogger("hf_trending_fetcher")
+
+HF_TRENDING_MCP_PATH = os.getenv("HF_TRENDING_MCP_PATH", "")
+
+TRENDING_SERVER_PARAMS = StdioServerParameters(
+    command="uv",
+    args=["--directory", HF_TRENDING_MCP_PATH, "run", "main.py"],
+)
+
+_MODEL_LINE_RE = re.compile(
+    r"^(?P<name>\S+)\s+\(Downloads:\s*(?P<downloads>[\d,]+),\s*Likes:\s*(?P<likes>[\d,]+)\)\s*$"
+)
+_TAGS_LINE_RE = re.compile(r"^Tags:\s*(?P<tags>.*)$")
+
+
+def _parse_trending_text(raw_text: str) -> list[dict]:
+    models = []
+    current = None
+
+    for line in raw_text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+
+        model_match = _MODEL_LINE_RE.match(line)
+        if model_match:
+            if current:
+                models.append(current)
+            current = {
+                "name": model_match.group("name"),
+                "downloads": int(model_match.group("downloads").replace(",", "")),
+                "likes": int(model_match.group("likes").replace(",", "")),
+                "tags": [],
+                "url": f"https://huggingface.co/{model_match.group('name')}",
+            }
+            continue
+
+        tags_match = _TAGS_LINE_RE.match(line)
+        if tags_match and current is not None:
+            tags_str = tags_match.group("tags").strip()
+            current["tags"] = [t.strip() for t in tags_str.split(",") if t.strip()]
+
+    if current:
+        models.append(current)
+
+    return models
+
+
+async def _call_get_trending_models(limit: int) -> str:
+    if not HF_TRENDING_MCP_PATH:
+        raise RuntimeError(
+            "HF_TRENDING_MCP_PATH не задан в .env — укажи путь к папке, "
+            "куда склонирован https://github.com/kukapay/hf-trending-mcp"
+        )
+
+    async with stdio_client(TRENDING_SERVER_PARAMS) as (read_stream, write_stream):
+        async with ClientSession(read_stream, write_stream) as session:
+            await session.initialize()
+            response = await session.call_tool("get_trending_models", arguments={"limit": limit})
+            if not response.content:
+                return ""
+            raw = "\n".join(
+                part.text for part in response.content if hasattr(part, "text") and part.text
+            )
+            if response.isError:
+                # Раньше это никак не проверялось: текст ошибки/трейсбека молча
+                # прогонялся через регулярку парсера моделей, не матчился и
+                # превращался в models=[] без единого следа реальной причины.
+                raise RuntimeError(f"MCP-тул get_trending_models вернул ошибку: {raw}")
+            return raw
+
+
+def _enrich_with_summaries(models: list[dict]) -> list[dict]:
+    """
+    Дописывает каждой модели короткое LLM-саммари (по имени + тегам).
+    Отдельная ошибка/рейт-лимит на одной модели не должна ронять всю
+    витрину — если саммари не получилось, оставляем пустую строку,
+    остальные поля (downloads/likes/tags) при этом сохраняются как есть.
+    """
+
+    from agent_manager import summarize_trending_model, AnalysisError
+
+    for model in models:
+        try:
+            model["summary"] = summarize_trending_model(model["name"], model.get("tags", []))
+        except AnalysisError as e:
+            logger.warning(f"Саммари для модели '{model['name']}' не получено: {e}")
+            model["summary"] = ""
+    return models
+
+
+def fetch_trending_models(limit: int = 30) -> list[dict]:
+    try:
+        raw_text = asyncio.run(_call_get_trending_models(limit))
+    except Exception as e:
+        logger.error(f"Не удалось получить трендовые модели HF: {e!r}")
+        return []
+
+    if not raw_text:
+        return []
+
+    models = _parse_trending_text(raw_text)
+    return _enrich_with_summaries(models)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    print("ТЕСТОВЫЙ ЗАПУСК: трендовые модели HF")
+    result = fetch_trending_models(5)
+    print(f"Получено: {len(result)}\n")
+    for m in result:
+        print(m)

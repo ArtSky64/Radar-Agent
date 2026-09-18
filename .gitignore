@@ -1,0 +1,12 @@
+.venv/
+venv/
+__pycache__/
+*.pyc
+.env
+app.log
+errors.log
+*.db
+data/
+.embeddings_cache/
+run_all.pid
+hf-trending-mcp/
