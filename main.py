@@ -5,11 +5,11 @@ import numpy as np
 import config
 from dedup import text_to_vector, is_duplicate
 from agent_manager import analyze_article, AnalysisError
-from database import init_db, get_all_vectors, save_vector, save_article, delete_old_vectors, save_trending_models
+from database import init_db, get_all_vectors, save_vector, save_article, delete_old_vectors, save_trending_models, upsert_related_material
 from FetcherHF import stream_hf_articles
 from FetcherHFDatasets import stream_hf_datasets
 from mcp_fetcher_kaggle import stream_kaggle_articles
-from mcp_fetcher_arxiv import stream_arxiv_articles
+from mcp_fetcher_papers import stream_papers_articles
 from github_fetcher import stream_github_articles
 from mcp_fetcher_hf_trending import fetch_trending_models
 import arena_scraper
@@ -96,9 +96,9 @@ def stream_all_new_articles():
             logger.error(f"Источник Hugging Face (датасеты, запрос='{query}') недоступен: {e}")
 
     try:
-        yield from _tag_source_type(stream_arxiv_articles("large language models"), "статья")
+        yield from _tag_source_type(stream_papers_articles(), "статья")
     except Exception as e:
-        logger.error(f"Источник arXiv недоступен: {e}")
+        logger.error(f"Источник Papers (HF + PwC) недоступен: {e}")
 
     try:
         yield from _tag_source_type(stream_github_articles(), "репозиторий")
@@ -201,12 +201,22 @@ def main():
             "source_url": source_url,
             "tags": analysis.tags,  # список строк — database.py сам делает json.dumps
             "source_type": article.get("source_type", "статья"),
-            # Заполнено только у HF-датасетов (см. FetcherHFDatasets.py),
-            # у остальных источников остаётся пустой строкой
+            # Заполнено у HF-датасетов, тематических срезов и периодов
             "language": article.get("language", ""),
+            "topic_tag": article.get("topic_tag", ""),
+            "related_links": article.get("related_links", []),
+            "source_article_url": article.get("source_article_url", ""),
+            "period": article.get("period", ""),
         }
         save_article(payload)
         processed += 1
+
+        # ТЗ 1.3: Связанные датасеты/модели из карточки статьи
+        for material in article.get("related_materials", []):
+            try:
+                upsert_related_material(material, source_article_url=source_url)
+            except Exception as upsert_err:
+                logger.warning(f"Не удалось сохранить связанный материал {material}: {upsert_err}")
 
         # 8. КРИТИЧЕСКИЙ ШАГ: пополняем memory_vectors,
         #    чтобы следующие статьи в этом же цикле сравнивались

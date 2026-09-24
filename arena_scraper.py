@@ -3,10 +3,13 @@ import json
 import logging
 import time
 import random
-from playwright.sync_api import sync_playwright
+from collections import defaultdict
+try:
+    from playwright.sync_api import sync_playwright
+except ImportError:
+    sync_playwright = None
 
 from database import init_db, save_leaderboard_data
-from leaderboard_analyzer import run_leaderboard_analysis
 
 logger = logging.getLogger("arena_scraper")
 
@@ -132,27 +135,37 @@ def collect_all_categories(category_urls):
     fetched_at = datetime.datetime.now().isoformat()
     all_data = {}
 
+    if sync_playwright is None:
+        raise RuntimeError("Playwright не установлен в окружении. Запустите: pip install playwright && playwright install chromium")
+
     with sync_playwright() as playwright:
-        # 1. Запуск браузера с нативными аргументами маскировки автоматизации
+        # 1. Запуск браузера с нативными аргументами маскировки автоматизации.
+        # ВАЖНО: channel="chromium" НЕ указываем — на Linux-серверах нет системного
+        # Chrome/Chromium, установленного через channel, и Playwright падает с
+        # "No such file or directory" ещё до первого goto(), что убивает всю сессию.
+        # Встроенный Playwright Chromium (bundled) работает везде одинаково.
         browser = playwright.chromium.launch(
             headless=True,
-            channel="chromium",  # настоящий установленный Chrome, а не bundled Chromium —
-                                # Cloudflare куда охотнее банит именно голый Chromium
             args=[
-                "--disable-blink-features=AutomationControlled",  # Отключает главный маркер робота navigator.webdriver
+                "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
                 "--disable-infobars",
-                "--window-position=0,0",
-                "--ignore-certificate-errors"
+                "--window-size=1920,1080",
+                "--ignore-certificate-errors",
+                "--disable-gpu",
             ]
         )
 
         # 2. Создаем контекст с реальными параметрами пользователя (User-Agent, Язык, Экран)
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
             viewport={"width": 1920, "height": 1080},
-            locale="ru-RU",
-            timezone_id="Europe/Moscow"
+            locale="en-US",
+            timezone_id="America/New_York",
+            java_script_enabled=True,
+            accept_downloads=False,
         )
         page = context.new_page()
 
@@ -193,7 +206,17 @@ def collect_all_categories(category_urls):
             };
         """)
 
-        # 4. Обход ссылок в рамках единой сессии
+        # 4. Прогревочный визит на главную страницу арены.
+        # Cloudflare устанавливает куки при первом запросе — если сразу идти на
+        # /leaderboard/*, сессия не прогрета и соединение сбрасывается.
+        # Пауза перед первой категорией имитирует живого пользователя.
+        try:
+            page.goto("https://arena.ai", wait_until="domcontentloaded", timeout=30000)
+            time.sleep(random.uniform(2.0, 4.0))
+        except Exception:
+            pass  # не критично — продолжаем
+
+        # 5. Обход ссылок в рамках единой сессии
         for category, url in category_urls.items():
             print(f"\n--- Собираем данные для категории: {category} ---")
 
@@ -258,7 +281,11 @@ def save_to_db(data):
           f"по {len(data['categories'])} категориям (снимок от {data['fetched_at']})")
 
     print("[АНАЛИЗ] Строим инкрементальный анализ (новый снимок + предыдущий + предыдущий анализ)...")
-    run_leaderboard_analysis()
+    try:
+        from leaderboard_analyzer import run_leaderboard_analysis
+        run_leaderboard_analysis()
+    except Exception as e:
+        logger.warning(f"Анализ лидерборда пропущен или завершился ошибкой: {e}")
     print("[АНАЛИЗ] Готово.")
 
 # Единый источник правды для списка категорий арены — раньше этот же словарь
@@ -277,6 +304,100 @@ CATEGORY_URLS = {
     "image-to-video": "https://arena.ai/leaderboard/image-to-video",
     "video-edit": "https://arena.ai/leaderboard/video-edit"
 }
+
+
+def format_cat_plural(n: int) -> str:
+    """Склонение слова 'категория' в русском языке."""
+    if 11 <= n % 100 <= 14:
+        return "категорий"
+    last = n % 10
+    if last == 1:
+        return "категория"
+    if 2 <= last <= 4:
+        return "категории"
+    return "категорий"
+
+
+def aggregate_all_categories(records: list[dict], method: str = "avg") -> list[dict]:
+    """
+    ТЗ Блок 5 (фидбек п.5): Агрегация «Все категории» лидерборда Arena.
+    Устраняет баг plain-конкатенации, при котором одна и та же модель выводилась N раз
+    с несопоставимыми Elo-рейтингами из разных категорий.
+
+    Группирует записи по model_name и вычисляет:
+    - Вариант A (method='avg', рекомендуется): средний рейтинг avg(rating) по категориям модели.
+    - Вариант B (method='max'): максимальный рейтинг max(rating) + категория-источник.
+
+    :param records: список словарей с ключами model_name, category, rating
+    :param method: 'avg' (среднее) или 'max' (максимум)
+    :return: отсортированный по убыванию rating список агрегированных моделей
+    """
+    by_model = defaultdict(list)
+    for r in records:
+        name = (r.get("model_name") or "").strip()
+        if name:
+            by_model[name].append(r)
+
+    aggregated = []
+    for name, rows in by_model.items():
+        valid_ratings = []
+        for r in rows:
+            val = r.get("rating")
+            if isinstance(val, (int, float)):
+                valid_ratings.append(float(val))
+            elif isinstance(val, str):
+                cleaned = val.replace("%", "").strip()
+                try:
+                    valid_ratings.append(float(cleaned))
+                except ValueError:
+                    pass
+
+        if not valid_ratings:
+            avg_rating = 0.0
+            max_rating = 0.0
+            best_cat = rows[0].get("category", "")
+        else:
+            avg_rating = round(sum(valid_ratings) / len(valid_ratings), 1)
+
+            def _get_sortable_rating(row):
+                v = row.get("rating")
+                if isinstance(v, (int, float)):
+                    return float(v)
+                if isinstance(v, str):
+                    try:
+                        return float(v.replace("%", "").strip())
+                    except ValueError:
+                        return -1.0
+                return -1.0
+
+            best_row = max(rows, key=_get_sortable_rating)
+            max_rating = _get_sortable_rating(best_row)
+            best_cat = best_row.get("category", "")
+
+        cats = sorted(set(r.get("category", "") for r in rows if r.get("category")))
+        num_cats = len(cats)
+        cats_str = ", ".join(c.upper() for c in cats)
+
+        if method == "max":
+            chosen_rating = max_rating
+            cat_label = f"МАКС: {best_cat.upper()} ({num_cats} {format_cat_plural(num_cats)}: {cats_str})"
+        else:
+            chosen_rating = avg_rating
+            cat_label = f"{num_cats} {format_cat_plural(num_cats)}: {cats_str}"
+
+        aggregated.append({
+            "model_name": name,
+            "rating": chosen_rating,
+            "categories": cats,
+            "category": cat_label,
+            "num_categories": num_cats,
+            "avg_rating": avg_rating,
+            "max_rating": max_rating,
+            "best_category": best_cat,
+            "fetched_at": rows[0].get("fetched_at"),
+        })
+
+    return sorted(aggregated, key=lambda x: x["rating"], reverse=True)
 
 
 def main():

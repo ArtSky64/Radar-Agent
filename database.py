@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import json
 from datetime import datetime, timedelta
@@ -10,6 +11,9 @@ DB_NAME = config.DB_NAME
 
 @contextmanager
 def get_connection():
+    db_dir = os.path.dirname(os.path.abspath(DB_NAME))
+    if db_dir:
+        os.makedirs(db_dir, exist_ok=True)
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
     try:
@@ -36,19 +40,28 @@ def init_db():
             tags TEXT NOT NULL,
             source_type TEXT NOT NULL DEFAULT 'статья',
             language TEXT NOT NULL DEFAULT '',
+            topic_tag TEXT NOT NULL DEFAULT '',
+            related_links TEXT NOT NULL DEFAULT '',
+            source_article_url TEXT NOT NULL DEFAULT '',
+            period TEXT NOT NULL DEFAULT '',
             added_at TEXT DEFAULT CURRENT_TIMESTAMP
         );""")
 
-        # Миграция для БД, созданных до появления source_type/language — CREATE
+        # Миграция для БД, созданных до появления новых колонок — CREATE
         # TABLE IF NOT EXISTS не добавит колонку в уже существующую таблицу.
         existing_cols = {row['name'] for row in cursor.execute("PRAGMA table_info(articles)")}
         if 'source_type' not in existing_cols:
             cursor.execute("ALTER TABLE articles ADD COLUMN source_type TEXT NOT NULL DEFAULT 'статья'")
         if 'language' not in existing_cols:
-            # Сейчас реально заполняется только для HF-датасетов (см.
-            # FetcherHFDatasets.py) — используется для фильтра по языку
-            # во вкладке "Датасеты". Для остальных типов остаётся пустым.
             cursor.execute("ALTER TABLE articles ADD COLUMN language TEXT NOT NULL DEFAULT ''")
+        if 'topic_tag' not in existing_cols:
+            cursor.execute("ALTER TABLE articles ADD COLUMN topic_tag TEXT NOT NULL DEFAULT ''")
+        if 'related_links' not in existing_cols:
+            cursor.execute("ALTER TABLE articles ADD COLUMN related_links TEXT NOT NULL DEFAULT ''")
+        if 'source_article_url' not in existing_cols:
+            cursor.execute("ALTER TABLE articles ADD COLUMN source_article_url TEXT NOT NULL DEFAULT ''")
+        if 'period' not in existing_cols:
+            cursor.execute("ALTER TABLE articles ADD COLUMN period TEXT NOT NULL DEFAULT ''")
         cursor.execute('''CREATE TABLE IF NOT EXISTS leaderboard (
             category TEXT NOT NULL,
             model_name TEXT NOT NULL,
@@ -100,18 +113,84 @@ def save_article(article: dict) -> None:
     # source_type: 'статья' | 'модель' | 'датасет' | 'репозиторий' — проставляется
     # фетчером через main.py (_tag_source_type). Если источник его не передал,
     # по умолчанию считаем это обычной статьёй, чтобы не сломать старые вызовы.
+    related_links = article.get('related_links', '')
+    if isinstance(related_links, (list, dict)):
+        related_links = json.dumps(related_links, ensure_ascii=False)
+
+    tags = article.get('tags', [])
+    if isinstance(tags, (list, dict)):
+        tags_str = json.dumps(tags, ensure_ascii=False)
+    else:
+        tags_str = str(tags)
+
     with get_connection() as conn:
         conn.execute('''
-            INSERT INTO articles (title, summary, source_url, tags, source_type, language)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO articles (
+                title, summary, source_url, tags, source_type, language,
+                topic_tag, related_links, source_article_url, period
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             article['title'],
-            article['summary'],
+            article.get('summary', ''),
             article['source_url'],
-            json.dumps(article['tags']),
+            tags_str,
             article.get('source_type', 'статья'),
             article.get('language', ''),
+            article.get('topic_tag', ''),
+            related_links,
+            article.get('source_article_url', ''),
+            article.get('period', ''),
         ))
+
+
+def upsert_related_material(material: dict, source_article_url: str) -> None:
+    """
+    ТЗ 1.3: Связанные датасеты/модели из карточки статьи.
+    Если модели/датасета ещё нет в БД — вставляем;
+    если есть — добавляем source_article_url к записи.
+    """
+    name = material.get('name') or material.get('title') or ''
+    source_url = material.get('url') or material.get('source_url') or ''
+    source_type = material.get('type') or material.get('source_type') or 'модель'
+    summary = material.get('summary', f"Связанный материал к статье: {source_article_url}")
+
+    if not source_url and not name:
+        return
+
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "SELECT rowid, source_article_url FROM articles WHERE (source_url != '' AND source_url = ?) OR (title = ? AND source_type = ?)",
+            (source_url, name, source_type)
+        )
+        row = cursor.fetchone()
+        if row:
+            curr_source = row['source_article_url'] or ''
+            if source_article_url and source_article_url not in curr_source:
+                new_source = f"{curr_source}, {source_article_url}".strip(", ")
+                conn.execute(
+                    "UPDATE articles SET source_article_url = ? WHERE rowid = ?",
+                    (new_source, row['rowid'])
+                )
+        else:
+            conn.execute('''
+                INSERT INTO articles (
+                    title, summary, source_url, tags, source_type, language,
+                    topic_tag, related_links, source_article_url, period
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                name,
+                summary,
+                source_url,
+                json.dumps([source_type], ensure_ascii=False),
+                source_type,
+                '',
+                '',
+                '',
+                source_article_url,
+                '',
+            ))
 
 
 def get_all_articles() -> list[dict]:
@@ -123,9 +202,18 @@ def get_all_articles() -> list[dict]:
         articles = []
         for row in cursor:
             article = dict(row)
-            article['tags'] = json.loads(article['tags'])
+            try:
+                article['tags'] = json.loads(article['tags'])
+            except Exception:
+                pass
+            if 'related_links' in article and article['related_links']:
+                try:
+                    article['related_links'] = json.loads(article['related_links'])
+                except Exception:
+                    pass
             articles.append(article)
         return articles
+
 
 
 def clear_articles() -> None:

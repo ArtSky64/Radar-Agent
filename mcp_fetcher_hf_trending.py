@@ -1,21 +1,17 @@
 import asyncio
+import json
 import logging
 import os
 import re
+import ssl
+import urllib.request
+import urllib.parse
 
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
-from dotenv import load_dotenv
-
-load_dotenv()
 logger = logging.getLogger("hf_trending_fetcher")
 
-HF_TRENDING_MCP_PATH = os.getenv("HF_TRENDING_MCP_PATH", "")
-
-TRENDING_SERVER_PARAMS = StdioServerParameters(
-    command="uv",
-    args=["--directory", HF_TRENDING_MCP_PATH, "run", "main.py"],
-)
+# ==========================================
+# ЧАСТЬ 1: MCP stdio (локальный сервер)
+# ==========================================
 
 _MODEL_LINE_RE = re.compile(
     r"^(?P<name>\S+)\s+\(Downloads:\s*(?P<downloads>[\d,]+),\s*Likes:\s*(?P<likes>[\d,]+)\)\s*$"
@@ -56,14 +52,24 @@ def _parse_trending_text(raw_text: str) -> list[dict]:
     return models
 
 
-async def _call_get_trending_models(limit: int) -> str:
-    if not HF_TRENDING_MCP_PATH:
-        raise RuntimeError(
-            "HF_TRENDING_MCP_PATH не задан в .env — укажи путь к папке, "
-            "куда склонирован https://github.com/kukapay/hf-trending-mcp"
-        )
+async def _call_mcp_stdio(limit: int) -> str:
+    """Пробуем локальный MCP stdio-сервер (hf-trending-mcp через uv)."""
+    from dotenv import load_dotenv
+    load_dotenv()
 
-    async with stdio_client(TRENDING_SERVER_PARAMS) as (read_stream, write_stream):
+    HF_TRENDING_MCP_PATH = os.getenv("HF_TRENDING_MCP_PATH", "")
+    if not HF_TRENDING_MCP_PATH:
+        raise RuntimeError("HF_TRENDING_MCP_PATH не задан в .env")
+
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+
+    params = StdioServerParameters(
+        command="uv",
+        args=["--directory", HF_TRENDING_MCP_PATH, "run", "main.py"],
+    )
+
+    async with stdio_client(params) as (read_stream, write_stream):
         async with ClientSession(read_stream, write_stream) as session:
             await session.initialize()
             response = await session.call_tool("get_trending_models", arguments={"limit": limit})
@@ -73,21 +79,89 @@ async def _call_get_trending_models(limit: int) -> str:
                 part.text for part in response.content if hasattr(part, "text") and part.text
             )
             if response.isError:
-                # Раньше это никак не проверялось: текст ошибки/трейсбека молча
-                # прогонялся через регулярку парсера моделей, не матчился и
-                # превращался в models=[] без единого следа реальной причины.
                 raise RuntimeError(f"MCP-тул get_trending_models вернул ошибку: {raw}")
             return raw
 
+
+# ==========================================
+# ЧАСТЬ 2: Прямой HTTP fallback через HF API
+# ==========================================
+
+def _http_get_json(url: str, timeout: int = 20) -> dict | list | None:
+    """Простой GET-запрос с SSL-фолбэком."""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (compatible; agent-pipeline/1.0)",
+        "Accept": "application/json",
+    }
+    req = urllib.request.Request(url, headers=headers)
+    last_exc = None
+    for verify_ssl in (True, False):
+        try:
+            ctx = ssl.create_default_context() if verify_ssl else ssl._create_unverified_context()
+            with urllib.request.urlopen(req, context=ctx, timeout=timeout) as resp:
+                return json.loads(resp.read().decode())
+        except Exception as e:
+            last_exc = e
+            continue  # пробуем без верификации
+    logger.debug(f"_http_get_json({url}) failed: {last_exc!r}")
+    raise last_exc
+
+
+
+def _fetch_hf_api_trending(limit: int) -> list[dict]:
+    """
+    Фолбэк: получаем трендовые модели напрямую через HF Hub REST API.
+    https://huggingface.co/api/models?sort=trendingScore&direction=-1&limit=N
+    """
+    url = (
+        "https://huggingface.co/api/models?"
+        + urllib.parse.urlencode({
+            "sort": "trendingScore",
+            "direction": "-1",
+            "limit": str(limit),
+        })
+    )
+    try:
+        data = _http_get_json(url)
+    except Exception as e:
+        logger.error(f"HF API /api/models trending запрос провалился: {e!r}")
+        return []
+
+    if not data or not isinstance(data, list):
+        return []
+
+    result = []
+    for item in data:
+        name = item.get("id") or item.get("modelId") or ""
+        if not name:
+            continue
+        downloads = item.get("downloads") or 0
+        likes = item.get("likes") or 0
+        tags = item.get("tags") or []
+        if isinstance(tags, str):
+            tags = [t.strip() for t in tags.split(",") if t.strip()]
+        result.append({
+            "name": name,
+            "downloads": int(downloads),
+            "likes": int(likes),
+            "tags": tags[:10],  # обрезаем длинные списки тегов
+            "url": f"https://huggingface.co/{name}",
+        })
+
+    return result
+
+
+
+# ==========================================
+# ЧАСТЬ 3: Обогащение LLM-саммари
+# ==========================================
 
 def _enrich_with_summaries(models: list[dict]) -> list[dict]:
     """
     Дописывает каждой модели короткое LLM-саммари (по имени + тегам).
     Отдельная ошибка/рейт-лимит на одной модели не должна ронять всю
-    витрину — если саммари не получилось, оставляем пустую строку,
-    остальные поля (downloads/likes/tags) при этом сохраняются как есть.
+    витрину — если саммари не получилось, оставляем пустую строку.
     """
-
     from agent_manager import summarize_trending_model, AnalysisError
 
     for model in models:
@@ -99,17 +173,38 @@ def _enrich_with_summaries(models: list[dict]) -> list[dict]:
     return models
 
 
+# ==========================================
+# ЧАСТЬ 4: Публичный entry-point
+# ==========================================
+
 def fetch_trending_models(limit: int = 30) -> list[dict]:
+    """
+    1. Пробуем локальный MCP stdio-сервер (если HF_TRENDING_MCP_PATH задан).
+    2. При любой ошибке MCP — фолбэк через HF Hub REST API напрямую.
+    3. Обогащаем оба результата LLM-саммари.
+    """
+    models = []
+    mcp_ok = False
+
     try:
-        raw_text = asyncio.run(_call_get_trending_models(limit))
+        raw_text = asyncio.run(_call_mcp_stdio(limit))
+        if raw_text:
+            models = _parse_trending_text(raw_text)
+            mcp_ok = True
     except Exception as e:
-        logger.error(f"Не удалось получить трендовые модели HF: {e!r}")
-        return []
+        logger.warning(
+            f"Не удалось получить трендовые модели HF через MCP: {e!r}. "
+            "Переключаемся на прямой HF API."
+        )
 
-    if not raw_text:
-        return []
+    if not mcp_ok or not models:
+        logger.info("Сбор трендовых моделей HF через прямой REST API...")
+        models = _fetch_hf_api_trending(limit)
+        if not models:
+            logger.info("Трендовые модели HF не получены (пусто или HF API недоступен).")
+            return []
+        logger.info(f"HF API вернул {len(models)} трендовых моделей.")
 
-    models = _parse_trending_text(raw_text)
     return _enrich_with_summaries(models)
 
 

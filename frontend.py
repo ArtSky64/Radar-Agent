@@ -1,6 +1,7 @@
 # для запуска: uvicorn app:app --reload (бэкенд), затем python -m streamlit run frontend.py (фронтенд)
 
 import os
+from collections import defaultdict
 import streamlit as st
 import requests
 
@@ -149,9 +150,107 @@ def fetch_data(endpoint):
         return {"status": "connect_error", "data": []}
 
 
+def format_cat_plural(n: int) -> str:
+    """Склонение слова 'категория' в русском языке."""
+    if 11 <= n % 100 <= 14:
+        return "категорий"
+    last = n % 10
+    if last == 1:
+        return "категория"
+    if 2 <= last <= 4:
+        return "категории"
+    return "категорий"
+
+
+def aggregate_all_categories(records: list[dict], method: str = "avg") -> list[dict]:
+    """
+    ТЗ Блок 5 (фидбек п.5): Агрегация «Все категории» лидерборда Arena.
+    Устраняет баг plain-конкатенации, при котором одна и та же модель выводилась N раз
+    с несопоставимыми Elo-рейтингами из разных категорий.
+
+    Группирует записи по model_name и вычисляет:
+    - Вариант A (method='avg', рекомендуется): средний рейтинг avg(rating) по категориям модели.
+    - Вариант B (method='max'): максимальный рейтинг max(rating) + категория-источник.
+
+    :param records: список словарей с ключами model_name, category, rating
+    :param method: 'avg' (среднее) или 'max' (максимум)
+    :return: отсортированный по убыванию rating список агрегированных моделей
+    """
+    by_model = defaultdict(list)
+    for r in records:
+        name = (r.get("model_name") or "").strip()
+        if name:
+            by_model[name].append(r)
+
+    aggregated = []
+    for name, rows in by_model.items():
+        valid_ratings = []
+        for r in rows:
+            val = r.get("rating")
+            if isinstance(val, (int, float)):
+                valid_ratings.append(float(val))
+            elif isinstance(val, str):
+                cleaned = val.replace("%", "").strip()
+                try:
+                    valid_ratings.append(float(cleaned))
+                except ValueError:
+                    pass
+
+        if not valid_ratings:
+            avg_rating = 0.0
+            max_rating = 0.0
+            best_cat = rows[0].get("category", "")
+        else:
+            avg_rating = round(sum(valid_ratings) / len(valid_ratings), 1)
+
+            def _get_sortable_rating(row):
+                v = row.get("rating")
+                if isinstance(v, (int, float)):
+                    return float(v)
+                if isinstance(v, str):
+                    try:
+                        return float(v.replace("%", "").strip())
+                    except ValueError:
+                        return -1.0
+                return -1.0
+
+            best_row = max(rows, key=_get_sortable_rating)
+            max_rating = _get_sortable_rating(best_row)
+            best_cat = best_row.get("category", "")
+
+        cats = sorted(set(r.get("category", "") for r in rows if r.get("category")))
+        num_cats = len(cats)
+        cats_str = ", ".join(c.upper() for c in cats)
+
+        if method == "max":
+            chosen_rating = max_rating
+            cat_label = f"МАКС: {best_cat.upper()} ({num_cats} {format_cat_plural(num_cats)}: {cats_str})"
+        else:
+            chosen_rating = avg_rating
+            cat_label = f"{num_cats} {format_cat_plural(num_cats)}: {cats_str}"
+
+        aggregated.append({
+            "model_name": name,
+            "rating": chosen_rating,
+            "categories": cats,
+            "category": cat_label,
+            "num_categories": num_cats,
+            "avg_rating": avg_rating,
+            "max_rating": max_rating,
+            "best_category": best_cat,
+            "fetched_at": rows[0].get("fetched_at"),
+        })
+
+    return sorted(aggregated, key=lambda x: x["rating"], reverse=True)
+
+
 leaderboard_res = fetch_data("leaderboard")
 trending_res = fetch_data("trending/models")
 articles_res = fetch_data("articles")
+analysis_res = fetch_data("leaderboard/analysis")
+
+analysis_list = analysis_res.get("data", []) if analysis_res.get("status") == "success" else []
+latest_analysis = analysis_list[0] if analysis_list else None
 
 # Парсинг реальных данных из бэкенда
 leaderboard_records = []
@@ -192,7 +291,7 @@ for i, art in enumerate(article_list):
 # Меню вкладок
 page = st.radio(
     "Разделы",
-    ["Лидерборд моделей", "Трендовые модели HF", "Статьи", "Модели", "Датасеты", "Репозитории"],
+    ["Лидерборд моделей", "Трендовые модели HF", "Papers (Статьи)", "Модели", "Датасеты", "Репозитории"],
     horizontal=True, label_visibility="collapsed",
 )
 st.divider()
@@ -200,9 +299,9 @@ st.divider()
 # Вкладки, разбитые из бывшей "Базы статей" по source_type — используются
 # и для фильтрации списка article_list, и для сносок-пояснений под заголовком.
 _CONTENT_TABS = {
-    "Статьи": {
+    "Papers (Статьи)": {
         "source_type": "статья",
-        "hint": "Статьи и препринты с arXiv — саммари и теги сгенерированы ИИ-агентом на основе оригинального текста.",
+        "hint": "Научные статьи и препринты из Hugging Face Papers и Papers with Code (PwC) — склеены по arxiv_id, ранжированы по upvotes, саммари и теги сформированы ИИ.",
     },
     "Модели": {
         "source_type": "модель",
@@ -226,6 +325,15 @@ with st.sidebar:
         st.markdown("<h5 style='color:#FFFFFF; margin-bottom:10px;'>Фильтры лидерборда</h5>", unsafe_allow_html=True)
         cats = sorted(list(unique_categories)) if unique_categories else ["Все категории"]
         selected_cat = st.selectbox("Категория", ["Все категории"] + cats)
+
+        agg_method = "avg"
+        if selected_cat == "Все категории":
+            agg_choice = st.radio(
+                "Метод агрегации",
+                ["Средний рейтинг (рекомендуется)", "Максимальный рейтинг"],
+                help="Вариант А (рекомендуется): средний балл Elo по всем категориям модели. Вариант B: максимальный балл в лучшей нише модели.",
+            )
+            agg_method = "avg" if "Средний" in agg_choice else "max"
 
     elif page == "Трендовые модели HF":
         st.markdown("<h5 style='color:#FFFFFF; margin-bottom:10px;'>Фильтры</h5>", unsafe_allow_html=True)
@@ -255,6 +363,24 @@ with st.sidebar:
                     "Язык датасета", available_languages, placeholder="Все языки..."
                 )
 
+        # Фильтры для Papers (Статьи)
+        selected_topics = []
+        selected_paper_source = "Все источники"
+        if page == "Papers (Статьи)":
+            selected_paper_source = st.selectbox(
+                "Источник статей",
+                ["Все источники", "Hugging Face Papers", "Papers with Code"],
+            )
+            available_topics = sorted({
+                a.get("topic_tag", "").strip()
+                for a in article_list
+                if a.get("source_type") == "статья" and a.get("topic_tag")
+            })
+            if available_topics:
+                selected_topics = st.multiselect(
+                    "Тематический срез", available_topics, placeholder="Все темы..."
+                )
+
 # --- ЛОГИКА ОТРЕСОВКИ СТРАНИЦ ---
 
 if page == "Лидерборд моделей":
@@ -264,18 +390,48 @@ if page == "Лидерборд моделей":
         st.write(
             "Рейтинг Elo вычисляется на основе результатов попарных «слепых» тестирований. Пользователи или автоматические бенчмарки оценивают ответы двух анонимных моделей на один и тот же промпт. Если модель побеждает, её рейтинг повышается, а у проигравшей — снижается. Величина изменения рейтинга зависит от разницы их баллов до матча: победа над сильным конкурентом (с высоким Elo) приносит значительно больше баллов, чем победа над слабым.")
 
+    # Вывод ИИ-анализа лидерборда, если доступен
+    if latest_analysis and latest_analysis.get("analysis_text"):
+        with st.expander("Анализ трендов лидерборда (ИИ)", expanded=False):
+            st.markdown(
+                f"<div style='font-size:0.9rem; color:#E4E4E7; white-space:pre-wrap; line-height:1.5;'>"
+                f"{latest_analysis['analysis_text']}"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+
     st.markdown("<div style='margin-top: 1.5rem;'></div>", unsafe_allow_html=True)
 
-    filtered = leaderboard_records
-    if selected_cat != "Все категории":
-        filtered = [r for r in filtered if r["category"] == selected_cat]
+    if selected_cat == "Все категории":
+        filtered = aggregate_all_categories(leaderboard_records, method=agg_method)
+    else:
+        filtered = [r for r in leaderboard_records if r["category"] == selected_cat]
 
     if filtered:
         filtered = sorted(filtered, key=lambda x: x.get("rating", 0), reverse=True)
         for idx, rec in enumerate(filtered):
-            st.markdown(
-                f'<div class="custom-card"><div style="display:flex; justify-content:space-between; align-items:center;"><div><strong style="font-size:1.1rem; color:#FFFFFF;">#{idx + 1} {rec["model_name"]}</strong><div style="font-size:0.8rem; color:#8B5CF6; margin-top:2px;">{rec["category"].upper()}</div></div><div style="font-size:1.2rem; font-weight:700; color:#A78BFA;">{rec["rating"]}</div></div></div>',
-                unsafe_allow_html=True)
+            if selected_cat == "Все категории":
+                cats_badge = rec.get("category", "")
+                sub_label = "avg Elo" if agg_method == "avg" else f"max in {rec.get('best_category', '').upper()}"
+                st.markdown(
+                    f'<div class="custom-card">'
+                    f'<div style="display:flex; justify-content:space-between; align-items:center;">'
+                    f'<div>'
+                    f'<strong style="font-size:1.1rem; color:#FFFFFF;">#{idx + 1} {rec["model_name"]}</strong>'
+                    f'<div style="font-size:0.8rem; color:#8B5CF6; margin-top:2px;">{cats_badge}</div>'
+                    f'</div>'
+                    f'<div style="text-align:right;">'
+                    f'<div style="font-size:1.2rem; font-weight:700; color:#A78BFA;">{rec["rating"]}</div>'
+                    f'<div style="font-size:0.75rem; color:#71717A;">{sub_label}</div>'
+                    f'</div>'
+                    f'</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    f'<div class="custom-card"><div style="display:flex; justify-content:space-between; align-items:center;"><div><strong style="font-size:1.1rem; color:#FFFFFF;">#{idx + 1} {rec["model_name"]}</strong><div style="font-size:0.8rem; color:#8B5CF6; margin-top:2px;">{rec["category"].upper()}</div></div><div style="font-size:1.2rem; font-weight:700; color:#A78BFA;">{rec["rating"]}</div></div></div>',
+                    unsafe_allow_html=True)
     else:
         st.warning("В данной категории пока нет записей.")
 
@@ -324,6 +480,24 @@ elif page in _CONTENT_TABS:
             if any(lang.strip() in selected_languages for lang in (a.get("language") or "").split(","))
         ]
 
+    if page == "Papers (Статьи)":
+        if selected_paper_source == "Hugging Face Papers":
+            articles = [
+                a for a in articles
+                if "[HF" in a.get("title", "") or "huggingface.co" in a.get("source_url", "")
+            ]
+        elif selected_paper_source == "Papers with Code":
+            articles = [
+                a for a in articles
+                if "PwC" in a.get("title", "") or "paperswithcode" in a.get("source_url", "")
+            ]
+
+        if selected_topics:
+            articles = [
+                a for a in articles
+                if a.get("topic_tag", "").strip() in selected_topics
+            ]
+
     _TYPE_COLORS = {
         "статья": "#8B5CF6",
         "модель": "#22D3EE",
@@ -343,12 +517,39 @@ elif page in _CONTENT_TABS:
                 f'<span style="font-size:0.7rem; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; color:#A1A1AA; border:1px solid #2D1B4E; border-radius:6px; padding:2px 8px; margin-right:8px;">{language}</span>'
                 if source_type == "датасет" and language else ""
             )
+            topic_tag = (a.get("topic_tag") or "").strip()
+            topic_badge = (
+                f'<span style="font-size:0.7rem; font-weight:700; color:#EC4899; border:1px solid #EC4899; border-radius:6px; padding:2px 8px; margin-right:8px;">#{topic_tag}</span>'
+                if topic_tag else ""
+            )
+
+            source_art_url = (a.get("source_article_url") or "").strip()
+            source_art_html = (
+                f'<div style="font-size:0.8rem; color:#A1A1AA; margin-top:4px;">Связано со статьей: <a href="{source_art_url}" target="_blank" style="color:#A78BFA; text-decoration:none;">{source_art_url}</a></div>'
+                if source_art_url else ""
+            )
+
+            rel_links = a.get("related_links", [])
+            rel_html = ""
+            if isinstance(rel_links, list) and rel_links:
+                badges = []
+                for r in rel_links:
+                    r_type = r.get("type", "link")
+                    r_url = r.get("url", "")
+                    r_name = r.get("name", "ссылка")
+                    if r_url:
+                        badges.append(
+                            f'<a href="{r_url}" target="_blank" style="display:inline-block; font-size:0.75rem; color:#C084FC; background:#1E1B4B; border:1px solid #3B0764; border-radius:4px; padding:2px 6px; margin:2px 4px 2px 0; text-decoration:none;">🔗 {r_type}: {r_name}</a>'
+                        )
+                if badges:
+                    rel_html = f'<div style="margin-top:6px;">{"".join(badges)}</div>'
+
             link_html = (
                 f'<a href="{source_url}" target="_blank" style="font-size:0.85rem; color:#A78BFA; text-decoration:none;">Читать источник →</a>'
                 if source_url else ""
             )
             st.markdown(
-                f'<div class="custom-card"><div class="article-tags">{type_badge}{lang_badge}{tags_html}</div><h4 style="margin:0; color:#FFFFFF;">{a.get("title")}</h4><p style="font-size:0.9rem; color:#D4D4D8; margin:8px 0;">{a.get("summary")}</p>{link_html}</div>',
+                f'<div class="custom-card"><div class="article-tags">{type_badge}{lang_badge}{topic_badge}{tags_html}</div><h4 style="margin:0; color:#FFFFFF;">{a.get("title")}</h4><p style="font-size:0.9rem; color:#D4D4D8; margin:8px 0;">{a.get("summary")}</p>{source_art_html}{rel_html}<div style="margin-top:8px;">{link_html}</div></div>',
                 unsafe_allow_html=True)
     else:
         st.info("Материалы не найдены.")
