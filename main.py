@@ -10,7 +10,11 @@ from FetcherHF import stream_hf_articles
 from FetcherHFDatasets import stream_hf_datasets
 from mcp_fetcher_kaggle import stream_kaggle_articles
 from mcp_fetcher_papers import stream_papers_articles
-from github_fetcher import stream_github_articles
+from github_fetcher import (
+    stream_github_articles_v2,
+    stream_github_trending_page_articles,
+    TRENDING_PERIODS,
+)
 from mcp_fetcher_hf_trending import fetch_trending_models
 import arena_scraper
 
@@ -100,10 +104,21 @@ def stream_all_new_articles():
     except Exception as e:
         logger.error(f"Источник Papers (HF + PwC) недоступен: {e}")
 
+    #одно множество на все режимы гита, чтобы репо выбранное ллм в одном режиме не уходило в ллм повторно в другому
+    seen_github_ids: set[str] = set()
+
     try:
-        yield from _tag_source_type(stream_github_articles(), "репозиторий")
+        yield from _tag_source_type(stream_github_articles_v2(seen_ids=seen_github_ids), "репозиторий")
     except Exception as e:
-        logger.error(f"Источник GitHub недоступен: {e}")
+        logger.error(f"Источник GitHub(SearchAPI) недоступен: {e}")
+
+    for period in TRENDING_PERIODS:
+        try:
+            yield from _tag_source_type(
+                stream_github_trending_page_articles(period, seen_ids=seen_github_ids), "репозиторий",)
+        except Exception as e:
+            logger.error(f"Источник GitHub Trending ({period}) недоступен: {e}")
+
 
     try:
         yield from _tag_source_type(stream_kaggle_articles(), "датасет")
