@@ -4,6 +4,15 @@ import os
 from collections import defaultdict
 import streamlit as st
 import requests
+from html import escape
+
+from leaderboard_view import (
+    ALL_CATEGORIES,
+    aggregate_all_categories,
+    build_latest_records,
+    category_count_label,
+    format_rating,
+)
 
 # Устанавливаем широкую компоновку и принудительно открываем сайдбар
 st.set_page_config(layout="wide", initial_sidebar_state="expanded")
@@ -257,25 +266,11 @@ leaderboard_records = []
 unique_models = set()
 unique_categories = set()
 
-if leaderboard_res.get("status") == "success" and leaderboard_res.get("data"):
-    snapshots = leaderboard_res["data"]
-    # В БД хранится до 2 снепшотов (текущий + предыдущий) для инкрементального
-    # анализа, но на фронте нужен только самый свежий — иначе одна и та же
-    # модель показывается дважды (из старого и нового снепшота почти с тем же
-    # рейтингом). API отдаёт снепшоты отсортированными по fetched_at DESC,
-    # так что просто берём первый.
-    latest_snap = snapshots[0] if snapshots else None
-    if latest_snap:
-        for cat, models in latest_snap.get("categories", {}).items():
-            unique_categories.add(cat)
-            for m in models:
-                unique_models.add(m.get("name"))
-                leaderboard_records.append({
-                    "category": cat,
-                    "model_name": m.get("name"),
-                    "rating": m.get("rating"),
-                    "fetched_at": latest_snap.get("fetched_at")
-                })
+if leaderboard_res.get("status") == "success" and leaderboard_res.get("data"): #изменено 
+    
+    leaderboard_records = build_latest_records(leaderboard_res["data"])
+    unique_categories = {r["category"] for r in leaderboard_records}
+    unique_models = {r["model_name"] for r in leaderboard_records}
 
 trend_list = trending_res.get("data", []) if trending_res.get("status") == "success" else []
 article_list = articles_res.get("data", []) if articles_res.get("status") == "success" else []
@@ -323,8 +318,8 @@ with st.sidebar:
 
     if page == "Лидерборд моделей":
         st.markdown("<h5 style='color:#FFFFFF; margin-bottom:10px;'>Фильтры лидерборда</h5>", unsafe_allow_html=True)
-        cats = sorted(list(unique_categories)) if unique_categories else ["Все категории"]
-        selected_cat = st.selectbox("Категория", ["Все категории"] + cats)
+        cats = sorted(unique_categories)
+        selected_cat = st.selectbox("Категория", [ALL_CATEGORIES] + cats)
 
         agg_method = "avg"
         if selected_cat == "Все категории":
@@ -402,36 +397,33 @@ if page == "Лидерборд моделей":
 
     st.markdown("<div style='margin-top: 1.5rem;'></div>", unsafe_allow_html=True)
 
-    if selected_cat == "Все категории":
-        filtered = aggregate_all_categories(leaderboard_records, method=agg_method)
+    is_aggregate = selected_cat == ALL_CATEGORIES # изменено 
+
+    if is_aggregate:
+        filtered = aggregate_all_categories(leaderboard_records)
     else:
-        filtered = [r for r in leaderboard_records if r["category"] == selected_cat]
+        filtered = sorted(
+            (r for r in leaderboard_records if r["category"] == selected_cat),
+            key=lambda x: x["rating"],
+            reverse=True,
+        )
 
     if filtered:
-        filtered = sorted(filtered, key=lambda x: x.get("rating", 0), reverse=True)
         for idx, rec in enumerate(filtered):
-            if selected_cat == "Все категории":
-                cats_badge = rec.get("category", "")
-                sub_label = "avg Elo" if agg_method == "avg" else f"max in {rec.get('best_category', '').upper()}"
-                st.markdown(
-                    f'<div class="custom-card">'
-                    f'<div style="display:flex; justify-content:space-between; align-items:center;">'
-                    f'<div>'
-                    f'<strong style="font-size:1.1rem; color:#FFFFFF;">#{idx + 1} {rec["model_name"]}</strong>'
-                    f'<div style="font-size:0.8rem; color:#8B5CF6; margin-top:2px;">{cats_badge}</div>'
-                    f'</div>'
-                    f'<div style="text-align:right;">'
-                    f'<div style="font-size:1.2rem; font-weight:700; color:#A78BFA;">{rec["rating"]}</div>'
-                    f'<div style="font-size:0.75rem; color:#71717A;">{sub_label}</div>'
-                    f'</div>'
-                    f'</div>'
-                    f'</div>',
-                    unsafe_allow_html=True,
+            name = escape(str(rec["model_name"]))
+            if is_aggregate:
+                subtitle = escape(rec["category"].upper())
+                details = (
+                    '<div style="font-size:0.75rem; color:#A1A1AA; margin-top:4px;">'
+                    f'{escape(", ".join(rec["categories"]))}</div>'
                 )
             else:
-                st.markdown(
-                    f'<div class="custom-card"><div style="display:flex; justify-content:space-between; align-items:center;"><div><strong style="font-size:1.1rem; color:#FFFFFF;">#{idx + 1} {rec["model_name"]}</strong><div style="font-size:0.8rem; color:#8B5CF6; margin-top:2px;">{rec["category"].upper()}</div></div><div style="font-size:1.2rem; font-weight:700; color:#A78BFA;">{rec["rating"]}</div></div></div>',
-                    unsafe_allow_html=True)
+                subtitle = escape(rec["category"].upper())
+                details = ""
+
+            st.markdown(
+                f'<div class="custom-card"><div style="display:flex; justify-content:space-between; align-items:center;"><div><strong style="font-size:1.1rem; color:#FFFFFF;">#{idx + 1} {name}</strong><div style="font-size:0.8rem; color:#8B5CF6; margin-top:2px;">{subtitle}</div>{details}</div><div style="font-size:1.2rem; font-weight:700; color:#A78BFA;">{format_rating(rec["rating"])}</div></div></div>',
+                unsafe_allow_html=True)
     else:
         st.warning("В данной категории пока нет записей.")
 
