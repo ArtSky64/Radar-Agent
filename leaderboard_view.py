@@ -18,6 +18,8 @@ def _to_number(value) -> float | None:
     """
     if isinstance(value, bool):
         return None
+    if isinstance(value, str):
+        value = value.replace("%", "").strip()
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -58,21 +60,43 @@ def build_latest_records(snapshots: list[dict]) -> list[dict]:
     return records
 
 
-def aggregate_all_categories(records: list[dict]) -> list[dict]:
-    """Режим «Все категории»: одна строка на модель, рейтинг — среднее
-    по категориям, где модель присутствует (вариант A из ТЗ, п.5)."""
+def aggregate_all_categories(records: list[dict], method: str = "avg") -> list[dict]:
+    """Режим «Все категории»: одна строка на модель.
+    
+    :param records: список словарей с ключами model_name, category, rating
+    :param method: 'avg' (средний рейтинг) или 'max' (максимальный рейтинг)
+    """
     by_model: dict[str, list[dict]] = defaultdict(list)
     for r in records:
-        by_model[r["model_name"]].append(r)
+        name = (r.get("model_name") or "").strip()
+        if name:
+            by_model[name].append(r)
 
     aggregated = []
     for name, rows in by_model.items():
         categories = sorted({r["category"] for r in rows})
+        num_cats = len(categories)
+        cats_str = ", ".join(c.upper() for c in categories)
+        
+        # Рейтинги уже очищены _to_number
+        avg_rating = sum(r["rating"] for r in rows) / num_cats
+        best_row = max(rows, key=lambda x: x["rating"])
+        max_rating = best_row["rating"]
+        best_cat = best_row["category"]
+
+        if method == "max":
+            chosen_rating = max_rating
+            cat_label = f"МАКС: {best_cat.upper()} ({num_cats} {category_count_label(num_cats).split()[1]}: {cats_str})"
+        else:
+            chosen_rating = avg_rating
+            cat_label = f"{num_cats} {category_count_label(num_cats).split()[1]}: {cats_str}"
+
         aggregated.append({
             "model_name": name,
-            "rating": sum(r["rating"] for r in rows) / len(rows),
+            "rating": chosen_rating,
             "categories": categories,
-            "category": category_count_label(len(categories)),
+            "category": cat_label,
+            "fetched_at": rows[0].get("fetched_at"),
         })
     return sorted(aggregated, key=lambda x: x["rating"], reverse=True)
 

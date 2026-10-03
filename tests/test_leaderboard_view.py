@@ -63,6 +63,18 @@ def test_aggregate_average_sort_and_categories():
     assert ratings == sorted(ratings, reverse=True)
 
 
+def test_aggregate_max_method():
+    s = snap(
+        "2026-07-01",
+        text=[("A", 1400), ("B", 1290)],
+        vision=[("A", 1200), ("C", 1250)],
+    )
+    result = aggregate_all_categories(build_latest_records([s]), method="max")
+    a = next(r for r in result if r["model_name"] == "A")
+    assert a["rating"] == 1400  # Максимум из 1400 и 1200
+    assert a["category"] == "МАКС: TEXT (2 категории: TEXT, VISION)"
+
+
 @pytest.mark.parametrize("n,expected", [
     (1, "1 категория"), (2, "2 категории"), (4, "4 категории"),
     (5, "5 категорий"), (11, "11 категорий"), (12, "12 категорий"),

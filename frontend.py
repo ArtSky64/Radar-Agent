@@ -159,99 +159,6 @@ def fetch_data(endpoint):
         return {"status": "connect_error", "data": []}
 
 
-def format_cat_plural(n: int) -> str:
-    """Склонение слова 'категория' в русском языке."""
-    if 11 <= n % 100 <= 14:
-        return "категорий"
-    last = n % 10
-    if last == 1:
-        return "категория"
-    if 2 <= last <= 4:
-        return "категории"
-    return "категорий"
-
-
-def aggregate_all_categories(records: list[dict], method: str = "avg") -> list[dict]:
-    """
-    ТЗ Блок 5 (фидбек п.5): Агрегация «Все категории» лидерборда Arena.
-    Устраняет баг plain-конкатенации, при котором одна и та же модель выводилась N раз
-    с несопоставимыми Elo-рейтингами из разных категорий.
-
-    Группирует записи по model_name и вычисляет:
-    - Вариант A (method='avg', рекомендуется): средний рейтинг avg(rating) по категориям модели.
-    - Вариант B (method='max'): максимальный рейтинг max(rating) + категория-источник.
-
-    :param records: список словарей с ключами model_name, category, rating
-    :param method: 'avg' (среднее) или 'max' (максимум)
-    :return: отсортированный по убыванию rating список агрегированных моделей
-    """
-    by_model = defaultdict(list)
-    for r in records:
-        name = (r.get("model_name") or "").strip()
-        if name:
-            by_model[name].append(r)
-
-    aggregated = []
-    for name, rows in by_model.items():
-        valid_ratings = []
-        for r in rows:
-            val = r.get("rating")
-            if isinstance(val, (int, float)):
-                valid_ratings.append(float(val))
-            elif isinstance(val, str):
-                cleaned = val.replace("%", "").strip()
-                try:
-                    valid_ratings.append(float(cleaned))
-                except ValueError:
-                    pass
-
-        if not valid_ratings:
-            avg_rating = 0.0
-            max_rating = 0.0
-            best_cat = rows[0].get("category", "")
-        else:
-            avg_rating = round(sum(valid_ratings) / len(valid_ratings), 1)
-
-            def _get_sortable_rating(row):
-                v = row.get("rating")
-                if isinstance(v, (int, float)):
-                    return float(v)
-                if isinstance(v, str):
-                    try:
-                        return float(v.replace("%", "").strip())
-                    except ValueError:
-                        return -1.0
-                return -1.0
-
-            best_row = max(rows, key=_get_sortable_rating)
-            max_rating = _get_sortable_rating(best_row)
-            best_cat = best_row.get("category", "")
-
-        cats = sorted(set(r.get("category", "") for r in rows if r.get("category")))
-        num_cats = len(cats)
-        cats_str = ", ".join(c.upper() for c in cats)
-
-        if method == "max":
-            chosen_rating = max_rating
-            cat_label = f"МАКС: {best_cat.upper()} ({num_cats} {format_cat_plural(num_cats)}: {cats_str})"
-        else:
-            chosen_rating = avg_rating
-            cat_label = f"{num_cats} {format_cat_plural(num_cats)}: {cats_str}"
-
-        aggregated.append({
-            "model_name": name,
-            "rating": chosen_rating,
-            "categories": cats,
-            "category": cat_label,
-            "num_categories": num_cats,
-            "avg_rating": avg_rating,
-            "max_rating": max_rating,
-            "best_category": best_cat,
-            "fetched_at": rows[0].get("fetched_at"),
-        })
-
-    return sorted(aggregated, key=lambda x: x["rating"], reverse=True)
-
 
 leaderboard_res = fetch_data("leaderboard")
 trending_res = fetch_data("trending/models")
@@ -400,7 +307,7 @@ if page == "Лидерборд моделей":
     is_aggregate = selected_cat == ALL_CATEGORIES # изменено 
 
     if is_aggregate:
-        filtered = aggregate_all_categories(leaderboard_records)
+        filtered = aggregate_all_categories(leaderboard_records, method=agg_method)
     else:
         filtered = sorted(
             (r for r in leaderboard_records if r["category"] == selected_cat),
