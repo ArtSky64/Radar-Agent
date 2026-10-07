@@ -90,6 +90,16 @@ def init_db():
             cursor.execute("ALTER TABLE hf_trending ADD COLUMN source_url TEXT NOT NULL DEFAULT ''")
         if 'summary' not in trending_cols:
             cursor.execute("ALTER TABLE hf_trending ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
+        if 'pipeline_tag' not in trending_cols:
+            cursor.execute("ALTER TABLE hf_trending ADD COLUMN pipeline_tag TEXT NOT NULL DEFAULT ''")
+        if 'license' not in trending_cols:
+            cursor.execute("ALTER TABLE hf_trending ADD COLUMN license TEXT NOT NULL DEFAULT ''")
+        if 'card_description' not in trending_cols:
+            cursor.execute("ALTER TABLE hf_trending ADD COLUMN card_description TEXT NOT NULL DEFAULT ''")
+        if 'language' not in trending_cols:
+            cursor.execute("ALTER TABLE hf_trending ADD COLUMN language TEXT NOT NULL DEFAULT ''")
+        if 'variant' not in trending_cols:
+            cursor.execute("ALTER TABLE hf_trending ADD COLUMN variant TEXT NOT NULL DEFAULT ''")
         conn.commit()
 
 
@@ -301,26 +311,31 @@ def get_analysis_history(limit: int = 10) -> list[dict]:
 def save_trending_models(models: list[dict]) -> None:
     """
     Полностью заменяет предыдущую витрину трендовых моделей новой.
-    models: [{"name": str, "downloads": int, "likes": int, "tags": list[str], "url": str, "summary": str}, ...]
+    models: [{"name": str, "downloads": int, "likes": int, "tags": list[str], "url": str, "summary": str, "pipeline_tag": str, "license": str, "card_description": str, "language": str, "variant": str}, ...]
     """
     fetched_at = datetime.utcnow().isoformat()
     with get_connection() as conn:
         conn.execute('DELETE FROM hf_trending')
         conn.executemany('''
-            INSERT INTO hf_trending (model_name, downloads, likes, tags, source_url, summary, fetched_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO hf_trending (
+                model_name, downloads, likes, tags, source_url, summary, fetched_at,
+                pipeline_tag, license, card_description, language, variant
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', [
             (
                 m["name"],
                 m["downloads"],
                 m["likes"],
                 json.dumps(m["tags"]),
-                # url может не прийти со старых вызовов — считаем сами по имени модели
                 m.get("url") or f"https://huggingface.co/{m['name']}",
-                # если LLM-саммари не удалось сгенерировать (ошибка/рейт-лимит) —
-                # не роняем весь прогон, просто сохраняем пустую строку
                 m.get("summary") or "",
                 fetched_at,
+                m.get("pipeline_tag") or "",
+                m.get("license") or "",
+                m.get("card_description") or "",
+                m.get("language") or "",
+                m.get("variant") or ""
             )
             for m in models
         ])

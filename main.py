@@ -7,7 +7,7 @@ from dedup import text_to_vector, is_duplicate
 from agent_manager import analyze_article, AnalysisError
 from database import init_db, get_all_vectors, save_vector, save_article, delete_old_vectors, save_trending_models, upsert_related_material
 from FetcherHF import stream_hf_articles
-from FetcherHFDatasets import stream_hf_datasets
+from FetcherHFDatasets import stream_hf_datasets_by_mode
 from mcp_fetcher_kaggle import stream_kaggle_articles
 from mcp_fetcher_papers import stream_papers_articles
 from github_fetcher import (
@@ -84,20 +84,11 @@ def stream_all_new_articles():
     # повторных прогонах (раз в 3 дня, плюс ручные запуски) HF отдаёт почти
     # одну и ту же топ-выдачу по этому запросу, и все кандидаты уходят в дедуп
     # как уже виденные (см. лог: "Обработано: 0, дублей: 22"). Гоняем несколько
-    # разных тематических запросов за цикл, чтобы охватывать разные ниши и
-    # реально прирастать новыми датасетами, а не топтаться на месте.
-    HF_DATASET_QUERIES = [
-        "machine learning",
-        "nlp",
-        "computer vision",
-        "reinforcement learning",
-        "time series",
-    ]
-    for query in HF_DATASET_QUERIES:
+    for mode in config.HF_DATASET_MODES:
         try:
-            yield from _tag_source_type(stream_hf_datasets(query), "датасет")
+            yield from _tag_source_type(stream_hf_datasets_by_mode(mode), "датасет")
         except Exception as e:
-            logger.error(f"Источник Hugging Face (датасеты, запрос='{query}') недоступен: {e}")
+            logger.error(f"Источник Hugging Face (датасеты, режим='{mode}') недоступен: {e}")
 
     try:
         yield from _tag_source_type(stream_papers_articles(), "статья")

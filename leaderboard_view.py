@@ -18,8 +18,11 @@ def _to_number(value) -> float | None:
     """
     if isinstance(value, bool):
         return None
+    
+    # Если пришла строка с процентами (вдруг спарсился winrate вместо elo)
     if isinstance(value, str):
-        value = value.replace("%", "").strip()
+        value = value.replace('%', '').strip()
+        
     try:
         number = float(value)
     except (TypeError, ValueError):
@@ -30,12 +33,6 @@ def _to_number(value) -> float | None:
 def build_latest_records(snapshots: list[dict]) -> list[dict]:
     """Плоский список записей: по каждой категории берётся ТОЛЬКО самый
     свежий снимок, в котором эта категория есть.
-
-    Раньше фронтенд сваливал в один список все снимки (в БД их до 2),
-    и одна модель дублировалась даже внутри одной категории. Выбор «свежий
-    снимок категории», а не «последний снимок целиком», страхует от
-    частичного скрапинга: если в новом снимке часть категорий провалилась,
-    они не пропадут из интерфейса, а подтянутся из предыдущего.
     """
     records: list[dict] = []
     seen_categories: set[str] = set()
@@ -62,59 +59,46 @@ def build_latest_records(snapshots: list[dict]) -> list[dict]:
 
 def aggregate_all_categories(records: list[dict], method: str = "avg") -> list[dict]:
     """Режим «Все категории»: одна строка на модель.
-    
-    :param records: список словарей с ключами model_name, category, rating
-    :param method: 'avg' (средний рейтинг) или 'max' (максимальный рейтинг)
+    method='avg': рейтинг — среднее по категориям, где модель присутствует.
+    method='max': рейтинг — максимум по категориям.
     """
-    by_model: dict[str, list[dict]] = defaultdict(list)
+    by_model = defaultdict(list)
     for r in records:
-        name = (r.get("model_name") or "").strip()
-        if name:
-            by_model[name].append(r)
+        by_model[r["model_name"]].append(r)
 
-    aggregated = []
+    result = []
     for name, rows in by_model.items():
-        categories = sorted({r["category"] for r in rows})
-        num_cats = len(categories)
-        cats_str = ", ".join(c.upper() for c in categories)
-        
-        # Рейтинги уже очищены _to_number
-        avg_rating = sum(r["rating"] for r in rows) / num_cats
-        best_row = max(rows, key=lambda x: x["rating"])
-        max_rating = best_row["rating"]
-        best_cat = best_row["category"]
-
         if method == "max":
-            chosen_rating = max_rating
-            cat_label = f"МАКС: {best_cat.upper()} ({num_cats} {category_count_label(num_cats).split()[1]}: {cats_str})"
+            best_row = max(rows, key=lambda x: x["rating"])
+            rating = best_row["rating"]
+            cat_list = ", ".join(sorted(r["category"].upper() for r in rows))
+            cat_label = f"МАКС: {best_row['category'].upper()} ({len(rows)} {category_count_label(len(rows)).split()[1]}: {cat_list})"
         else:
-            chosen_rating = avg_rating
-            cat_label = f"{num_cats} {category_count_label(num_cats).split()[1]}: {cats_str}"
+            rating = sum(r["rating"] for r in rows) / len(rows)
+            cat_label = category_count_label(len(rows))
 
-        aggregated.append({
+        result.append({
             "model_name": name,
-            "rating": chosen_rating,
-            "categories": categories,
+            "rating": rating,
+            "categories": sorted(r["category"] for r in rows),
             "category": cat_label,
-            "fetched_at": rows[0].get("fetched_at"),
         })
-    return sorted(aggregated, key=lambda x: x["rating"], reverse=True)
 
-
-def format_rating(value: float) -> str:
-    """1234.0 -> '1234', 1403.666 -> '1403.7'."""
-    rounded = round(value)
-    return str(int(rounded)) if abs(value - rounded) < 1e-9 else f"{value:.1f}"
+    return sorted(result, key=lambda x: x["rating"], reverse=True)
 
 
 def category_count_label(n: int) -> str:
-    """Склонение: 1 категория, 2 категории, 5 категорий."""
-    if 11 <= n % 100 <= 14:
-        word = "категорий"
-    elif n % 10 == 1:
-        word = "категория"
-    elif 2 <= n % 10 <= 4:
-        word = "категории"
+    """Возвращает строку с правильным склонением слова «категория»."""
+    if n % 10 == 1 and n % 100 != 11:
+        return f"{n} категория"
+    elif 2 <= n % 10 <= 4 and (n % 100 < 10 or n % 100 >= 20):
+        return f"{n} категории"
     else:
-        word = "категорий"
-    return f"{n} {word}"
+        return f"{n} категорий"
+
+
+def format_rating(rating: float) -> str:
+    """Форматирует число рейтинга: целое без нулей на конце, иначе 1 знак после запятой."""
+    if rating.is_integer():
+        return str(int(rating))
+    return f"{rating:.1f}"

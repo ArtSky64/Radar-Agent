@@ -50,3 +50,8 @@ PWC_DETAIL_TOOL = os.getenv("PWC_DETAIL_TOOL", "get_paper")
 PWC_TOPIC_SLUGS = ["healthcare", "medical-imaging", "biology"]
 PAPERS_WINDOW_DAYS = int(os.getenv("PAPERS_WINDOW_DAYS", "7"))
 PAPERS_LIMIT = int(os.getenv("PAPERS_LIMIT", "10"))
+
+# --- GitHub & HuggingFace ---
+GITHUB_TRENDING_PERIODS = ["daily", "weekly", "monthly"]
+HF_DATASET_MODES = ["query", "recent", "trending", "trending_ru"]
+HF_MODEL_MODES = ["trending", "trending_ru"]
