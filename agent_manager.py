@@ -258,3 +258,176 @@ def analyze_article(title: str, text: str) -> ArticleAnalysis:
     except Exception as e:
         logger.error(f"Ошибка анализа статьи '{title}': {e!r}")
         raise AnalysisError(f"Не удалось проанализировать статью '{title}': {e!r}") from e
+
+
+# ==========================================
+# КАРТОЧКА GITHUB-РЕПОЗИТОРИЯ (ТЗ СОЗВОНА)
+# ==========================================
+
+class GitHubRepoCard(BaseModel):
+    """Структурированная карточка трендового репозитория GitHub."""
+    summary: str = Field(
+        description="Подробное описание репозитория на русском языке, ровно 3-4 предложения: суть проекта, решаемая задача, стек/возможности."
+    )
+    tags: list[str] = Field(
+        default_factory=list,
+        description="3-6 свободных тегов по технологиям и фреймворкам (напр. ['PyTorch', 'Transformers'])"
+    )
+    directions: list[str] = Field(
+        default_factory=list,
+        description="0-4 тега строго из списка НАПРАВЛЕНИЕ: health_ai, cv, audio, nlp_llm, agents, generative_ai, classical_ml, robotics, ml_infrastructure, backend, data_engineering"
+    )
+    task_types: list[str] = Field(
+        default_factory=list,
+        description="0-3 тега строго из списка ТИП ЗАДАЧИ: classification, regression, clustering, detection_tracking, segmentation, generation, recognition, rag_search, agent_orchestration, training_finetuning, inference_optimization, evaluation, reinforcement_learning, anomaly_detection"
+    )
+
+
+GITHUB_REPO_SYSTEM_PROMPT = """
+Ты — Senior AI/ML Engineer и технический аналитик.
+Тебе дают название GitHub-репозитория, его краткое описание и выдержку из README.md.
+
+ТВОЯ ЗАДАЧА — составить структурированную карточку репозитория со следующими требованиями:
+
+1. summary:
+   - Напиши развернутое описание строго из 3-4 предложений на русском языке.
+   - Обязательно укажи: (1) что это за проект/инструмент, (2) какую конкретную задачу он решает, (3) ключевой стек/архитектуру и кому/для чего он полезен. Не пиши одно предложение!
+
+2. tags:
+   - Сгенерируй 3-6 свободных релевантных тегов (названия библиотек, алгоритмов, технологий, напр. ['PyTorch', 'vLLM', 'FastAPI']).
+
+3. directions (НАПРАВЛЕНИЕ):
+   - Обязательный выбор от 0 до 4 тегов СТРОГО из следующего списка:
+     * health_ai (Медицинский AI, биомедицина, анализ медицинских данных)
+     * cv (Computer Vision, анализ изображений и видео)
+     * audio (Распознавание, генерация и обработка аудио)
+     * nlp_llm (NLP, LLM, обработка и генерация текста)
+     * agents (AI-агенты, мультиагентные системы)
+     * generative_ai (Генерация изображений, видео, аудио, синтетических данных)
+     * classical_ml (Классическое ML: классификация, регрессия, кластеризация)
+     * robotics (Робототехника, автономные системы)
+     * ml_infrastructure (MLOps, инференс, обучение, оптимизация и развёртывание моделей)
+     * backend (API, серверные приложения, интеграции)
+     * data_engineering (Пайплайны данных, ETL, разметка, хранение и обработка датасетов)
+   - Если ни одно направление не подходит, верни пустой список []. Не придумывай свои названия!
+
+4. task_types (ТИП ЗАДАЧИ):
+   - Обязательный выбор от 0 до 3 тегов СТРОГО из следующего списка:
+     * classification (Классификация объектов, текстов, изображений, аудио)
+     * regression (Регрессия, предсказание непрерывных значений, forecasting, временные ряды)
+     * clustering (Кластеризация, поиск закономерностей, понижение размерности, embeddings)
+     * detection_tracking (Детекция и отслеживание объектов)
+     * segmentation (Сегментация изображений и видео)
+     * generation (Генерация контента и синтетических данных)
+     * recognition (Распознавание речи, звуков, текста (ASR, speaker ID, sound events))
+     * rag_search (RAG, поиск информации, векторные БД, retrieval)
+     * agent_orchestration (Оркестрация агентов, tool calling, MCP, промпт-инжиниринг)
+     * training_finetuning (Обучение и дообучение моделей)
+     * inference_optimization (Ускорение и оптимизация инференса)
+     * evaluation (Бенчмарки, оценка качества, интерпретируемость, XAI)
+     * reinforcement_learning (RL, RLHF, обучение с подкреплением)
+     * anomaly_detection (Поиск аномалий и выбросов)
+   - Если ни один тип задачи не подходит, верни пустой список []. Не придумывай свои названия!
+
+Отвечай строго в формате структурированной схемы.
+"""
+
+
+def _get_github_repo_agent() -> Agent:
+    return Agent(
+        model=get_model(),
+        output_type=GitHubRepoCard,
+        system_prompt=GITHUB_REPO_SYSTEM_PROMPT,
+    )
+
+
+@retry(
+    retry=retry_if_exception(_is_retryable_error),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=1, max=30),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True,
+)
+def _call_github_repo_agent(prompt: str):
+    _throttle()
+    return _get_github_repo_agent().run_sync(prompt)
+
+
+def sanitize_repo_card(card: GitHubRepoCard) -> GitHubRepoCard:
+    """Очищает и валидирует теги согласно жестким лимитам ТЗ."""
+    valid_dirs = set(config.GITHUB_DIRECTIONS.keys())
+    valid_tasks = set(config.GITHUB_TASK_TYPES.keys())
+
+    cleaned_dirs = [d.strip().lower() for d in card.directions if d.strip().lower() in valid_dirs][:config.GITHUB_MAX_DIRECTIONS]
+    cleaned_tasks = [t.strip().lower() for t in card.task_types if t.strip().lower() in valid_tasks][:config.GITHUB_MAX_TASK_TYPES]
+    cleaned_tags = [t.strip() for t in card.tags if t.strip()][:8]
+
+    return GitHubRepoCard(
+        summary=card.summary.strip(),
+        tags=cleaned_tags,
+        directions=cleaned_dirs,
+        task_types=cleaned_tasks,
+    )
+
+
+def _mock_github_repo_card(repo_name: str, readme_text: str, description: str = "") -> GitHubRepoCard:
+    """Детерминированный фолбэк для тестов и работы без активного vLLM."""
+    text = (description + " " + readme_text[:1200]).lower()
+    dirs = []
+    if any(k in text for k in ("agent", "tool", "mcp", "workflow")):
+        dirs.append("agents")
+    if any(k in text for k in ("llm", "gpt", "transformer", "prompt", "nlp", "language model")):
+        dirs.append("nlp_llm")
+    if any(k in text for k in ("vision", "image", "video", "cv", "yolo", "ocr")):
+        dirs.append("cv")
+    if any(k in text for k in ("audio", "voice", "speech", "sound", "asr")):
+        dirs.append("audio")
+    if any(k in text for k in ("pipeline", "etl", "dataset", "data")):
+        dirs.append("data_engineering")
+    if not dirs:
+        dirs.append("backend")
+
+    tasks = []
+    if any(k in text for k in ("rag", "retriev", "vector", "search", "embedding")):
+        tasks.append("rag_search")
+    if any(k in text for k in ("orchestrat", "workflow", "agent")):
+        tasks.append("agent_orchestration")
+    if any(k in text for k in ("generat", "diffus", "synthe")):
+        tasks.append("generation")
+    if any(k in text for k in ("train", "finetun", "lora", "rlhf")):
+        tasks.append("training_finetuning")
+    if not tasks:
+        tasks.append("classification")
+
+    base_desc = description.strip() or f"Проект {repo_name} предоставляет открытый инструментарий для разработчиков."
+    summary = (
+        f"Проект {repo_name} ориентирован на решение прикладных задач в области AI/ML и разработки на Python. "
+        f"{base_desc} "
+        f"Архитектура решения включает модули для интеграции, настройки и запуска в современных вычислительных средах. "
+        f"Репозиторий полезен инженерам и дата-сайентистам для автоматизации и масштабирования рабочих пайплайнов."
+    )
+    return GitHubRepoCard(
+        summary=summary,
+        tags=["Python", "Open-Source", "AI/ML"],
+        directions=dirs[:config.GITHUB_MAX_DIRECTIONS],
+        task_types=tasks[:config.GITHUB_MAX_TASK_TYPES],
+    )
+
+
+def analyze_github_repo(repo_name: str, readme_text: str, description: str = "") -> GitHubRepoCard:
+    """
+    Анализирует репозиторий GitHub через Qwen / PydanticAI.
+    Возвращает карточку с 3-4 предложениями описания, тегами, 0-4 направлениями и 0-3 типами задач.
+    При недоступности LLM возвращает качественный эвристический фолбэк.
+    """
+    prompt = (
+        f"Репозиторий: {repo_name}\n"
+        f"Краткое описание GitHub: {description or '(нет)'}\n\n"
+        f"Выдержка из README.md:\n{readme_text[:4000]}"
+    )
+    try:
+        result = _call_github_repo_agent(prompt)
+        return sanitize_repo_card(result.output)
+    except Exception as e:
+        logger.warning(f"LLM-анализ недоступен для '{repo_name}' ({type(e).__name__}: {e}). Используем фолбэк-карточку.")
+        return _mock_github_repo_card(repo_name, readme_text, description)

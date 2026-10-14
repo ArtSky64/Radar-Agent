@@ -3,10 +3,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from database import (
     init_db, get_all_leaderboard_snapshots, save_leaderboard_data, get_all_articles,
     get_analysis_history, save_trending_models, get_trending_models,
+    save_github_trending, get_github_trending,
 )
 import arena_scraper
 from leaderboard_analyzer import run_leaderboard_analysis
 from mcp_fetcher_hf_trending import fetch_trending_models
+from github_fetcher import run_github_trending_pipeline
+
 
 app = FastAPI(title="Arena AI API")
 
@@ -119,6 +122,43 @@ def read_trending_models():
         return {"status": "success", "total_models": len(models), "data": models}
     except Exception as e:
         return {"status": "error", "message": str(e), "data": []}
+
+
+# Внутренняя функция бэкенда: тянет трендовые репозитории GitHub и сохраняет
+def run_github_trending_fetch_and_save():
+    print("[БЭКЕНД] Запуск сбора трендовых репозиториев GitHub (weekly + monthly)...")
+    try:
+        repos = run_github_trending_pipeline(limit=30)
+        print(f"[БЭКЕНД] Сохранено трендовых репозиториев GitHub: {len(repos)}")
+    except Exception as e:
+        print(f"[БЭКЕНД ОШИБКА] Не удалось получить трендовые репозитории GitHub: {e}")
+
+
+# Эндпоинт для фонового запуска сбора трендовых репозиториев GitHub
+@app.post("/trending/github/refresh")
+def trigger_github_trending_fetch(background_tasks: BackgroundTasks):
+    background_tasks.add_task(run_github_trending_fetch_and_save)
+    return {
+        "status": "success",
+        "message": "Сбор трендовых репозиториев GitHub (weekly + monthly) запущен в фоне.",
+    }
+
+
+# Эндпоинт для вывода текущей витрины трендовых репозиториев GitHub
+@app.get("/trending/github")
+def read_github_trending():
+    try:
+        repos = get_github_trending()
+        last_fetched_at = repos[0].get("fetched_at") if repos else None
+        return {
+            "status": "success",
+            "total_repos": len(repos),
+            "last_fetched_at": last_fetched_at,
+            "data": repos,
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e), "data": [], "last_fetched_at": None}
+
 
 
 # Твой эндпоинт для статей (оставляем без изменений)

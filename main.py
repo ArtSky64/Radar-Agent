@@ -13,8 +13,10 @@ from mcp_fetcher_papers import stream_papers_articles
 from github_fetcher import (
     stream_github_articles_v2,
     stream_github_trending_page_articles,
+    run_github_trending_pipeline,
     TRENDING_PERIODS,
 )
+
 from mcp_fetcher_hf_trending import fetch_trending_models
 import arena_scraper
 
@@ -147,6 +149,16 @@ def _refresh_leaderboard():
         logger.error(f"Скрапинг/анализ лидерборда не выполнен: {e!r}")
 
 
+def _refresh_github_trending():
+    try:
+        limit = getattr(config, "GITHUB_TRENDING_LIMIT", 30)
+        logger.info(f"Запуск пайплайна GitHub Trending (Топ-{limit} weekly + monthly)...")
+        results = run_github_trending_pipeline(limit=limit)
+        logger.info(f"Витрина трендовых репозиториев GitHub обновлена: {len(results)} шт.")
+    except Exception as e:
+        logger.error(f"Пайплайн GitHub Trending завершился с ошибкой: {e!r}")
+
+
 # Главный цикл 
 
 def main():
@@ -154,6 +166,9 @@ def main():
 
     # Создаёт таблицы, если их ещё нет (безопасно вызывать при каждом запуске)
     init_db()
+
+    # Тренды GitHub — сбор 30 проектов (weekly + monthly), обогащение README и Qwen
+    _refresh_github_trending()
 
     # Тренды HF не участвуют в дедупе/цикле статей — обновляем отдельным шагом
     _refresh_trending_models()
@@ -165,6 +180,7 @@ def main():
     # Чистим только устаревший кэш векторов-дублей (не сами статьи —
     # они должны копиться со всех прогонов, это база знаний, а не разовый снимок)
     delete_old_vectors(days=14)
+
 
     # 1. ОДИН РАЗ выгружаем все векторы из БД в оперативную память.
     # get_all_vectors() — генератор, оборачиваем в list() явно, как договорились.
@@ -206,6 +222,9 @@ def main():
             "summary": analysis.summary,
             "source_url": source_url,
             "tags": analysis.tags,  # список строк — database.py сам делает json.dumps
+            "directions": article.get("directions", []),
+            "task_types": article.get("task_types", []),
+            "stars": article.get("stars", 0),
             "source_type": article.get("source_type", "статья"),
             # Заполнено у HF-датасетов, тематических срезов и периодов
             "language": article.get("language", ""),
@@ -214,6 +233,7 @@ def main():
             "source_article_url": article.get("source_article_url", ""),
             "period": article.get("period", ""),
         }
+
         save_article(payload)
         processed += 1
 

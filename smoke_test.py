@@ -42,14 +42,16 @@ def _():
     for fn_name in ("init_db", "save_vector", "get_all_vectors", "save_article",
                      "get_all_articles", "delete_old_vectors",
                      "save_leaderboard_data", "get_all_leaderboard_snapshots",
-                     "upsert_related_material"):
+                     "upsert_related_material", "get_article_by_url", "repo_exists_in_db",
+                     "save_github_trending", "get_github_trending"):
         assert hasattr(database, fn_name), f"database.py: нет функции {fn_name}"
 
     import FetcherHF
     assert hasattr(FetcherHF, "stream_hf_articles")
 
     import FetcherHFDatasets
-    assert hasattr(FetcherHFDatasets, "stream_hf_datasets")
+    assert hasattr(FetcherHFDatasets, "stream_hf_datasets") or hasattr(FetcherHFDatasets, "stream_hf_datasets_by_mode")
+
 
     import mcp_fetcher_papers
     assert hasattr(mcp_fetcher_papers, "stream_papers_articles")
@@ -58,10 +60,17 @@ def _():
 
     import github_fetcher
     assert hasattr(github_fetcher, "stream_github_articles")
+    assert hasattr(github_fetcher, "run_github_trending_pipeline")
+    assert hasattr(github_fetcher, "fetch_top_trending_repos")
+    assert hasattr(github_fetcher, "fetch_repo_readme")
+
+    assert hasattr(agent_manager, "analyze_github_repo")
+    assert hasattr(agent_manager, "GitHubRepoCard")
 
     import main
     assert hasattr(main, "stream_all_new_articles")
     assert hasattr(main, "main")
+
 
 
 @check("get_model() кидает понятную ошибку при реальном вызове без ключа")
@@ -316,9 +325,192 @@ def _():
     assert res_robust[0]["rating"] == 1200.0
 
 
+@check("database.py: github_trending таблица и методы поиска/сохранения")
+def _():
+    import database
+    database.DB_NAME = TEST_DB_NAME
+    database.init_db()
+
+    # Проверка сохранения статьи с directions и task_types
+    database.save_article({
+        "title": "[GitHub] test-owner/test-repo",
+        "summary": "Проект для автоматизации задач в области ML. Позволяет запускать пайплайны данных. Включает готовые интеграции с API.",
+        "source_url": "https://github.com/test-owner/test-repo",
+        "tags": ["Python", "ML"],
+        "directions": ["agents", "nlp_llm"],
+        "task_types": ["rag_search", "agent_orchestration"],
+        "source_type": "репозиторий",
+        "stars": 1500,
+        "period": "weekly",
+    })
+
+    # Проверка поиска
+    assert database.repo_exists_in_db("https://github.com/test-owner/test-repo") is True
+    assert database.repo_exists_in_db("test-owner/test-repo") is True
+    assert database.repo_exists_in_db("nonexistent/repo") is False
+
+    art = database.get_article_by_url("https://github.com/test-owner/test-repo")
+    assert art is not None
+    assert art["directions"] == ["agents", "nlp_llm"]
+    assert art["task_types"] == ["rag_search", "agent_orchestration"]
+    assert art["stars"] == 1500
+
+    # Проверка сохранения слепка трендов
+    trending_mock = [
+        {
+            "repo_name": "test-owner/test-repo",
+            "source_url": "https://github.com/test-owner/test-repo",
+            "summary": "Описание репозитория 1",
+            "tags": ["Tag1"],
+            "directions": ["agents"],
+            "task_types": ["rag_search"],
+            "stars": 1500,
+            "stars_this_period": 250,
+            "period": "weekly",
+            "is_new": False,
+        },
+        {
+            "repo_name": "new-owner/new-repo",
+            "source_url": "https://github.com/new-owner/new-repo",
+            "summary": "Описание репозитория 2",
+            "tags": ["Tag2"],
+            "directions": ["cv"],
+            "task_types": ["detection_tracking"],
+            "stars": 800,
+            "stars_this_period": 120,
+            "period": "monthly",
+            "is_new": True,
+        },
+    ]
+    database.save_github_trending(trending_mock)
+    loaded = database.get_github_trending()
+    assert len(loaded) == 2
+    assert loaded[0]["repo_name"] == "test-owner/test-repo"
+    assert loaded[0]["is_new"] is False
+    assert loaded[1]["repo_name"] == "new-owner/new-repo"
+    assert loaded[1]["is_new"] is True
+    assert loaded[1]["directions"] == ["cv"]
+    assert loaded[1]["task_types"] == ["detection_tracking"]
+
+
+@check("agent_manager.py: GitHubRepoCard валидация и санитизация (0-4 направлений, 0-3 задач)")
+def _():
+    import agent_manager
+    from agent_manager import GitHubRepoCard, sanitize_repo_card
+
+    # Проверка схемы
+    card = GitHubRepoCard(
+        summary="Это первое предложение. Это второе предложение. Это третье предложение. Это четвертое предложение.",
+        tags=["PyTorch", "vLLM"],
+        directions=["agents", "nlp_llm", "cv", "audio", "backend"],  # 5 штук (превышает 4)
+        task_types=["rag_search", "generation", "classification", "regression"],  # 4 штуки (превышает 3)
+    )
+
+    cleaned = sanitize_repo_card(card)
+    assert len(cleaned.directions) <= 4, "Должно быть максимум 4 направления"
+    assert len(cleaned.task_types) <= 3, "Должно быть максимум 3 типа задач"
+    assert set(cleaned.directions).issubset(set(agent_manager.config.GITHUB_DIRECTIONS.keys()))
+    assert set(cleaned.task_types).issubset(set(agent_manager.config.GITHUB_TASK_TYPES.keys()))
+
+    # Проверка фильтрации невалидных тегов
+    bad_card = GitHubRepoCard(
+        summary="Краткое описание.",
+        tags=["test"],
+        directions=["not_a_valid_direction", "agents"],
+        task_types=["invalid_task", "rag_search"],
+    )
+    cleaned_bad = sanitize_repo_card(bad_card)
+    assert cleaned_bad.directions == ["agents"]
+    assert cleaned_bad.task_types == ["rag_search"]
+
+
+@check("github_fetcher.py: сквозной прогон пайплайна (30 репозиториев, новые vs старые)")
+def _():
+    import database
+    from unittest.mock import patch, AsyncMock
+    database.DB_NAME = TEST_DB_NAME
+    database.init_db()
+
+    # Добавим один репозиторий заранее в БД
+    database.save_article({
+        "title": "[GitHub] existing-org/existing-repo",
+        "summary": "Существующее описание из базы данных. Состоит из трех предложений. Полезно инженерам.",
+        "source_url": "https://github.com/existing-org/existing-repo",
+        "tags": ["Python", "Existing"],
+        "directions": ["backend"],
+        "task_types": ["classification"],
+        "source_type": "репозиторий",
+        "stars": 5000,
+        "period": "weekly",
+    })
+
+    # Создадим 3 тестовых трендовых репозитория (1 старый + 2 новых)
+    fake_trending = [
+        {
+            "id": "existing-org/existing-repo",
+            "title": "existing-org/existing-repo",
+            "description": "Old repo desc",
+            "full_text": "Language: Python | Stars: 5000\nDescription: Old repo desc",
+            "url": "https://github.com/existing-org/existing-repo",
+            "stars_total": 5000,
+            "stars_this_period": 300,
+            "trending_period": "weekly",
+        },
+        {
+            "id": "new-org/new-repo-1",
+            "title": "new-org/new-repo-1",
+            "description": "New repo 1 desc",
+            "full_text": "Language: Python | Stars: 1200\nDescription: New repo 1 desc",
+            "url": "https://github.com/new-org/new-repo-1",
+            "stars_total": 1200,
+            "stars_this_period": 150,
+            "trending_period": "weekly",
+        },
+        {
+            "id": "new-org/new-repo-2",
+            "title": "new-org/new-repo-2",
+            "description": "New repo 2 desc",
+            "full_text": "Language: Python | Stars: 800\nDescription: New repo 2 desc",
+            "url": "https://github.com/new-org/new-repo-2",
+            "stars_total": 800,
+            "stars_this_period": 90,
+            "trending_period": "monthly",
+        },
+    ]
+
+    import github_fetcher
+
+    with patch.object(github_fetcher, "fetch_top_trending_repos", AsyncMock(return_value=fake_trending)), \
+         patch.object(github_fetcher, "fetch_repo_readme", AsyncMock(return_value="# Demo Project\nThis is a test readme.")):
+
+        results = github_fetcher.run_github_trending_pipeline(limit=3)
+
+        assert len(results) == 3
+        # Первый репозиторий должен быть определен как уже существующий в базе
+        assert results[0]["is_new"] is False
+        assert results[0]["repo_name"] == "existing-org/existing-repo"
+        assert "Существующее описание" in results[0]["summary"]
+
+        # Второй и третий должны быть определены как новые
+        assert results[1]["is_new"] is True
+        assert results[1]["repo_name"] == "new-org/new-repo-1"
+        assert len(results[1]["summary"]) > 20
+        assert len(results[1]["directions"]) <= 4
+        assert len(results[1]["task_types"]) <= 3
+
+        assert results[2]["is_new"] is True
+        assert results[2]["repo_name"] == "new-org/new-repo-2"
+
+        # Проверяем, что новые репозитории появились в articles и в github_trending
+        assert database.repo_exists_in_db("https://github.com/new-org/new-repo-1") is True
+        assert database.repo_exists_in_db("https://github.com/new-org/new-repo-2") is True
+
+        trending_in_db = database.get_github_trending()
+        assert len(trending_in_db) == 3
 
 
 if __name__ == "__main__":
+
     print("=" * 60)
     print("ИТОГ")
     print("=" * 60)

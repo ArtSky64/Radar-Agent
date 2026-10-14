@@ -1,8 +1,11 @@
 import os
 import sqlite3
 import json
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
+
+# Московский часовой пояс (UTC+3)
+MSK_TZ = timezone(timedelta(hours=3))
 
 import config
 
@@ -44,6 +47,10 @@ def init_db():
             related_links TEXT NOT NULL DEFAULT '',
             source_article_url TEXT NOT NULL DEFAULT '',
             period TEXT NOT NULL DEFAULT '',
+            directions TEXT NOT NULL DEFAULT '[]',
+            task_types TEXT NOT NULL DEFAULT '[]',
+            stars INTEGER NOT NULL DEFAULT 0,
+            is_trending INTEGER NOT NULL DEFAULT 0,
             added_at TEXT DEFAULT CURRENT_TIMESTAMP
         );""")
 
@@ -62,6 +69,29 @@ def init_db():
             cursor.execute("ALTER TABLE articles ADD COLUMN source_article_url TEXT NOT NULL DEFAULT ''")
         if 'period' not in existing_cols:
             cursor.execute("ALTER TABLE articles ADD COLUMN period TEXT NOT NULL DEFAULT ''")
+        if 'directions' not in existing_cols:
+            cursor.execute("ALTER TABLE articles ADD COLUMN directions TEXT NOT NULL DEFAULT '[]'")
+        if 'task_types' not in existing_cols:
+            cursor.execute("ALTER TABLE articles ADD COLUMN task_types TEXT NOT NULL DEFAULT '[]'")
+        if 'stars' not in existing_cols:
+            cursor.execute("ALTER TABLE articles ADD COLUMN stars INTEGER NOT NULL DEFAULT 0")
+        if 'is_trending' not in existing_cols:
+            cursor.execute("ALTER TABLE articles ADD COLUMN is_trending INTEGER NOT NULL DEFAULT 0")
+
+        cursor.execute('''CREATE TABLE IF NOT EXISTS github_trending (
+            repo_name TEXT NOT NULL,
+            source_url TEXT NOT NULL UNIQUE,
+            summary TEXT NOT NULL DEFAULT '',
+            tags TEXT NOT NULL DEFAULT '[]',
+            directions TEXT NOT NULL DEFAULT '[]',
+            task_types TEXT NOT NULL DEFAULT '[]',
+            stars INTEGER NOT NULL DEFAULT 0,
+            stars_this_period INTEGER NOT NULL DEFAULT 0,
+            period TEXT NOT NULL DEFAULT '',
+            is_new INTEGER NOT NULL DEFAULT 0,
+            fetched_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );''')
+
         cursor.execute('''CREATE TABLE IF NOT EXISTS leaderboard (
             category TEXT NOT NULL,
             model_name TEXT NOT NULL,
@@ -130,16 +160,29 @@ def save_article(article: dict) -> None:
     tags = article.get('tags', [])
     if isinstance(tags, (list, dict)):
         tags_str = json.dumps(tags, ensure_ascii=False)
+    directions = article.get('directions', [])
+    if isinstance(directions, (list, dict)):
+        directions_str = json.dumps(directions, ensure_ascii=False)
     else:
-        tags_str = str(tags)
+        directions_str = str(directions or "[]")
+
+    task_types = article.get('task_types', [])
+    if isinstance(task_types, (list, dict)):
+        task_types_str = json.dumps(task_types, ensure_ascii=False)
+    else:
+        task_types_str = str(task_types or "[]")
+
+    stars = int(article.get('stars', 0) or 0)
+    is_trending = int(bool(article.get('is_trending', 0)))
 
     with get_connection() as conn:
         conn.execute('''
             INSERT INTO articles (
                 title, summary, source_url, tags, source_type, language,
-                topic_tag, related_links, source_article_url, period
+                topic_tag, related_links, source_article_url, period,
+                directions, task_types, stars, is_trending
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             article['title'],
             article.get('summary', ''),
@@ -151,7 +194,12 @@ def save_article(article: dict) -> None:
             related_links,
             article.get('source_article_url', ''),
             article.get('period', ''),
+            directions_str,
+            task_types_str,
+            stars,
+            is_trending,
         ))
+
 
 
 def upsert_related_material(material: dict, source_article_url: str) -> None:
@@ -212,17 +260,61 @@ def get_all_articles() -> list[dict]:
         articles = []
         for row in cursor:
             article = dict(row)
-            try:
-                article['tags'] = json.loads(article['tags'])
-            except Exception:
-                pass
-            if 'related_links' in article and article['related_links']:
-                try:
-                    article['related_links'] = json.loads(article['related_links'])
-                except Exception:
-                    pass
+            for key in ('tags', 'directions', 'task_types', 'related_links'):
+                if key in article and article[key]:
+                    try:
+                        article[key] = json.loads(article[key])
+                    except Exception:
+                        pass
+                elif key not in article and key in ('tags', 'directions', 'task_types'):
+                    article[key] = []
             articles.append(article)
         return articles
+
+
+def get_article_by_url(source_url: str) -> dict | None:
+    """Ищет статью/репозиторий в базе по URL (с нормализацией слэшей)."""
+    if not source_url:
+        return None
+    clean_url = source_url.strip().rstrip("/")
+    with get_connection() as conn:
+        cursor = conn.execute(
+            'SELECT rowid, * FROM articles WHERE source_url = ? OR source_url = ? LIMIT 1',
+            (clean_url, f"{clean_url}/")
+        )
+        row = cursor.fetchone()
+        if not row:
+            return None
+        article = dict(row)
+        for key in ('tags', 'directions', 'task_types', 'related_links'):
+            if key in article and article[key]:
+                try:
+                    article[key] = json.loads(article[key])
+                except Exception:
+                    pass
+            elif key not in article and key in ('tags', 'directions', 'task_types'):
+                article[key] = []
+        return article
+
+
+def repo_exists_in_db(repo_url_or_name: str) -> bool:
+    """Проверяет, есть ли репозиторий в БД по URL или имени author/repo."""
+    if not repo_url_or_name:
+        return False
+    val = repo_url_or_name.strip()
+    if val.startswith("http://") or val.startswith("https://"):
+        return get_article_by_url(val) is not None
+    # Если передано только имя 'owner/repo'
+    full_url = f"https://github.com/{val.lstrip('/')}"
+    if get_article_by_url(full_url) is not None:
+        return True
+    with get_connection() as conn:
+        cursor = conn.execute(
+            "SELECT 1 FROM articles WHERE title = ? OR title = ? OR source_url LIKE ? LIMIT 1",
+            (val, f"[GitHub] {val}", f"%github.com/{val}%")
+        )
+        return cursor.fetchone() is not None
+
 
 
 
@@ -351,6 +443,73 @@ def get_trending_models() -> list[dict]:
             item['tags'] = json.loads(item['tags'])
             result.append(item)
         return result
+
+
+def save_github_trending(repos: list[dict]) -> None:
+    """
+    Полностью заменяет текущий слепок трендовых репозиториев GitHub новым списком (до 30 шт).
+    """
+    fetched_at = (repos and repos[0].get("fetched_at")) or datetime.now(MSK_TZ).isoformat()
+    with get_connection() as conn:
+        conn.execute('DELETE FROM github_trending')
+        for r in repos:
+            tags = r.get("tags", [])
+            tags_str = json.dumps(tags, ensure_ascii=False) if isinstance(tags, (list, dict)) else str(tags)
+
+            directions = r.get("directions", [])
+            directions_str = json.dumps(directions, ensure_ascii=False) if isinstance(directions, (list, dict)) else str(directions)
+
+            task_types = r.get("task_types", [])
+            task_types_str = json.dumps(task_types, ensure_ascii=False) if isinstance(task_types, (list, dict)) else str(task_types)
+
+            conn.execute('''
+                INSERT INTO github_trending (
+                    repo_name, source_url, summary, tags, directions, task_types,
+                    stars, stars_this_period, period, is_new, fetched_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                r.get("repo_name") or r.get("title", ""),
+                r.get("source_url") or r.get("url", ""),
+                r.get("summary", ""),
+                tags_str,
+                directions_str,
+                task_types_str,
+                int(r.get("stars", 0) or 0),
+                int(r.get("stars_this_period", 0) or 0),
+                r.get("period", ""),
+                1 if r.get("is_new") else 0,
+                fetched_at,
+            ))
+
+
+def get_github_trending() -> list[dict]:
+    """Возвращает текущий актуальный список трендовых репозиториев GitHub."""
+    with get_connection() as conn:
+        cursor = conn.execute('SELECT rowid, * FROM github_trending ORDER BY rowid ASC')
+        result = []
+        for row in cursor:
+            item = dict(row)
+            for key in ('tags', 'directions', 'task_types'):
+                if key in item and item[key]:
+                    try:
+                        item[key] = json.loads(item[key])
+                    except Exception:
+                        pass
+                elif key not in item and key in ('tags', 'directions', 'task_types'):
+                    item[key] = []
+            item['is_new'] = bool(item.get('is_new', 0))
+            result.append(item)
+        return result
+
+
+def get_github_trending_last_fetched_at() -> str | None:
+    """Возвращает дату и время (ISO) последнего сбора списка трендов GitHub (или None)."""
+    with get_connection() as conn:
+        cursor = conn.execute('SELECT fetched_at FROM github_trending ORDER BY rowid ASC LIMIT 1')
+        row = cursor.fetchone()
+        return row['fetched_at'] if row else None
+
 
 
 def get_all_leaderboard_snapshots() -> list[dict]:

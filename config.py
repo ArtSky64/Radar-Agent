@@ -53,5 +53,46 @@ PAPERS_LIMIT = int(os.getenv("PAPERS_LIMIT", "10"))
 
 # --- GitHub & HuggingFace ---
 GITHUB_TRENDING_PERIODS = ["daily", "weekly", "monthly"]
+GITHUB_TRENDING_URLS = [
+    "https://github.com/trending/python?since=weekly",
+    "https://github.com/trending/python?since=monthly",
+]
+GITHUB_TRENDING_LIMIT = 30
+
+# Фиксированные списки тегов согласно ТЗ
+GITHUB_DIRECTIONS = {
+    "health_ai": "Медицинский AI, биомедицина, анализ медицинских данных",
+    "cv": "Computer Vision, анализ изображений и видео",
+    "audio": "Распознавание, генерация и обработка аудио",
+    "nlp_llm": "NLP, LLM, обработка и генерация текста",
+    "agents": "AI-агенты, мультиагентные системы",
+    "generative_ai": "Генерация изображений, видео, аудио, синтетических данных",
+    "classical_ml": "Классическое ML: классификация, регрессия, кластеризация",
+    "robotics": "Робототехника, автономные системы",
+    "ml_infrastructure": "MLOps, инференс, обучение, оптимизация и развёртывание моделей",
+    "backend": "API, серверные приложения, интеграции",
+    "data_engineering": "Пайплайны данных, ETL, разметка, хранение и обработка датасетов",
+}
+GITHUB_MAX_DIRECTIONS = 4
+
+GITHUB_TASK_TYPES = {
+    "classification": "Классификация объектов, текстов, изображений, аудио",
+    "regression": "Регрессия, предсказание непрерывных значений, forecasting, временные ряды",
+    "clustering": "Кластеризация, поиск закономерностей, понижение размерности, embeddings",
+    "detection_tracking": "Детекция и отслеживание объектов",
+    "segmentation": "Сегментация изображений и видео",
+    "generation": "Генерация контента и синтетических данных",
+    "recognition": "Распознавание речи, звуков, текста (ASR, speaker ID, sound events)",
+    "rag_search": "RAG, поиск информации, векторные БД, retrieval",
+    "agent_orchestration": "Оркестрация агентов, tool calling, MCP, промпт-инжиниринг",
+    "training_finetuning": "Обучение и дообучение моделей",
+    "inference_optimization": "Ускорение и оптимизация инференса",
+    "evaluation": "Бенчмарки, оценка качества, интерпретируемость, XAI",
+    "reinforcement_learning": "RL, RLHF, обучение с подкреплением",
+    "anomaly_detection": "Поиск аномалий и выбросов",
+}
+GITHUB_MAX_TASK_TYPES = 3
+
 HF_DATASET_MODES = ["query", "recent", "trending", "trending_ru"]
 HF_MODEL_MODES = ["trending", "trending_ru"]
+

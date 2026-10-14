@@ -1,10 +1,37 @@
 # для запуска: uvicorn app:app --reload (бэкенд), затем python -m streamlit run frontend.py (фронтенд)
 
 import os
-from collections import defaultdict
-import streamlit as st
 import requests
-from html import escape
+import streamlit as st
+from datetime import datetime, timedelta, timezone
+
+# Московский часовой пояс (UTC+3)
+MSK_TZ = timezone(timedelta(hours=3))
+
+
+def format_timestamp_ru(ts_str: str | None) -> str:
+    """Преобразует ISO строку даты/времени в понятный формат по МСК (UTC+3)."""
+    if not ts_str:
+        return "нет данных"
+    try:
+        ts = str(ts_str).strip()
+        if ts.endswith("Z"):
+            ts = ts[:-1] + "+00:00"
+        dt = datetime.fromisoformat(ts)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc).astimezone(MSK_TZ)
+        else:
+            dt = dt.astimezone(MSK_TZ)
+
+        months = [
+            "января", "февраля", "марта", "апреля", "мая", "июня",
+            "июля", "августа", "сентября", "октября", "ноября", "декабря"
+        ]
+        return f"{dt.day} {months[dt.month - 1]} {dt.year} г., {dt.strftime('%H:%M')} (МСК)"
+    except Exception:
+        return str(ts_str)
+
+
 
 from leaderboard_view import (
     ALL_CATEGORIES,
@@ -13,6 +40,7 @@ from leaderboard_view import (
     category_count_label,
     format_rating,
 )
+
 
 # Устанавливаем широкую компоновку и принудительно открываем сайдбар
 st.set_page_config(layout="wide", initial_sidebar_state="expanded")
@@ -164,9 +192,24 @@ leaderboard_res = fetch_data("leaderboard")
 trending_res = fetch_data("trending/models")
 articles_res = fetch_data("articles")
 analysis_res = fetch_data("leaderboard/analysis")
+github_trending_res = fetch_data("trending/github")
+
+github_trending_list = github_trending_res.get("data", []) if github_trending_res.get("status") == "success" else []
+github_last_fetched_at = github_trending_res.get("last_fetched_at")
+if not github_trending_list:
+    try:
+        from database import get_github_trending, get_github_trending_last_fetched_at
+        github_trending_list = get_github_trending()
+        github_last_fetched_at = get_github_trending_last_fetched_at()
+    except Exception:
+        pass
+elif not github_last_fetched_at and github_trending_list:
+    github_last_fetched_at = github_trending_list[0].get("fetched_at")
+
 
 analysis_list = analysis_res.get("data", []) if analysis_res.get("status") == "success" else []
 latest_analysis = analysis_list[0] if analysis_list else None
+
 
 # Парсинг реальных данных из бэкенда
 leaderboard_records = []
@@ -283,6 +326,47 @@ with st.sidebar:
                     "Тематический срез", available_topics, placeholder="Все темы..."
                 )
 
+        # Фильтры для Репозиториев (ТЗ созвона)
+        selected_directions = []
+        selected_task_types = []
+        selected_repo_status = "Все"
+
+        if page == "Репозитории":
+            try:
+                import config
+                all_dir_keys = list(config.GITHUB_DIRECTIONS.keys())
+                all_task_keys = list(config.GITHUB_TASK_TYPES.keys())
+            except Exception:
+                all_dir_keys = []
+                all_task_keys = []
+
+            selected_directions = st.multiselect(
+                "Направление (0-4)",
+                all_dir_keys,
+                placeholder="Все направления...",
+                help="Фиксированный список направлений"
+            )
+            selected_task_types = st.multiselect(
+                "Тип задачи (0-3)",
+                all_task_keys,
+                placeholder="Все типы задач...",
+                help="Фиксированный список типов задач"
+            )
+            selected_repo_status = st.selectbox(
+                "Статус",
+                ["Все", "Новые в тренде", "Уже были в базе (в тренде)"]
+            )
+            if github_last_fetched_at:
+                st.markdown(
+                    f"<div style='margin-top:14px; padding:10px 12px; background:#12121A; border:1px solid #2D1B4E; border-radius:8px; font-size:0.8rem; color:#A1A1AA;'>"
+                    f"🕒 <strong>Последний сбор:</strong><br>"
+                    f"<span style='color:#34D399; font-weight:600;'>{format_timestamp_ru(github_last_fetched_at)}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+
+
+
 # --- ЛОГИКА ОТРЕСОВКИ СТРАНИЦ ---
 
 if page == "Лидерборд моделей":
@@ -363,12 +447,76 @@ elif page in _CONTENT_TABS:
     st.markdown(f"<h1>{page}</h1>", unsafe_allow_html=True)
     st.caption(tab_info["hint"])
 
-    articles = [a for a in article_list if a.get("source_type", "статья") == tab_info["source_type"]]
+    if page == "Репозитории":
+        col_btn, col_info = st.columns([1, 3])
+        with col_btn:
+            if st.button("🔄 Обновить тренды GitHub", help="Запустить сбор актуальных 30 репозиториев (weekly + monthly)"):
+                try:
+                    res = requests.post(f"{API_URL}/trending/github/refresh", timeout=3)
+                    st.success("Сбор трендов запущен в фоне!")
+                except Exception:
+                    try:
+                        from github_fetcher import run_github_trending_pipeline
+                        with st.spinner("Сбор трендов GitHub (weekly + monthly)..."):
+                            run_github_trending_pipeline(limit=30)
+                        st.success("Тренды успешно собраны!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Ошибка сбора: {e}")
+
+        with col_info:
+            if github_last_fetched_at:
+                formatted_dt = format_timestamp_ru(github_last_fetched_at)
+                st.markdown(
+                    f"<div style='display:flex; align-items:center; height:100%; padding-top:4px; font-size:0.95rem; color:#E4E4E7;'>"
+                    f"🕒 <span style='color:#A1A1AA; margin-right:6px;'>Последний сбор списка:</span>"
+                    f"<span style='color:#34D399; font-weight:600; background:#064E3B; padding:3px 10px; border-radius:6px; border:1px solid #059669;'>"
+                    f"{formatted_dt}</span>"
+                    f"</div>",
+                    unsafe_allow_html=True,
+                )
+            else:
+                st.markdown(
+                    "<div style='display:flex; align-items:center; height:100%; padding-top:6px; font-size:0.9rem; color:#A1A1AA;'>"
+                    "🕒 <em>Данные трендов еще не собирались</em>"
+                    "</div>",
+                    unsafe_allow_html=True,
+                )
+
+
+        # Используем актуальный слепок из github_trending, если он есть
+        if github_trending_list:
+            articles = list(github_trending_list)
+        else:
+            articles = [a for a in article_list if a.get("source_type") == "репозиторий"]
+
+        # Фильтр по статусу в тренде
+        if selected_repo_status == "Новые в тренде":
+            articles = [a for a in articles if a.get("is_new")]
+        elif selected_repo_status == "Уже были в базе (в тренде)":
+            articles = [a for a in articles if not a.get("is_new")]
+
+        # Фильтр по направлениям (0-4)
+        if selected_directions:
+            articles = [
+                a for a in articles
+                if any(d in selected_directions for d in a.get("directions", []))
+            ]
+
+        # Фильтр по типам задач (0-3)
+        if selected_task_types:
+            articles = [
+                a for a in articles
+                if any(t in selected_task_types for t in a.get("task_types", []))
+            ]
+    else:
+        articles = [a for a in article_list if a.get("source_type", "статья") == tab_info["source_type"]]
 
     if search_art:
         articles = [a for a in articles if
-                    search_art.lower() in a.get('title', '').lower() or search_art.lower() in a.get('summary',
-                                                                                                    '').lower()]
+                    search_art.lower() in a.get('title', '').lower() or
+                    search_art.lower() in a.get('repo_name', '').lower() or
+                    search_art.lower() in a.get('summary', '').lower()]
 
     if selected_tags:
         articles = [a for a in articles if any(t in selected_tags for t in a.get("tags", []))]
@@ -407,10 +555,33 @@ elif page in _CONTENT_TABS:
     if articles:
         for a in articles:
             tags_html = "".join([f'<span class="article-tag">{t}</span>' for t in a.get("tags", [])])
-            source_url = a.get("source_url", "")
-            source_type = a.get("source_type", "статья")
+            source_url = a.get("source_url") or a.get("url", "")
+            source_type = a.get("source_type", "репозиторий" if page == "Репозитории" else "статья")
             type_color = _TYPE_COLORS.get(source_type, "#8B5CF6")
             type_badge = f'<span style="font-size:0.7rem; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; color:{type_color}; border:1px solid {type_color}; border-radius:6px; padding:2px 8px; margin-right:8px;">{source_type}</span>'
+
+            # Специфичные бейджи для репозиториев
+            repo_extra_badges = ""
+            if page == "Репозитории" or source_type == "репозиторий":
+                is_new = a.get("is_new", False)
+                if is_new:
+                    status_badge = '<span style="font-size:0.7rem; font-weight:700; color:#34D399; background:#064E3B; border:1px solid #059669; border-radius:6px; padding:2px 8px; margin-right:6px;">🌟 НОВЫЙ В ТРЕНДЕ</span>'
+                else:
+                    status_badge = '<span style="font-size:0.7rem; font-weight:700; color:#A78BFA; background:#2E1065; border:1px solid #7C3AED; border-radius:6px; padding:2px 8px; margin-right:6px;">🔥 В ТРЕНДЕ</span>'
+
+                stars_count = a.get("stars", 0)
+                stars_badge = f'<span style="font-size:0.7rem; font-weight:700; color:#FBBF24; background:#451A03; border:1px solid #D97706; border-radius:6px; padding:2px 8px; margin-right:6px;">⭐ {stars_count:,}</span>' if stars_count else ""
+
+                dirs_badges = "".join([
+                    f'<span style="font-size:0.7rem; font-weight:600; color:#38BDF8; background:#0F172A; border:1px solid #0284C7; border-radius:6px; padding:2px 8px; margin-right:4px;">🧭 {d}</span>'
+                    for d in a.get("directions", [])
+                ])
+                tasks_badges = "".join([
+                    f'<span style="font-size:0.7rem; font-weight:600; color:#C084FC; background:#2E1065; border:1px solid #7E22CE; border-radius:6px; padding:2px 8px; margin-right:4px;">🎯 {t}</span>'
+                    for t in a.get("task_types", [])
+                ])
+                repo_extra_badges = f"{status_badge}{stars_badge}{dirs_badges}{tasks_badges}"
+
             language = (a.get("language") or "").strip()
             lang_badge = (
                 f'<span style="font-size:0.7rem; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; color:#A1A1AA; border:1px solid #2D1B4E; border-radius:6px; padding:2px 8px; margin-right:8px;">{language}</span>'
@@ -443,12 +614,18 @@ elif page in _CONTENT_TABS:
                 if badges:
                     rel_html = f'<div style="margin-top:6px;">{"".join(badges)}</div>'
 
+            btn_label = "Открыть на GitHub →" if source_type == "репозиторий" else "Читать источник →"
             link_html = (
-                f'<a href="{source_url}" target="_blank" style="font-size:0.85rem; color:#A78BFA; text-decoration:none;">Читать источник →</a>'
+                f'<a href="{source_url}" target="_blank" style="font-size:0.85rem; color:#A78BFA; text-decoration:none;">{btn_label}</a>'
                 if source_url else ""
             )
             st.markdown(
-                f'<div class="custom-card"><div class="article-tags">{type_badge}{lang_badge}{topic_badge}{tags_html}</div><h4 style="margin:0; color:#FFFFFF;">{a.get("title")}</h4><p style="font-size:0.9rem; color:#D4D4D8; margin:8px 0;">{a.get("summary")}</p>{source_art_html}{rel_html}<div style="margin-top:8px;">{link_html}</div></div>',
+                f'<div class="custom-card">'
+                f'<div class="article-tags">{type_badge}{repo_extra_badges}{lang_badge}{topic_badge}{tags_html}</div>'
+                f'<h4 style="margin:0; color:#FFFFFF;">{a.get("title") or a.get("repo_name")}</h4>'
+                f'<p style="font-size:0.9rem; color:#D4D4D8; margin:8px 0; line-height:1.5;">{a.get("summary")}</p>'
+                f'{source_art_html}{rel_html}'
+                f'<div style="margin-top:8px;">{link_html}</div></div>',
                 unsafe_allow_html=True)
     else:
         st.info("Материалы не найдены.")

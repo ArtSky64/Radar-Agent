@@ -136,3 +136,7 @@ def stream_hf_datasets_by_mode(mode: str):
     articles = asyncio.run(fetch_hf_datasets_by_mode(mode))
     for article in articles:
         yield article
+
+def stream_hf_datasets(query: str = "machine learning"):
+    """Алиас для обратной совместимости со старыми тестами и вызовами."""
+    yield from stream_hf_datasets_by_mode("query")
