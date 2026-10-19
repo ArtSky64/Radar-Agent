@@ -51,6 +51,7 @@ def init_db():
             task_types TEXT NOT NULL DEFAULT '[]',
             stars INTEGER NOT NULL DEFAULT 0,
             is_trending INTEGER NOT NULL DEFAULT 0,
+            has_code INTEGER NOT NULL DEFAULT 0,
             added_at TEXT DEFAULT CURRENT_TIMESTAMP
         );""")
 
@@ -77,6 +78,61 @@ def init_db():
             cursor.execute("ALTER TABLE articles ADD COLUMN stars INTEGER NOT NULL DEFAULT 0")
         if 'is_trending' not in existing_cols:
             cursor.execute("ALTER TABLE articles ADD COLUMN is_trending INTEGER NOT NULL DEFAULT 0")
+        if 'has_code' not in existing_cols:
+            cursor.execute("ALTER TABLE articles ADD COLUMN has_code INTEGER NOT NULL DEFAULT 0")
+
+        # Миграция наличия кода: если в ссылках или тексте есть github/code -> has_code = 1
+        cursor.execute("""
+            UPDATE articles
+            SET has_code = 1
+            WHERE related_links LIKE '%github%'
+               OR related_links LIKE '%code%'
+               OR source_url LIKE '%github.com%'
+               OR summary LIKE '%github.com%';
+        """)
+
+        # Очистка ошибочно проставленного тега #healthcare у немедицинских статей (например, Minecraft, Argon, Hy-Memory)
+        cursor.execute("""
+            UPDATE articles
+            SET topic_tag = ''
+            WHERE topic_tag = 'healthcare'
+              AND (
+                  (
+                      lower(title || ' ' || summary) NOT LIKE '%health%'
+                      AND lower(title || ' ' || summary) NOT LIKE '%medic%'
+                      AND lower(title || ' ' || summary) NOT LIKE '%clinic%'
+                      AND lower(title || ' ' || summary) NOT LIKE '%patient%'
+                      AND lower(title || ' ' || summary) NOT LIKE '%biomed%'
+                      AND lower(title || ' ' || summary) NOT LIKE '%hospital%'
+                      AND lower(title || ' ' || summary) NOT LIKE '%disease%'
+                      AND lower(title || ' ' || summary) NOT LIKE '%doctor%'
+                      AND lower(title || ' ' || summary) NOT LIKE '%pharma%'
+                      AND lower(title || ' ' || summary) NOT LIKE '%ehr%'
+                  )
+                  OR lower(title || ' ' || summary) LIKE '%minecraft%'
+                  OR lower(title || ' ' || summary) LIKE '%argon%'
+                  OR lower(title || ' ' || summary) LIKE '%game%'
+              );
+        """)
+
+        # Очистка любых случайных статей со стоп-словами из медицинских разделов
+        cursor.execute("""
+            UPDATE articles
+            SET topic_tag = ''
+            WHERE topic_tag IN ('healthcare', 'medical-imaging', 'biology')
+              AND (
+                  lower(title || ' ' || summary) LIKE '%minecraft%'
+                  OR lower(title || ' ' || summary) LIKE '%argon%'
+                  OR lower(title || ' ' || summary) LIKE '%game%'
+              );
+        """)
+
+        # Удаление псевдо-датасетов/моделей, ошибочно созданных как карточки-заглушки из статей
+        cursor.execute("""
+            DELETE FROM articles
+            WHERE summary LIKE 'Связанный материал к статье:%'
+               OR summary LIKE 'Связанный материал к статье %';
+        """)
 
         cursor.execute('''CREATE TABLE IF NOT EXISTS github_trending (
             repo_name TEXT NOT NULL,
@@ -130,6 +186,18 @@ def init_db():
             cursor.execute("ALTER TABLE hf_trending ADD COLUMN language TEXT NOT NULL DEFAULT ''")
         if 'variant' not in trending_cols:
             cursor.execute("ALTER TABLE hf_trending ADD COLUMN variant TEXT NOT NULL DEFAULT ''")
+        if 'directions' not in trending_cols:
+            cursor.execute("ALTER TABLE hf_trending ADD COLUMN directions TEXT NOT NULL DEFAULT '[]'")
+        if 'task_types' not in trending_cols:
+            cursor.execute("ALTER TABLE hf_trending ADD COLUMN task_types TEXT NOT NULL DEFAULT '[]'")
+        if 'parameters' not in trending_cols:
+            cursor.execute("ALTER TABLE hf_trending ADD COLUMN parameters TEXT NOT NULL DEFAULT ''")
+        if 'rank_global' not in trending_cols:
+            cursor.execute("ALTER TABLE hf_trending ADD COLUMN rank_global INTEGER NOT NULL DEFAULT 0")
+        if 'rank_ru' not in trending_cols:
+            cursor.execute("ALTER TABLE hf_trending ADD COLUMN rank_ru INTEGER NOT NULL DEFAULT 0")
+        if 'trending_score' not in trending_cols:
+            cursor.execute("ALTER TABLE hf_trending ADD COLUMN trending_score REAL NOT NULL DEFAULT 0.0")
         conn.commit()
 
 
@@ -172,17 +240,39 @@ def save_article(article: dict) -> None:
     else:
         task_types_str = str(task_types or "[]")
 
-    stars = int(article.get('stars', 0) or 0)
+    stars = int(article.get('stars', 0) or article.get('upvotes', 0) or 0)
     is_trending = int(bool(article.get('is_trending', 0)))
+    has_code = int(bool(article.get('has_code', 0)))
+    if not has_code:
+        # Автоопределение по ссылкам и тексту
+        if 'github' in str(related_links).lower() or 'github.com' in article.get('source_url', '') or 'github.com' in article.get('summary', ''):
+            has_code = 1
 
     with get_connection() as conn:
+        cursor = conn.execute(
+            "SELECT rowid, stars, has_code, period, related_links, topic_tag FROM articles WHERE source_url = ? LIMIT 1",
+            (article['source_url'],)
+        )
+        row = cursor.fetchone()
+        if row:
+            conn.execute('''
+                UPDATE articles
+                SET stars = MAX(stars, ?),
+                    has_code = MAX(has_code, ?),
+                    period = CASE WHEN period = '' OR period IS NULL THEN ? ELSE period END,
+                    related_links = CASE WHEN related_links = '' OR related_links = '[]' OR related_links IS NULL THEN ? ELSE related_links END,
+                    topic_tag = CASE WHEN topic_tag = '' OR topic_tag IS NULL THEN ? ELSE topic_tag END
+                WHERE rowid = ?
+            ''', (stars, has_code, article.get('period', ''), related_links, article.get('topic_tag', ''), row['rowid']))
+            return
+
         conn.execute('''
             INSERT INTO articles (
                 title, summary, source_url, tags, source_type, language,
                 topic_tag, related_links, source_article_url, period,
-                directions, task_types, stars, is_trending
+                directions, task_types, stars, is_trending, has_code
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             article['title'],
             article.get('summary', ''),
@@ -198,20 +288,20 @@ def save_article(article: dict) -> None:
             task_types_str,
             stars,
             is_trending,
+            has_code,
         ))
 
 
 
 def upsert_related_material(material: dict, source_article_url: str) -> None:
     """
-    ТЗ 1.3: Связанные датасеты/модели из карточки статьи.
-    Если модели/датасета ещё нет в БД — вставляем;
-    если есть — добавляем source_article_url к записи.
+    Связанные датасеты и модели отображаются ссылками внутри карточки статьи.
+    Если такой датасет/модель уже реально существует в базе (собран парсером),
+    добавляем к нему обратную ссылку на статью. Отдельные карточки-заглушки не создаются.
     """
     name = material.get('name') or material.get('title') or ''
     source_url = material.get('url') or material.get('source_url') or ''
     source_type = material.get('type') or material.get('source_type') or 'модель'
-    summary = material.get('summary', f"Связанный материал к статье: {source_article_url}")
 
     if not source_url and not name:
         return
@@ -230,25 +320,6 @@ def upsert_related_material(material: dict, source_article_url: str) -> None:
                     "UPDATE articles SET source_article_url = ? WHERE rowid = ?",
                     (new_source, row['rowid'])
                 )
-        else:
-            conn.execute('''
-                INSERT INTO articles (
-                    title, summary, source_url, tags, source_type, language,
-                    topic_tag, related_links, source_article_url, period
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', (
-                name,
-                summary,
-                source_url,
-                json.dumps([source_type], ensure_ascii=False),
-                source_type,
-                '',
-                '',
-                '',
-                source_article_url,
-                '',
-            ))
 
 
 def get_all_articles() -> list[dict]:
@@ -256,7 +327,7 @@ def get_all_articles() -> list[dict]:
         # Без ORDER BY SQLite отдаёт по rowid (порядок вставки) — старые статьи
         # были наверху. Сортируем по added_at, новые сначала; rowid DESC как
         # тай-брейк для записей с одинаковой секундой добавления.
-        cursor = conn.execute('SELECT rowid, * FROM articles ORDER BY added_at DESC, rowid DESC')
+        cursor = conn.execute("SELECT rowid, * FROM articles WHERE summary NOT LIKE 'Связанный материал к статье:%' ORDER BY added_at DESC, rowid DESC")
         articles = []
         for row in cursor:
             article = dict(row)
@@ -403,46 +474,91 @@ def get_analysis_history(limit: int = 10) -> list[dict]:
 def save_trending_models(models: list[dict]) -> None:
     """
     Полностью заменяет предыдущую витрину трендовых моделей новой.
-    models: [{"name": str, "downloads": int, "likes": int, "tags": list[str], "url": str, "summary": str, "pipeline_tag": str, "license": str, "card_description": str, "language": str, "variant": str}, ...]
+    Поддерживает направления, типы задач, параметры, рейтинги (RU и мировой) и трендинг-скор.
     """
-    fetched_at = datetime.utcnow().isoformat()
+    init_db()
+    fetched_at = (models and models[0].get("fetched_at")) or datetime.now(MSK_TZ).isoformat()
     with get_connection() as conn:
         conn.execute('DELETE FROM hf_trending')
-        conn.executemany('''
-            INSERT INTO hf_trending (
-                model_name, downloads, likes, tags, source_url, summary, fetched_at,
-                pipeline_tag, license, card_description, language, variant
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', [
-            (
-                m["name"],
-                m["downloads"],
-                m["likes"],
-                json.dumps(m["tags"]),
-                m.get("url") or f"https://huggingface.co/{m['name']}",
+        for m in models:
+            tags = m.get("tags", [])
+            tags_str = json.dumps(tags, ensure_ascii=False) if isinstance(tags, (list, dict)) else str(tags)
+
+            directions = m.get("directions", [])
+            directions_str = json.dumps(directions, ensure_ascii=False) if isinstance(directions, (list, dict)) else str(directions)
+
+            task_types = m.get("task_types", [])
+            task_types_str = json.dumps(task_types, ensure_ascii=False) if isinstance(task_types, (list, dict)) else str(task_types)
+
+            conn.execute('''
+                INSERT INTO hf_trending (
+                    model_name, downloads, likes, tags, source_url, summary, fetched_at,
+                    pipeline_tag, license, card_description, language, variant,
+                    directions, task_types, parameters, rank_global, rank_ru, trending_score
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                m.get("name") or m.get("model_name", "Unknown"),
+                int(m.get("downloads", 0) or 0),
+                int(m.get("likes", 0) or 0),
+                tags_str,
+                m.get("url") or m.get("source_url") or f"https://huggingface.co/{m.get('name') or m.get('model_name')}",
                 m.get("summary") or "",
                 fetched_at,
                 m.get("pipeline_tag") or "",
                 m.get("license") or "",
                 m.get("card_description") or "",
                 m.get("language") or "",
-                m.get("variant") or ""
-            )
-            for m in models
-        ])
+                m.get("variant") or "",
+                directions_str,
+                task_types_str,
+                m.get("parameters") or "",
+                int(m.get("rank_global", 0) or 0),
+                int(m.get("rank_ru", 0) or 0),
+                float(m.get("trending_score", 0.0) or 0.0),
+            ))
 
 
-def get_trending_models() -> list[dict]:
-    """Текущая витрина трендовых моделей (порядок сохранён как при сохранении)."""
+def get_trending_models(variant: str | None = None) -> list[dict]:
+    """
+    Текущая витрина трендовых моделей.
+    variant: None (все), 'ru' (только с поддержкой русского), 'global' (мировые тренды).
+    """
+    init_db()
+    query = 'SELECT rowid, * FROM hf_trending'
+    params = []
+    if variant == 'ru':
+        query += ' WHERE rank_ru > 0 OR variant LIKE ? OR language LIKE ? ORDER BY CASE WHEN rank_ru > 0 THEN rank_ru ELSE 9999 END ASC, trending_score DESC, downloads DESC'
+        params.extend(['%ru%', '%ru%'])
+    elif variant == 'global':
+        query += ' WHERE rank_global > 0 ORDER BY rank_global ASC'
+    else:
+        query += ' ORDER BY rowid ASC'
+
     with get_connection() as conn:
-        cursor = conn.execute('SELECT rowid, * FROM hf_trending ORDER BY rowid ASC')
+        cursor = conn.execute(query, params)
         result = []
         for row in cursor:
             item = dict(row)
-            item['tags'] = json.loads(item['tags'])
+            for key in ('tags', 'directions', 'task_types'):
+                if key in item and item[key]:
+                    try:
+                        item[key] = json.loads(item[key])
+                    except Exception:
+                        pass
+                elif key not in item or not item[key]:
+                    item[key] = []
             result.append(item)
         return result
+
+
+def get_hf_trending_last_fetched_at() -> str | None:
+    """Возвращает дату/время (ISO) последнего сбора трендовых моделей HF."""
+    init_db()
+    with get_connection() as conn:
+        cursor = conn.execute('SELECT fetched_at FROM hf_trending ORDER BY rowid ASC LIMIT 1')
+        row = cursor.fetchone()
+        return row['fetched_at'] if row else None
 
 
 def save_github_trending(repos: list[dict]) -> None:

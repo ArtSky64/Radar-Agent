@@ -147,6 +147,7 @@ def main() -> None:
     parser.add_argument("--no-frontend", action="store_true", help="Не запускать веб-интерфейс Streamlit")
     parser.add_argument("--no-api", action="store_true", help="Не запускать FastAPI бэкенд")
     parser.add_argument("--run-once", action="store_true", help="Запустить main.py один раз вместо цикличного scheduler.py")
+    parser.add_argument("--only-datasets", action="store_true", help="Запустить сбор только датасетов (main.py --only-datasets)")
 
     args = parser.parse_args()
 
@@ -187,7 +188,9 @@ def main() -> None:
         ]
 
     if not args.no_pipeline:
-        if args.run_once:
+        if args.only_datasets:
+            commands["pipeline"] = [sys.executable, "-u", "main.py", "--only-datasets"]
+        elif args.run_once:
             commands["pipeline"] = [sys.executable, "-u", "main.py"]
         else:
             commands["pipeline"] = [sys.executable, "-u", "scheduler.py"]
@@ -202,7 +205,12 @@ def main() -> None:
         print(f"  {BOLD}REST API (FastAPI):{RESET}        http://localhost:{args.api_port}")
         print(f"  {BOLD}Документация API:{RESET}          http://localhost:{args.api_port}/docs")
     if not args.no_pipeline:
-        mode_text = "main.py (разовый запуск)" if args.run_once else "scheduler.py (цикличный сбор)"
+        if args.only_datasets:
+            mode_text = "main.py --only-datasets (только датасеты)"
+        elif args.run_once:
+            mode_text = "main.py (разовый запуск)"
+        else:
+            mode_text = "scheduler.py (цикличный сбор)"
         print(f"  {BOLD}Пайплайн сбора данных:{RESET}    {mode_text}")
     print("=" * 70)
     print(f"Для остановки всех сервисов нажмите {BOLD}Ctrl + C{RESET}\n")

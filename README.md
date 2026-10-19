@@ -63,6 +63,28 @@ python run_all.py
 ```
 Скрипт поочередно запустит все парсеры, пропустит данные через агентов-аналитиков, дедуплицирует и положит новые находки в базу данных.
 
+**Точечный запуск отдельных модулей:**
+- **Только датасеты (Hugging Face + Kaggle):**
+  ```bash
+  python main.py --only-datasets
+  ```
+- **Только статьи (HF + PwC):**
+  ```bash
+  python main.py --only-papers
+  ```
+- **Только тренды GitHub:**
+  ```bash
+  python main.py --only-github
+  ```
+- **Только тренды моделей HF:**
+  ```bash
+  python main.py --only-models
+  ```
+- **Только лидерборд LMSys Arena:**
+  ```bash
+  python main.py --only-arena
+  ```
+
 **Автоматический запуск по расписанию:**
 ```bash
 python scheduler.py

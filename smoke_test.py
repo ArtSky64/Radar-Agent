@@ -43,7 +43,8 @@ def _():
                      "get_all_articles", "delete_old_vectors",
                      "save_leaderboard_data", "get_all_leaderboard_snapshots",
                      "upsert_related_material", "get_article_by_url", "repo_exists_in_db",
-                     "save_github_trending", "get_github_trending"):
+                     "save_github_trending", "get_github_trending", "get_github_trending_last_fetched_at",
+                     "save_trending_models", "get_trending_models", "get_hf_trending_last_fetched_at"):
         assert hasattr(database, fn_name), f"database.py: нет функции {fn_name}"
 
     import FetcherHF
@@ -66,6 +67,10 @@ def _():
 
     assert hasattr(agent_manager, "analyze_github_repo")
     assert hasattr(agent_manager, "GitHubRepoCard")
+    assert hasattr(agent_manager, "HFModelCard")
+    assert hasattr(agent_manager, "analyze_hf_model")
+    assert hasattr(agent_manager, "clean_model_tags")
+    assert hasattr(agent_manager, "extract_model_parameters")
 
     import main
     assert hasattr(main, "stream_all_new_articles")
@@ -507,6 +512,133 @@ def _():
 
         trending_in_db = database.get_github_trending()
         assert len(trending_in_db) == 3
+
+
+@check("mcp_fetcher_hf_trending: параметры, порезка тегов, направления/задачи и сквозной рейтинг")
+def _():
+    import agent_manager
+    import database
+    import config
+
+    database.DB_NAME = TEST_DB_NAME
+    database.init_db()
+
+    # 1. Проверка извлечения параметров
+    assert agent_manager.extract_model_parameters("underdog-saluki-27b") == "27B"
+    assert agent_manager.extract_model_parameters("LiquidAI/d1-3B") == "3B"
+    assert agent_manager.extract_model_parameters("LiquidAI/d1-omni-600M") == "600M"
+    assert agent_manager.extract_model_parameters("Qwen2.5-7B-Instruct-GGUF") == "7B"
+
+    # 2. Проверка порезки мусорных тегов (отсечение тысяч языковых кодов и тех. меток)
+    bloated_tags = [
+        "transformers", "safetensors", "endpoints_compatible", "region:us",
+        "custom_code", "aah", "aai", "rus", "eng", "fra", "zyp", "arxiv:2401.12345",
+        "license:mit", "dataset:open-data", "GGUF", "multimodal", "vision", "moe"
+    ]
+    cleaned = agent_manager.clean_model_tags(bloated_tags, max_tags=5)
+    assert len(cleaned) <= 5
+    for junk in ("safetensors", "endpoints_compatible", "aah", "zyp", "rus", "eng"):
+        assert junk not in cleaned
+
+    # 3. Проверка анализа модели
+    card = agent_manager.analyze_hf_model(
+        model_name="test-org/underdog-saluki-27b",
+        pipeline_tag="text-generation",
+        tags=["LLM", "GGUF", "conversational"],
+        card_description="A 27B parameter open text generation model."
+    )
+    assert isinstance(card, agent_manager.HFModelCard)
+    assert card.parameters == "27B"
+    assert len(card.directions) <= config.HF_MAX_DIRECTIONS
+    assert len(card.task_types) <= config.HF_MAX_TASK_TYPES
+    for d in card.directions:
+        assert d in config.HF_DIRECTIONS
+    for t in card.task_types:
+        assert t in config.HF_TASK_TYPES
+
+    # 4. Проверка сохранения в БД и фильтрации по variant / рейтингу
+    test_models = [
+        {
+            "name": "global-only-model",
+            "model_name": "global-only-model",
+            "downloads": 50000,
+            "likes": 1200,
+            "trending_score": 500.0,
+            "tags": ["LLM", "GGUF"],
+            "url": "https://huggingface.co/global-only-model",
+            "summary": "Мировая модель",
+            "pipeline_tag": "text-generation",
+            "license": "apache-2.0",
+            "card_description": "Global desc",
+            "language": "",
+            "variant": "global",
+            "directions": ["nlp_llm"],
+            "task_types": ["generation"],
+            "parameters": "7B",
+            "rank_global": 1,
+            "rank_ru": 0,
+        },
+        {
+            "name": "ru-and-global-model",
+            "model_name": "ru-and-global-model",
+            "downloads": 30000,
+            "likes": 800,
+            "trending_score": 450.0,
+            "tags": ["LLM", "Russian"],
+            "url": "https://huggingface.co/ru-and-global-model",
+            "summary": "Русско-мировая модель",
+            "pipeline_tag": "text-generation",
+            "license": "apache-2.0",
+            "card_description": "RU & Global desc",
+            "language": "ru",
+            "variant": "global,ru",
+            "directions": ["nlp_llm"],
+            "task_types": ["generation"],
+            "parameters": "27B",
+            "rank_global": 2,
+            "rank_ru": 1,
+        },
+        {
+            "name": "ru-only-model",
+            "model_name": "ru-only-model",
+            "downloads": 5000,
+            "likes": 150,
+            "trending_score": 100.0,
+            "tags": ["Russian", "Voice"],
+            "url": "https://huggingface.co/ru-only-model",
+            "summary": "Только русская модель",
+            "pipeline_tag": "automatic-speech-recognition",
+            "license": "mit",
+            "card_description": "RU only desc",
+            "language": "ru",
+            "variant": "ru",
+            "directions": ["audio"],
+            "task_types": ["recognition"],
+            "parameters": "600M",
+            "rank_global": 0,
+            "rank_ru": 2,
+        },
+    ]
+
+    database.save_trending_models(test_models)
+
+    all_in_db = database.get_trending_models()
+    assert len(all_in_db) == 3
+
+    ru_in_db = database.get_trending_models(variant="ru")
+    assert len(ru_in_db) == 2
+    assert ru_in_db[0]["model_name"] == "ru-and-global-model"
+    assert ru_in_db[0]["rank_ru"] == 1
+    assert ru_in_db[1]["model_name"] == "ru-only-model"
+    assert ru_in_db[1]["rank_ru"] == 2
+
+    global_in_db = database.get_trending_models(variant="global")
+    assert len(global_in_db) == 2
+    assert global_in_db[0]["model_name"] == "global-only-model"
+    assert global_in_db[1]["model_name"] == "ru-and-global-model"
+
+    assert database.get_hf_trending_last_fetched_at() is not None
+
 
 
 if __name__ == "__main__":

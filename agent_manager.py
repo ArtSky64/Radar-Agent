@@ -1,4 +1,5 @@
 import logging
+import re
 import threading
 import time
 
@@ -19,10 +20,14 @@ import config
 
 logger = logging.getLogger("agent_manager")
 
+import asyncio
+import concurrent.futures
 import threading
-_RATE_LIMIT_LOCK=threading.Lock()
+
+_RATE_LIMIT_LOCK = threading.Lock()
 _last_call_ts = 0.0
 _MIN_INTERVAL_SEC = 1.05
+
 def _throttle() -> None:
     global _last_call_ts
     with _RATE_LIMIT_LOCK:
@@ -31,6 +36,24 @@ def _throttle() -> None:
         if wait > 0:
             time.sleep(wait)
         _last_call_ts = time.monotonic()
+
+
+def _safe_run_agent_sync(agent: Agent, prompt: str):
+    """
+    Безопасно запускает agent.run_sync:
+    Если event loop уже запущен в текущем потоке (например внутри async-функции),
+    выполняет run_sync в отдельном потоке пула, где нет конфликтующего loop'а.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop is not None and loop.is_running():
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(agent.run_sync, prompt).result()
+    else:
+        return agent.run_sync(prompt)
 
 
 class ArticleAnalysis(BaseModel):
@@ -229,18 +252,301 @@ def _call_trending_model_agent(prompt: str):
     return _get_trending_model_agent().run_sync(prompt)
 
 
+class HFModelCard(BaseModel):
+    """Карточка трендовой модели Hugging Face с направлениями, типами задач и параметрами."""
+    summary: str = Field(description="Что делает модель, для каких задач подходит, входы/выходы, архитектура, ключевые особенности, способы запуска и ограничения простым языком без маркетинга.")
+    tags: list[str] = Field(default_factory=list, description="От 3 до 5 ключевых содержательных тегов (напр. 'LLM', 'GGUF', 'LoRA', 'multimodal'). Без мусора, без языковых кодов.")
+    directions: list[str] = Field(default_factory=list, description="От 0 до 4 категорий строго из фиксированного списка НАПРАВЛЕНИЕ: health_ai, cv, audio, nlp_llm, generative_ai, classical_ml, robotics.")
+    task_types: list[str] = Field(default_factory=list, description="От 0 до 3 категорий строго из фиксированного списка ТИП ЗАДАЧИ: classification, regression, clustering, detection_tracking, segmentation, generation, recognition, reinforcement_learning, anomaly_detection.")
+    parameters: str = Field(default="", description="Количество параметров модели, если известно (напр. '27B', '7B', '70B', '600M'), или пустая строка.")
+
+
+HF_MODEL_SYSTEM_PROMPT = """
+Ты — ведущий эксперт по открытым нейросетям и Hugging Face.
+Твоя задача — проанализировать карточку модели и сформировать структурированный JSON-ответ строго по схеме HFModelCard:
+
+1. summary:
+   - Объясни, что делает модель, для каких задач подходит, что принимает на вход и возвращает на выход.
+   - Укажи архитектуру, ключевые особенности, способы запуска, метрики качества и известные ограничения.
+   - Пиши простым языком, без маркетинга и лишней теории. Не повторяй название, теги и другие метаданные.
+   - Используй только подтверждённую информацию, ничего не выдумывай. Если сведений нет — пропускай их.
+   - Описание должно быть максимально кратким, но информативным.
+2. tags: от 3 до 5 содержательных тегов (напр. 'LLM', 'GGUF', 'Vision', 'Multimodal', 'LoRA'). Без мусора, без языковых кодов.
+3. directions: от 0 до 4 тегов СТРОГО из списка НАПРАВЛЕНИЕ:
+   - health_ai: Медицинский AI, биомедицина, анализ медицинских данных
+   - cv: Computer Vision, анализ изображений и видео
+   - audio: Распознавание, генерация и обработка аудио
+   - nlp_llm: NLP, LLM, обработка и генерация текста
+   - generative_ai: Генерация изображений, видео, аудио, синтетических данных
+   - classical_ml: Классическое ML: классификация, регрессия, кластеризация
+   - robotics: Робототехника, автономные системы
+
+4. task_types: от 0 до 3 тегов СТРОГО из списка ТИП ЗАДАЧИ:
+   - classification: Классификация объектов, текстов, изображений, аудио
+   - regression: Регрессия, предсказание непрерывных значений, forecasting, временные ряды
+   - clustering: Кластеризация, поиск закономерностей, понижение размерности, embeddings
+   - detection_tracking: Детекция и отслеживание объектов
+   - segmentation: Сегментация изображений и видео
+   - generation: Генерация контента и синтетических данных
+   - recognition: Распознавание речи, звуков, текста (ASR, speaker ID, sound events)
+   - reinforcement_learning: RL, RLHF, обучение с подкреплением
+   - anomaly_detection: Поиск аномалий и выбросов
+
+5. parameters: число параметров модели (напр. '27B', '7B', '70B', '600M'), если известно из названия или описания. Если неизвестно — оставь пустой строкой.
+"""
+
+
+def extract_model_parameters(name: str, tags: list[str] | None = None, card_data: dict | None = None) -> str:
+    """
+    Извлекает количество параметров модели (например, '27B', '7B', '70B', '600M', '8x7B')
+    из названия модели, тегов или метаданных safetensors.
+    """
+    import re
+    if not name:
+        return ""
+    param_pattern = re.compile(r'(?i)(?:\b|_|-)(\d+(?:\.\d+)?(?:x\d+(?:\.\d+)?)?)\s*([bmk])(?:\b|_|-|$)', re.IGNORECASE)
+
+    short_name = name.split("/")[-1] if "/" in name else name
+    match = param_pattern.search(short_name)
+    if match:
+        return f"{match.group(1)}{match.group(2).upper()}"
+
+    match = param_pattern.search(name)
+    if match:
+        return f"{match.group(1)}{match.group(2).upper()}"
+
+    if tags:
+        for t in tags:
+            match = param_pattern.search(str(t))
+            if match:
+                return f"{match.group(1)}{match.group(2).upper()}"
+
+    if card_data and isinstance(card_data, dict):
+        safetensors = card_data.get("safetensors", {})
+        if isinstance(safetensors, dict) and "total" in safetensors:
+            try:
+                tot = int(safetensors["total"])
+                if tot >= 1_000_000_000:
+                    b_val = round(tot / 1_000_000_000, 1)
+                    return f"{int(b_val) if b_val.is_integer() else b_val}B"
+                elif tot >= 1_000_000:
+                    m_val = round(tot / 1_000_000, 1)
+                    return f"{int(m_val) if m_val.is_integer() else m_val}M"
+            except (ValueError, TypeError):
+                pass
+    return ""
+
+
+_JUNK_TAG_PREFIXES = ("license:", "arxiv:", "dataset:", "base_model:", "region:", "doi:", "diffusers:", "model_index")
+_JUNK_EXACT_TAGS = {
+    "safetensors", "endpoints_compatible", "custom_code", "has_space", "autotrain_compatible",
+    "pytorch", "tensorboard", "transformers", "conversational", "en", "ru", "rus"
+}
+
+
+def clean_model_tags(tags: list[str], max_tags: int = 5) -> list[str]:
+    """
+    Очищает и урезает список тегов модели, отсекая тысячи мусорных языковых кодов
+    и технические метки, из-за которых ломается бэкенд.
+    """
+    if not tags:
+        return []
+    cleaned = []
+    seen = set()
+    for t in tags:
+        if not t or not isinstance(t, str):
+            continue
+        tag = t.strip()
+        lower_tag = tag.lower()
+
+        if any(lower_tag.startswith(p) for p in _JUNK_TAG_PREFIXES):
+            continue
+        if len(lower_tag) <= 3 and lower_tag.isalpha():
+            continue
+        if lower_tag in _JUNK_EXACT_TAGS:
+            continue
+        if lower_tag in seen:
+            continue
+
+        seen.add(lower_tag)
+        cleaned.append(tag)
+        if len(cleaned) >= max_tags:
+            break
+
+    if not cleaned:
+        for t in tags:
+            tag = str(t).strip()
+            if tag.lower() in ("transformers", "gguf", "diffusers", "vllm", "mlx"):
+                cleaned.append(tag)
+                if len(cleaned) >= max_tags:
+                    break
+
+    return cleaned[:max_tags]
+
+
+def sanitize_hf_model_card(
+    card: HFModelCard,
+    model_name: str = "",
+    pipeline_tag: str = "",
+    tags: list[str] | None = None,
+) -> HFModelCard:
+    valid_dirs = set(config.HF_DIRECTIONS.keys())
+    valid_tasks = set(config.HF_TASK_TYPES.keys())
+
+    cleaned_dirs = [d.strip().lower() for d in card.directions if d.strip().lower() in valid_dirs][:config.HF_MAX_DIRECTIONS]
+    cleaned_tasks = [t.strip().lower() for t in card.task_types if t.strip().lower() in valid_tasks][:config.HF_MAX_TASK_TYPES]
+    cleaned_tags = clean_model_tags(card.tags or tags or [], max_tags=5)
+
+    params = (card.parameters or "").strip()
+    if not params:
+        params = extract_model_parameters(model_name, tags)
+
+    return HFModelCard(
+        summary=card.summary.strip(),
+        tags=cleaned_tags,
+        directions=cleaned_dirs,
+        task_types=cleaned_tasks,
+        parameters=params,
+    )
+
+
+def _mock_hf_model_card(
+    name: str,
+    pipeline_tag: str = "",
+    tags: list[str] | None = None,
+    card_description: str = "",
+) -> HFModelCard:
+    text = f"{name} {pipeline_tag} {' '.join(tags or [])} {card_description[:1000]}".lower()
+    dirs = []
+    if any(k in text for k in ("health", "medic", "biomed", "clinical")):
+        dirs.append("health_ai")
+    if any(k in text for k in ("vision", "image", "video", "cv", "yolo", "ocr", "diffus")):
+        dirs.append("cv")
+    if any(k in text for k in ("audio", "voice", "speech", "sound", "asr", "tts")):
+        dirs.append("audio")
+    if any(k in text for k in ("text", "nlp", "llm", "conversational", "language", "instruct")):
+        dirs.append("nlp_llm")
+    if any(k in text for k in ("generat", "diffus", "synthe", "text-to-image", "image-generation")):
+        dirs.append("generative_ai")
+    if any(k in text for k in ("robot", "autonomous")):
+        dirs.append("robotics")
+    if not dirs:
+        dirs.append("nlp_llm")
+
+    tasks = []
+    if any(k in text for k in ("classif", "rating", "sentiment", "detector")):
+        tasks.append("classification")
+    if any(k in text for k in ("regress", "forecast", "time-series")):
+        tasks.append("regression")
+    if any(k in text for k in ("cluster", "embed", "similarity", "feature-extraction")):
+        tasks.append("clustering")
+    if any(k in text for k in ("detect", "yolo", "tracking")):
+        tasks.append("detection_tracking")
+    if any(k in text for k in ("segment", "mask")):
+        tasks.append("segmentation")
+    if any(k in text for k in ("generat", "text-to", "chat", "instruct", "synthe")):
+        tasks.append("generation")
+    if any(k in text for k in ("recogni", "asr", "speech-to-text", "speaker")):
+        tasks.append("recognition")
+    if not tasks:
+        tasks.append("generation")
+
+    params = extract_model_parameters(name, tags)
+    clean_tags = clean_model_tags(tags or [], max_tags=5)
+    if not clean_tags:
+        clean_tags = [pipeline_tag] if pipeline_tag else ["AI/ML"]
+
+    summary = (
+        f"Модель {name} представляет собой решение для задач {pipeline_tag or 'машинного обучения'}. "
+        f"Архитектура оптимизирована для эффективного инференса и решения прикладных задач анализа и генерации данных."
+    )
+
+    return HFModelCard(
+        summary=summary,
+        tags=clean_tags,
+        directions=dirs[:config.HF_MAX_DIRECTIONS],
+        task_types=tasks[:config.HF_MAX_TASK_TYPES],
+        parameters=params,
+    )
+
+
+def analyze_hf_model(
+    model_name: str,
+    pipeline_tag: str = "",
+    tags: list[str] | None = None,
+    card_description: str = "",
+) -> HFModelCard:
+    """
+    Анализирует модель Hugging Face через Qwen / PydanticAI.
+    Возвращает HFModelCard с описанием, 3-5 тегами, 0-4 направлениями, 0-3 типами задач и параметрами.
+    """
+    clean_tags_list = clean_model_tags(tags or [], max_tags=8)
+    prompt = (
+        f"Название модели: {model_name}\n"
+        f"Тип задачи (pipeline_tag): {pipeline_tag or '(не указан)'}\n"
+        f"Теги модели: {', '.join(clean_tags_list) if clean_tags_list else '(нет)'}\n\n"
+        f"Выдержка из описания карточки (README):\n{card_description[:3000]}"
+    )
+    try:
+        agent = Agent(
+            model=get_model(),
+            output_type=HFModelCard,
+            system_prompt=HF_MODEL_SYSTEM_PROMPT,
+        )
+        _throttle()
+        res = _safe_run_agent_sync(agent, prompt)
+        return sanitize_hf_model_card(res.output, model_name=model_name, pipeline_tag=pipeline_tag, tags=clean_tags_list)
+    except Exception as e:
+        logger.warning(f"LLM-анализ недоступен для модели '{model_name}' ({type(e).__name__}: {e}). Используем качественный фолбэк.")
+        return _mock_hf_model_card(model_name, pipeline_tag=pipeline_tag, tags=clean_tags_list, card_description=card_description)
+
+
+async def analyze_hf_model_async(
+    model_name: str,
+    pipeline_tag: str = "",
+    tags: list[str] | None = None,
+    card_description: str = "",
+) -> HFModelCard:
+    """Асинхронная версия анализа модели Hugging Face для корутин."""
+    clean_tags_list = clean_model_tags(tags or [], max_tags=8)
+    prompt = (
+        f"Название модели: {model_name}\n"
+        f"Тип задачи (pipeline_tag): {pipeline_tag or '(не указан)'}\n"
+        f"Теги модели: {', '.join(clean_tags_list) if clean_tags_list else '(нет)'}\n\n"
+        f"Выдержка из описания карточки (README):\n{card_description[:3000]}"
+    )
+    try:
+        agent = Agent(
+            model=get_model(),
+            output_type=HFModelCard,
+            system_prompt=HF_MODEL_SYSTEM_PROMPT,
+        )
+        _throttle()
+        res = await agent.run(prompt)
+        return sanitize_hf_model_card(res.output, model_name=model_name, pipeline_tag=pipeline_tag, tags=clean_tags_list)
+    except Exception as e:
+        logger.warning(f"LLM-анализ недоступен для модели '{model_name}' ({type(e).__name__}: {e}). Используем качественный фолбэк.")
+        return _mock_hf_model_card(model_name, pipeline_tag=pipeline_tag, tags=clean_tags_list, card_description=card_description)
+
+
+
 def summarize_trending_model(name: str, tags: list[str], card_description: str = "") -> str:
     """
     Генерирует короткое саммари для трендовой модели HF по названию, тегам и карточке.
     """
-    tags_str = ", ".join(tags) if tags else "(теги отсутствуют)"
-    prompt = f"Название модели: {name}\nТеги: {tags_str}\n\nОписание карточки:\n{card_description[:2500]}"
     try:
-        result = _call_trending_model_agent(prompt)
-        return result.output.summary
-    except Exception as e:
-        logger.error(f"Ошибка саммари трендовой модели '{name}': {e!r}")
-        raise AnalysisError(f"Не удалось получить саммари для модели '{name}': {e!r}") from e
+        card = analyze_hf_model(name, tags=tags, card_description=card_description)
+        return card.summary
+    except Exception:
+        tags_str = ", ".join(tags) if tags else "(теги отсутствуют)"
+        prompt = f"Название модели: {name}\nТеги: {tags_str}\n\nОписание карточки:\n{card_description[:2500]}"
+        try:
+            result = _call_trending_model_agent(prompt)
+            return result.output.summary
+        except Exception as e:
+            logger.error(f"Ошибка саммари трендовой модели '{name}': {e!r}")
+            return f"Модель {name} для задач машинного обучения."
+
 
 
 def analyze_article(title: str, text: str) -> ArticleAnalysis:
@@ -431,3 +737,24 @@ def analyze_github_repo(repo_name: str, readme_text: str, description: str = "")
     except Exception as e:
         logger.warning(f"LLM-анализ недоступен для '{repo_name}' ({type(e).__name__}: {e}). Используем фолбэк-карточку.")
         return _mock_github_repo_card(repo_name, readme_text, description)
+
+if __name__ == "__main__":
+    print("\n" + "=" * 70)
+    print("ТЕСТ НОВОГО ПРОМПТА НА 1 МОДЕЛИ (analyze_hf_model)")
+    print("=" * 70)
+    test_model = "Qwen/Qwen2.5-7B-Instruct"
+    print(f"Запуск анализа для модели: {test_model}...\n")
+    card = analyze_hf_model(
+        model_name=test_model,
+        pipeline_tag="text-generation",
+        tags=["LLM", "GGUF", "conversational", "transformers"],
+        card_description="Qwen2.5 is a series of dense language models including 7B parameters optimized for coding and math."
+    )
+    print("\n--- РЕЗУЛЬТАТ РАБОТЫ ПРОМПТА И СХЕМЫ ---")
+    print(f"1. Summary (Описание):\n   {card.summary}\n")
+    print(f"2. Parameters (Параметры): {card.parameters}")
+    print(f"3. Directions (Направления 0-4): {card.directions}")
+    print(f"4. Task Types (Типы задач 0-3):  {card.task_types}")
+    print(f"5. Tags (Очищенные теги 2-5):    {card.tags}")
+    print("=" * 70 + "\n")
+

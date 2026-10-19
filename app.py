@@ -2,7 +2,7 @@ from fastapi import FastAPI, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from database import (
     init_db, get_all_leaderboard_snapshots, save_leaderboard_data, get_all_articles,
-    get_analysis_history, save_trending_models, get_trending_models,
+    get_analysis_history, save_trending_models, get_trending_models, get_hf_trending_last_fetched_at,
     save_github_trending, get_github_trending,
 )
 import arena_scraper
@@ -94,7 +94,7 @@ def read_leaderboard_analysis():
 def run_trending_fetch_and_save():
     print("[БЭКЕНД] Запуск сбора трендовых моделей HF (hf-trending-mcp)...")
     try:
-        models = fetch_trending_models(limit=15)
+        models = fetch_trending_models(limit=30)
         if not models:
             print("[БЭКЕНД] Трендовые модели не получены (пусто или ошибка MCP-сервера).")
             return
@@ -116,12 +116,22 @@ def trigger_trending_fetch(background_tasks: BackgroundTasks):
 
 # Эндпоинт для вывода текущей витрины трендовых моделей
 @app.get("/trending/models")
-def read_trending_models():
+def read_trending_models(variant: str | None = None):
     try:
-        models = get_trending_models()
-        return {"status": "success", "total_models": len(models), "data": models}
+        models = get_trending_models(variant=variant)
+        last_fetched_at = get_hf_trending_last_fetched_at()
+        ru_models = [m for m in models if m.get("rank_ru", 0) > 0 or "ru" in (m.get("variant") or "")]
+        global_models = [m for m in models if m.get("rank_global", 0) > 0]
+        return {
+            "status": "success",
+            "total_models": len(models),
+            "last_fetched_at": last_fetched_at,
+            "data": models,
+            "ru_models": ru_models,
+            "global_models": global_models,
+        }
     except Exception as e:
-        return {"status": "error", "message": str(e), "data": []}
+        return {"status": "error", "message": str(e), "data": [], "last_fetched_at": None}
 
 
 # Внутренняя функция бэкенда: тянет трендовые репозитории GitHub и сохраняет
@@ -169,4 +179,25 @@ def read_articles():
         "status": "success",
         "total_articles": len(articles_list),
         "data": articles_list
+    }
+
+
+# Внутренняя функция бэкенда: тянет статьи HF + PwC и сохраняет в БД
+def run_papers_fetch_and_save():
+    print("[БЭКЕНД] Запуск сбора статей (HF + PwC + Healthcare)...")
+    try:
+        from mcp_fetcher_papers import ingest_papers
+        ingest_papers()
+        print("[БЭКЕНД] Сбор статей успешно завершен!")
+    except Exception as e:
+        print(f"[БЭКЕНД ОШИБКА] Ошибка при сборе статей: {e}")
+
+
+# Эндпоинт для фонового запуска сбора статей
+@app.post("/papers/refresh")
+def trigger_papers_refresh(background_tasks: BackgroundTasks):
+    background_tasks.add_task(run_papers_fetch_and_save)
+    return {
+        "status": "success",
+        "message": "Сбор статей (HF + PwC + Healthcare) запущен в фоне.",
     }

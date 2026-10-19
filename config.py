@@ -48,8 +48,10 @@ PWC_MCP_URL = os.getenv("PWC_MCP_URL", "https://gateway.pipeworx.io/paperswithco
 PWC_TRENDING_TOOL = os.getenv("PWC_TRENDING_TOOL", "trending_papers")
 PWC_DETAIL_TOOL = os.getenv("PWC_DETAIL_TOOL", "get_paper")
 PWC_TOPIC_SLUGS = ["healthcare", "medical-imaging", "biology"]
-PAPERS_WINDOW_DAYS = int(os.getenv("PAPERS_WINDOW_DAYS", "7"))
-PAPERS_LIMIT = int(os.getenv("PAPERS_LIMIT", "10"))
+PAPERS_WINDOW_DAYS = int(os.getenv("PAPERS_WINDOW_DAYS", "30"))
+PAPERS_LIMIT_HF = int(os.getenv("PAPERS_LIMIT_HF", "30"))
+PAPERS_LIMIT_PWC = int(os.getenv("PAPERS_LIMIT_PWC", "30"))
+PAPERS_LIMIT = int(os.getenv("PAPERS_LIMIT", "60"))
 
 # --- GitHub & HuggingFace ---
 GITHUB_TRENDING_PERIODS = ["daily", "weekly", "monthly"]
@@ -95,4 +97,35 @@ GITHUB_MAX_TASK_TYPES = 3
 
 HF_DATASET_MODES = ["query", "recent", "trending", "trending_ru"]
 HF_MODEL_MODES = ["trending", "trending_ru"]
+
+# Фиксированные списки тегов для моделей Hugging Face согласно ТЗ куратора
+HF_DIRECTIONS = {
+    "health_ai": "Медицинский AI, биомедицина, анализ медицинских данных",
+    "cv": "Computer Vision, анализ изображений и видео",
+    "audio": "Распознавание, генерация и обработка аудио",
+    "nlp_llm": "NLP, LLM, обработка и генерация текста",
+    "generative_ai": "Генерация изображений, видео, аудио, синтетических данных",
+    "classical_ml": "Классическое ML: классификация, регрессия, кластеризация",
+    "robotics": "Робототехника, автономные системы",
+}
+HF_MAX_DIRECTIONS = 4
+
+HF_TASK_TYPES = {
+    "classification": "Классификация объектов, текстов, изображений, аудио",
+    "regression": "Регрессия, предсказание непрерывных значений, forecasting, временные ряды",
+    "clustering": "Кластеризация, поиск закономерностей, понижение размерности, embeddings",
+    "detection_tracking": "Детекция и отслеживание объектов",
+    "segmentation": "Сегментация изображений и видео",
+    "generation": "Генерация контента и синтетических данных",
+    "recognition": "Распознавание речи, звуков, текста (ASR, speaker ID, sound events)",
+    "reinforcement_learning": "RL, RLHF, обучение с подкреплением",
+    "anomaly_detection": "Поиск аномалий и выбросов",
+}
+HF_MAX_TASK_TYPES = 3
+
+HF_TRENDING_URL_GENERAL = "https://huggingface.co/models?sort=trending"
+HF_TRENDING_URL_RU_1 = "https://huggingface.co/models?language=ru&sort=trending"
+HF_TRENDING_URL_RU_2 = "https://huggingface.co/models?language=rus&sort=trending"
+HF_TRENDING_LIMIT = 50
+
 
