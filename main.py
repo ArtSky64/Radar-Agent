@@ -221,7 +221,7 @@ def process_articles_stream(articles_stream):
             "title": title,
             "summary": analysis.summary,
             "source_url": source_url,
-            "tags": analysis.tags,  # список строк — database.py сам делает json.dumps
+            "tags": list(analysis.tags) + [t for t in article.get("tags", []) if t not in analysis.tags], #изменено под работу с тегом #Russian из датасетов HF
             "directions": article.get("directions", []),
             "task_types": article.get("task_types", []),
             "stars": int(article.get("stars") or article.get("upvotes") or 0),

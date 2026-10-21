@@ -95,7 +95,7 @@ GITHUB_TASK_TYPES = {
 }
 GITHUB_MAX_TASK_TYPES = 3
 
-HF_DATASET_MODES = ["query", "recent", "trending", "trending_ru"]
+HF_DATASET_MODES = ["trending", "trending_ru"]
 HF_MODEL_MODES = ["trending", "trending_ru"]
 
 # Фиксированные списки тегов для моделей Hugging Face согласно ТЗ куратора

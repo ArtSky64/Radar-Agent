@@ -51,7 +51,7 @@ def _():
     assert hasattr(FetcherHF, "stream_hf_articles")
 
     import FetcherHFDatasets
-    assert hasattr(FetcherHFDatasets, "stream_hf_datasets") or hasattr(FetcherHFDatasets, "stream_hf_datasets_by_mode")
+    assert hasattr(FetcherHFDatasets, "stream_hf_datasets_by_mode")
 
 
     import mcp_fetcher_papers
