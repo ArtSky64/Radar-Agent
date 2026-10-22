@@ -79,31 +79,14 @@ async def fetch_dataset_models_top3(client: httpx.AsyncClient, dataset_id: str) 
         return None
 
 
-async def fetch_dataset_has_spaces(client: httpx.AsyncClient, dataset_id: str) -> bool | None:
-    """
-    ТЗ 3.1.3: есть ли спейсы, использующие датасет (запрос limit=3).
-    В related_links хранится только ссылка на каталог, поэтому имена спейсов не нужны.
-    None — запрос не удался.
-    """
-    url = config.HF_DATASET_SPACES_API.format(dataset_id=dataset_id)
-    try:
-        resp = await client.get(url, timeout=15.0)
-        resp.raise_for_status()
-        data = resp.json()
-        if not isinstance(data, list):
-            return None
-        return len(data) > 0
-    except Exception as e:
-        logger.debug(f"Не удалось получить спейсы для датасета {dataset_id}: {e}")
-        return None
-
-
 def build_related_links(dataset_id: str, papers: list[dict],
-                        top_models: list[str] | None, has_spaces: bool | None) -> list[dict]:
+                        top_models: list[str] | None) -> list[dict]:
     """
     ТЗ 3.2 «Каталог + Топ-3» и п.5: собирает поле related_links.
-    Кнопку каталога не показываем только если API ответил и сущностей точно нет;
+    Кнопку каталога моделей не показываем только если API ответил и моделей точно нет;
     если запрос упал (None) — каталог всё равно валиден, ссылку оставляем.
+    Демо-спейсы (Spaces) на Hugging Face привязаны к моделям, а не к датасетам (на сайте HF
+    у датасетов спейсов нет), поэтому для датасетов ссылка на спейсы не генерируется.
     """
     links: list[dict] = list(papers)
     if top_models is None or top_models:
@@ -115,12 +98,6 @@ def build_related_links(dataset_id: str, papers: list[dict],
         if top_models:
             entry["top_items"] = top_models
         links.append(entry)
-    if has_spaces is None or has_spaces:
-        links.append({
-            "type": "spaces_catalog",
-            "name": "Spaces",
-            "url": config.HF_DATASET_SPACES_CATALOG_URL.format(dataset_id=dataset_id),
-        })
     return links
 
 
@@ -226,16 +203,28 @@ async def fetch_hf_datasets_by_mode(mode: str) -> list[dict]:
             if len(clean_text) < 50:
                 continue
 
-            tags = item.get("tags", [])
-            langs = [t.replace("language:", "") for t in tags if t.startswith("language:")]
+            raw_tags = item.get("tags", [])
+            langs = [t.replace("language:", "") for t in raw_tags if t.startswith("language:")]
 
             # Найден через ru-фильтр ИЛИ содержит в тегах language:ru/rus -> ru
             is_russian = mode == "trending_ru" or "ru" in langs or "rus" in langs
             language = "ru" if is_russian else ", ".join(langs)
 
+            # Очистка тегов от системных метаданных (размеры, лицензии, технические префиксы)
+            clean_tags = [
+                t for t in raw_tags
+                if isinstance(t, str) and not any(t.startswith(prefix) for prefix in (
+                    "language:", "license:", "size_categories:", "task_categories:",
+                    "region:", "arxiv:", "format:", "modality:", "annotations_creators:",
+                    "language_creators:", "source_datasets:", "multilinguality:"
+                ))
+            ][:5]
+            if is_russian and "#Russian" not in clean_tags:
+                clean_tags.insert(0, "#Russian")
+
             # ТЗ 3.1.1: связанные статьи достаются из тех же сырых тегов, что и язык —
             # делаем это для всех кандидатов сразу, запрос к сети для этого не нужен.
-            papers = extract_dataset_papers(tags, item.get("paperswithcode_id"))
+            papers = extract_dataset_papers(raw_tags, item.get("paperswithcode_id"))
 
             all_candidates.append({
                 "id": f"hf_dataset:{d_id}",
@@ -243,7 +232,7 @@ async def fetch_hf_datasets_by_mode(mode: str) -> list[dict]:
                 "full_text": clean_text,
                 "url": f"https://huggingface.co/datasets/{d_id}",
                 "language": language,
-                "tags": ["#Russian"] if is_russian else [],  # только исключение из ТЗ, без сырых HF-тегов
+                "tags": clean_tags,
                 "papers": papers,
                 "likes": int(item.get("likes", 0) or 0),
             })
@@ -268,7 +257,7 @@ async def fetch_hf_datasets_by_mode(mode: str) -> list[dict]:
         candidates_by_id = {c["id"]: c for c in all_candidates}
 
         # Собираем пары (результат LLM, оригинальный кандидат) только для реально
-        # найденных датасетов — моделей/спейсов запрашиваем именно по этому
+        # найденных датасетов — моделей запрашиваем именно по этому
         # небольшому списку (а не по всем ~50 кандидатам), чтобы не перегружать API.
         selected: list[tuple] = []
         for res_item in result.output.selected_datasets:
@@ -283,17 +272,12 @@ async def fetch_hf_datasets_by_mode(mode: str) -> list[dict]:
 
         if selected:
             async with httpx.AsyncClient(trust_env=False) as client:
-                models_lists, spaces_flags = await asyncio.gather(
-                    asyncio.gather(*[
-                        fetch_dataset_models_top3(client, dataset_id) for dataset_id, _, _ in selected
-                    ]),
-                    asyncio.gather(*[
-                        fetch_dataset_has_spaces(client, dataset_id) for dataset_id, _, _ in selected
-                    ]),
-                )
+                models_lists = await asyncio.gather(*[
+                    fetch_dataset_models_top3(client, dataset_id) for dataset_id, _, _ in selected
+                ])
 
-            for (dataset_id, res_item, original), top_models, has_spaces in zip(
-                selected, models_lists, spaces_flags
+            for (dataset_id, res_item, original), top_models in zip(
+                selected, models_lists
             ):
                 articles_payload.append({
                     "title": f"[HF Dataset] {original['title']}",
@@ -303,7 +287,7 @@ async def fetch_hf_datasets_by_mode(mode: str) -> list[dict]:
                     "tags": original.get("tags", []),
                     "stars": original.get("likes", 0),
                     "related_links": build_related_links(
-                        dataset_id, original.get("papers", []), top_models, has_spaces
+                        dataset_id, original.get("papers", []), top_models
                     ),
                 })
 
