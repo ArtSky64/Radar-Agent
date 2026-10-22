@@ -29,6 +29,64 @@ def get_connection():
         conn.close()
 
 
+def _migrate_hf_columns_to_related_links(conn, existing_cols: set) -> None:
+    """Переносит hf_papers / hf_models_top3 / hf_*_catalog_url в related_links и удаляет колонки."""
+    legacy = {'hf_papers', 'hf_models_top3', 'hf_models_catalog_url',
+              'hf_spaces_top3', 'hf_spaces_catalog_url'}
+    present = legacy & existing_cols
+    if not present:
+        return
+
+    def _loads(raw):
+        try:
+            value = json.loads(raw) if raw else []
+            return value if isinstance(value, list) else []
+        except Exception:
+            return []
+
+    select_cols = ", ".join(sorted(present))
+    rows = conn.execute(
+        f"SELECT rowid AS rid, related_links, {select_cols} FROM articles"
+    ).fetchall()
+    for row in rows:
+        keys = row.keys()
+        has = lambda k: k in keys and row[k] not in (None, '', '[]')
+        if not any(has(k) for k in present):
+            continue
+        current = _loads(row['related_links'])
+        known = {(l.get('type'), l.get('url')) for l in current if isinstance(l, dict)}
+        new_links = []
+
+        # paper: раньше хранились голыми URL вида https://huggingface.co/papers/<id>
+        if 'hf_papers' in keys:
+            for url in _loads(row['hf_papers']):
+                if not isinstance(url, str) or '/papers/' not in url:
+                    continue  # старые ссылки paperswithcode.com/dataset/... статьями не являются
+                new_links.append({"type": "paper", "name": "arXiv:" + url.rsplit('/', 1)[-1], "url": url})
+
+        if has('hf_models_catalog_url'):
+            entry = {"type": "models_catalog", "name": "Обученные модели", "url": row['hf_models_catalog_url']}
+            top = [m.get('name', '').split('/')[-1] for m in _loads(row['hf_models_top3'])
+                   if isinstance(m, dict) and m.get('name')] if 'hf_models_top3' in keys else []
+            if top:
+                entry["top_items"] = top
+            new_links.append(entry)
+
+        if has('hf_spaces_catalog_url'):
+            new_links.append({"type": "spaces_catalog", "name": "Spaces", "url": row['hf_spaces_catalog_url']})
+
+        merged = current + [l for l in new_links if (l['type'], l['url']) not in known]
+        conn.execute("UPDATE articles SET related_links = ? WHERE rowid = ?",
+                     (json.dumps(merged, ensure_ascii=False), row['rid']))
+
+    for col in sorted(present):
+        try:
+            conn.execute(f"ALTER TABLE articles DROP COLUMN {col}")
+        except sqlite3.OperationalError:
+            # SQLite < 3.35 не умеет DROP COLUMN: колонка останется неиспользуемой, это безопасно.
+            pass
+
+
 def init_db():
     with get_connection() as conn:
         cursor = conn.cursor()
@@ -44,7 +102,7 @@ def init_db():
             source_type TEXT NOT NULL DEFAULT 'статья',
             language TEXT NOT NULL DEFAULT '',
             topic_tag TEXT NOT NULL DEFAULT '',
-            related_links TEXT NOT NULL DEFAULT '',
+            related_links TEXT NOT NULL DEFAULT '[]',
             source_article_url TEXT NOT NULL DEFAULT '',
             period TEXT NOT NULL DEFAULT '',
             directions TEXT NOT NULL DEFAULT '[]',
@@ -81,12 +139,28 @@ def init_db():
         if 'has_code' not in existing_cols:
             cursor.execute("ALTER TABLE articles ADD COLUMN has_code INTEGER NOT NULL DEFAULT 0")
 
+        # Миграция: связанные сущности HF-датасетов хранились в отдельных колонках
+        # hf_papers / hf_models_top3 / hf_*_catalog_url. По ТЗ (п.5) всё лежит в
+        # related_links (JSON-массив), поэтому переносим старые данные и удаляем колонки.
+        _migrate_hf_columns_to_related_links(conn, existing_cols)
+        cursor.execute("UPDATE articles SET related_links = '[]' WHERE related_links IS NULL OR related_links = ''")
+
+        # Исправление ранее сохранённых ссылок на каталог моделей: без префикса "dataset:"
+        # сайт HF показывает пустой каталог. Идемпотентно (уже исправленные строки не трогаем).
+        cursor.execute("""
+            UPDATE articles
+            SET related_links = REPLACE(related_links, 'models?dataset=', 'models?dataset=dataset:')
+            WHERE related_links LIKE '%models?dataset=%'
+              AND related_links NOT LIKE '%models?dataset=dataset:%'
+        """)
+
         # Миграция наличия кода: если в ссылках или тексте есть github/code -> has_code = 1
         cursor.execute("""
             UPDATE articles
             SET has_code = 1
             WHERE related_links LIKE '%github%'
-               OR related_links LIKE '%code%'
+               OR related_links LIKE '%"type": "code"%'
+               OR related_links LIKE '%"type": "kaggle_code"%'
                OR source_url LIKE '%github.com%'
                OR summary LIKE '%github.com%';
         """)
@@ -221,13 +295,21 @@ def save_article(article: dict) -> None:
     # source_type: 'статья' | 'модель' | 'датасет' | 'репозиторий' — проставляется
     # фетчером через main.py (_tag_source_type). Если источник его не передал,
     # по умолчанию считаем это обычной статьёй, чтобы не сломать старые вызовы.
-    related_links = article.get('related_links', '')
+    # related_links — валидный JSON-массив в TEXT (ТЗ п.5); пустое значение = '[]'.
+    related_links = article.get('related_links') or []
     if isinstance(related_links, (list, dict)):
         related_links = json.dumps(related_links, ensure_ascii=False)
+    elif not str(related_links).strip():
+        related_links = '[]'
 
     tags = article.get('tags', [])
     if isinstance(tags, (list, dict)):
         tags_str = json.dumps(tags, ensure_ascii=False)
+    elif isinstance(tags, str):
+        # Поле tags в БД хранится как JSON; одиночный текстовый тег превращаем в список.
+        tags_str = json.dumps([tags] if tags else [], ensure_ascii=False)
+    else:
+        tags_str = '[]'
     directions = article.get('directions', [])
     if isinstance(directions, (list, dict)):
         directions_str = json.dumps(directions, ensure_ascii=False)
@@ -240,17 +322,23 @@ def save_article(article: dict) -> None:
     else:
         task_types_str = str(task_types or "[]")
 
+    # Некоторые сборщики (в том числе HF datasets) передают описание в поле text,
+    # тогда как таблица articles использует summary. Поддерживаем оба формата.
+    summary = article.get('summary') or article.get('text') or ''
+
     stars = int(article.get('stars', 0) or article.get('upvotes', 0) or 0)
     is_trending = int(bool(article.get('is_trending', 0)))
     has_code = int(bool(article.get('has_code', 0)))
     if not has_code:
         # Автоопределение по ссылкам и тексту
-        if 'github' in str(related_links).lower() or 'github.com' in article.get('source_url', '') or 'github.com' in article.get('summary', ''):
+        if ('github' in str(related_links).lower()
+                or 'github.com' in article.get('source_url', '')
+                or 'github.com' in summary):
             has_code = 1
 
     with get_connection() as conn:
         cursor = conn.execute(
-            "SELECT rowid, stars, has_code, period, related_links, topic_tag FROM articles WHERE source_url = ? LIMIT 1",
+            "SELECT rowid, stars, has_code, period, related_links, topic_tag, summary FROM articles WHERE source_url = ? LIMIT 1",
             (article['source_url'],)
         )
         row = cursor.fetchone()
@@ -259,11 +347,15 @@ def save_article(article: dict) -> None:
                 UPDATE articles
                 SET stars = MAX(stars, ?),
                     has_code = MAX(has_code, ?),
+                    summary = CASE WHEN summary = '' OR summary IS NULL THEN ? ELSE summary END,
                     period = CASE WHEN period = '' OR period IS NULL THEN ? ELSE period END,
                     related_links = CASE WHEN related_links = '' OR related_links = '[]' OR related_links IS NULL THEN ? ELSE related_links END,
                     topic_tag = CASE WHEN topic_tag = '' OR topic_tag IS NULL THEN ? ELSE topic_tag END
                 WHERE rowid = ?
-            ''', (stars, has_code, article.get('period', ''), related_links, article.get('topic_tag', ''), row['rowid']))
+            ''', (
+                stars, has_code, summary, article.get('period', ''), related_links, article.get('topic_tag', ''),
+                row['rowid'],
+            ))
             return
 
         conn.execute('''
@@ -275,7 +367,7 @@ def save_article(article: dict) -> None:
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             article['title'],
-            article.get('summary', ''),
+            summary,
             article['source_url'],
             tags_str,
             article.get('source_type', 'статья'),

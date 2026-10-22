@@ -201,3 +201,25 @@ def trigger_papers_refresh(background_tasks: BackgroundTasks):
         "status": "success",
         "message": "Сбор статей (HF + PwC + Healthcare) запущен в фоне.",
     }
+
+
+# Внутренняя функция бэкенда: собирает трендовые датасеты (Hugging Face + Kaggle) через общий
+# пайплайн main.py (дедуп -> ИИ-анализ -> БД). Импорт ленивый, как и у статей.
+def run_datasets_fetch_and_save():
+    print("[БЭКЕНД] Запуск сбора датасетов (Hugging Face + Kaggle)...")
+    try:
+        from main import run_datasets_only
+        processed, skipped, failed = run_datasets_only()
+        print(f"[БЭКЕНД] Датасеты: обработано {processed}, дублей {skipped}, ошибок {failed}")
+    except Exception as e:
+        print(f"[БЭКЕНД ОШИБКА] Ошибка при сборе датасетов: {e}")
+
+
+# Эндпоинт для фонового запуска сбора датасетов (кнопка на вкладке «Датасеты»)
+@app.post("/datasets/refresh")
+def trigger_datasets_refresh(background_tasks: BackgroundTasks):
+    background_tasks.add_task(run_datasets_fetch_and_save)
+    return {
+        "status": "success",
+        "message": "Сбор датасетов (Hugging Face + Kaggle) запущен в фоне.",
+    }

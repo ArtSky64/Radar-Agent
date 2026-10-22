@@ -258,11 +258,11 @@ global_trend_list.sort(key=lambda x: (x.get("rank_global") if x.get("rank_global
 
 article_list = articles_res.get("data", []) if articles_res.get("status") == "success" else []
 
-# Имитация системы тегов для статей
-available_tags = ["LLM", "RLHF", "Vision", "Agents", "Optimization", "Open-Source"]
-for i, art in enumerate(article_list):
-    if "tags" not in art:
-        art["tags"] = [available_tags[i % len(available_tags)], available_tags[(i + 2) % len(available_tags)]]
+# Теги берём из БД как есть (раньше подставлялись выдуманные LLM/RLHF/...).
+for art in article_list:
+    if not isinstance(art.get("tags"), list):
+        art["tags"] = []
+available_tags = sorted({t for art in article_list for t in art["tags"] if isinstance(t, str) and t})
 
 # --- НАВИГАЦИЯ (СВЕРХУ) ---
 
@@ -865,6 +865,42 @@ elif page in _CONTENT_TABS:
             if a.get("source_type", "статья") == tab_info["source_type"]
             and not (a.get("summary") or "").startswith("Связанный материал к статье:")
         ]
+    elif page == "Датасеты":
+        col_btn, col_info = st.columns([1, 3])
+        with col_btn:
+            if st.button("🔄 Обновить датасеты (HF + Kaggle)", help="Сбор трендовых датасетов Hugging Face (мировые + RU) и Kaggle"):
+                started_in_backend = False
+                try:
+                    res = requests.post(f"{API_URL}/datasets/refresh", timeout=3)
+                    started_in_backend = res.ok
+                except Exception:
+                    pass
+                if started_in_backend:
+                    st.success("Сбор датасетов запущен в фоне!")
+                else:
+                    try:
+                        from main import run_datasets_only
+                        with st.spinner("Сбор датасетов (Hugging Face + Kaggle)..."):
+                            run_datasets_only()
+                        st.success("Датасеты успешно собраны!")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Ошибка сбора: {e}")
+
+        with col_info:
+            ds_total = len([a for a in article_list if a.get("source_type") == "датасет"])
+            st.markdown(
+                f"<div style='display:flex; align-items:center; height:100%; padding-top:4px; font-size:0.95rem; color:#E4E4E7;'>"
+                f"📊 <span style='color:#A1A1AA; margin-right:6px;'>Датасетов в базе:</span>"
+                f"<span style='color:#FBBF24; font-weight:600; background:#451A03; padding:3px 10px; border-radius:6px; border:1px solid #D97706;'>{ds_total}</span>"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        articles = [
+            a for a in article_list
+            if a.get("source_type", "статья") == tab_info["source_type"]
+            and not (a.get("summary") or "").startswith("Связанный материал к статье:")
+        ]
     else:
         articles = [
             a for a in article_list
@@ -932,7 +968,7 @@ elif page in _CONTENT_TABS:
     }
 
     def render_article_card(a):
-        tags_html = "".join([f'<span class="article-tag">{t}</span>' for t in a.get("tags", [])])
+        tags_html = "".join([f'<span class="article-tag">{escape(str(t))}</span>' for t in (a.get("tags") or [])])
         source_url = a.get("source_url") or a.get("url", "")
         source_type = a.get("source_type", "репозиторий" if page == "Репозитории" else "статья")
         type_color = _TYPE_COLORS.get(source_type, "#8B5CF6")
@@ -980,6 +1016,12 @@ elif page in _CONTENT_TABS:
             f'<span style="font-size:0.7rem; font-weight:700; text-transform:uppercase; letter-spacing:0.05em; color:#A1A1AA; border:1px solid #2D1B4E; border-radius:6px; padding:2px 8px; margin-right:8px;">{language}</span>'
             if source_type == "датасет" and language else ""
         )
+        # Лайки/звёзды датасета (HF likes, Kaggle votes) — в верхней строке карточки (ТЗ п.6)
+        likes_badge = ""
+        if source_type == "датасет":
+            likes = int(a.get("stars", 0) or 0)
+            if likes > 0:
+                likes_badge = f'<span style="font-size:0.7rem; font-weight:700; color:#FBBF24; background:#451A03; border:1px solid #D97706; border-radius:6px; padding:2px 8px; margin-right:8px;">♡ {likes:,}</span>'
         topic_tag = (a.get("topic_tag") or "").strip()
         topic_badge = (
             f'<span style="font-size:0.7rem; font-weight:700; color:#EC4899; border:1px solid #EC4899; border-radius:6px; padding:2px 8px; margin-right:8px;">#{topic_tag}</span>'
@@ -993,6 +1035,7 @@ elif page in _CONTENT_TABS:
         )
 
         rel_html = ""
+        top_models_html = ""
         if rel_links:
             badges = []
             for r in rel_links:
@@ -1003,6 +1046,52 @@ elif page in _CONTENT_TABS:
                 r_name = r.get("name") or r_url
                 if not r_url:
                     continue
+                safe_url = escape(str(r_url), quote=True)
+                base_style = "display:inline-block; font-size:0.75rem; border-radius:6px; padding:3px 8px; margin:3px 6px 3px 0; text-decoration:none;"
+
+                # --- Типы из ТЗ п.5: paper / models_catalog / spaces_catalog / kaggle_code ---
+                if r_type == "paper":
+                    badges.append(
+                        f'<a href="{safe_url}" target="_blank" style="{base_style} color:#C084FC; background:#2E1065; border:1px solid #7C3AED;">'
+                        f'📄 Статья: {escape(str(r_name))}</a>'
+                    )
+                    continue
+                if r_type == "models_catalog":
+                    top = [str(t) for t in (r.get("top_items") or [])][:3]
+                    tip = escape("Топ моделей: " + ", ".join(top), quote=True) if top else "Каталог моделей, обученных на датасете"
+                    badges.append(
+                        f'<a href="{safe_url}" target="_blank" title="{tip}" style="{base_style} color:#38BDF8; background:#0C4A6E; border:1px solid #0284C7;">'
+                        f'🤖 Обученные модели ↗</a>'
+                    )
+                    # Топ-3 — отдельный блок между кнопками и ссылкой на источник:
+                    # шрифт как у основного текста карточки, модели списком в столбик.
+                    if top:
+                        top_models_html = (
+                            '<div style="margin-top:10px;">'
+                            '<div style="font-size:0.9rem; color:#A1A1AA; margin-bottom:2px;">Топ моделей:</div>'
+                            '<div style="font-size:0.9rem; color:#D4D4D8; line-height:1.6;">'
+                            + "".join(f'<div>• {escape(t)}</div>' for t in top)
+                            + '</div></div>'
+                        )
+                    continue
+                if r_type == "spaces_catalog":
+                    badges.append(
+                        f'<a href="{safe_url}" target="_blank" style="{base_style} color:#E879F9; background:#4A044E; border:1px solid #A21CAF;">'
+                        f'🚀 Демо Spaces ↗</a>'
+                    )
+                    continue
+                if r_type == "kaggle_code":
+                    try:
+                        cnt = int(r.get("count"))
+                    except (TypeError, ValueError):
+                        cnt = None
+                    label_code = f"Решения: {cnt:,} ↗" if cnt else "Решения (Code) ↗"
+                    badges.append(
+                        f'<a href="{safe_url}" target="_blank" style="{base_style} color:#34D399; background:#064E3B; border:1px solid #059669;">'
+                        f'💻 {label_code}</a>'
+                    )
+                    continue
+
                 if r_type in ("github", "code"):
                     style = "color:#34D399; background:#064E3B; border:1px solid #059669;"
                     icon = "💻"
@@ -1051,10 +1140,10 @@ elif page in _CONTENT_TABS:
 
         st.markdown(
             f'<div class="custom-card">'
-            f'<div class="article-tags">{type_badge}{upvotes_badge}{article_code_badge}{repo_extra_badges}{lang_badge}{topic_badge}{tags_html}</div>'
+            f'<div class="article-tags">{type_badge}{upvotes_badge}{article_code_badge}{repo_extra_badges}{lang_badge}{likes_badge}{topic_badge}{tags_html}</div>'
             f'<h4 style="margin:0; color:#FFFFFF;">{a.get("title") or a.get("repo_name")}</h4>'
             f'<p style="font-size:0.9rem; color:#D4D4D8; margin:8px 0; line-height:1.5;">{a.get("summary")}</p>'
-            f'{source_art_html}{rel_html}'
+            f'{source_art_html}{rel_html}{top_models_html}'
             f'<div style="margin-top:8px;">{link_html}</div></div>',
             unsafe_allow_html=True)
 

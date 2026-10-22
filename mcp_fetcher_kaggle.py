@@ -5,7 +5,7 @@ import os
 import re
 import time
 import logging
-from datetime import datetime, timezone
+from itertools import chain, zip_longest
 from pydantic import BaseModel, Field, ValidationError
 from pydantic_ai import Agent
 from mcp import ClientSession, StdioServerParameters
@@ -21,7 +21,7 @@ KAGGLE_BASE_URL = "https://www.kaggle.com"
 
 CANDIDATES_PER_TYPE = 20
 FINAL_MATERIALS_COUNT = 5
-FRESHNESS_TOP_N = 6  # сколько самых свежих кандидатов (по реальной дате) отдаём на тематический отбор LLM
+TRENDING_TOP_N = 6  # сколько самых популярных кандидатов отдаём на тематический отбор LLM
 
 
 # --- Схема данных: LLM отвечает ТОЛЬКО за тематический отбор id ---
@@ -48,7 +48,7 @@ def _get_selector_agent() -> Agent:
             "Ты — технический аналитик, который отбирает материалы для базы знаний по ИИ.\n\n"
             f"Тебе дадут JSON-список кандидатов (датасеты и модели с Kaggle), у каждого "
             "есть поля id, type, title, full_text. Список уже предварительно отсортирован "
-            "по свежести — все кандидаты достаточно новые, свежесть можно не учитывать. "
+            "в порядке выдачи Kaggle — порядок и свежесть учитывать не нужно. "
             f"Отбери до {FINAL_MATERIALS_COUNT} материалов, наиболее релевантных строго "
             "тематикам AI, ML, DL и DS (искусственный интеллект, машинное обучение, "
             "глубокое обучение, наука о данных). Материалы вне этих тематик игнорируй.\n\n"
@@ -138,24 +138,52 @@ def _extract_full_text(detail: dict) -> str:
     return json.dumps(detail, ensure_ascii=False)
 
 
-def _parse_last_updated(detail: dict) -> datetime:
-    """Достаёт реальную дату последнего обновления материала. Если поле отсутствует
-    или не парсится — возвращает минимально возможную дату (материал уйдёт в конец
-    при сортировке по свежести, а не сломает пайплайн)."""
-    raw = detail.get("lastUpdated") or detail.get("updateTime")
-    if not raw:
-        return datetime.min.replace(tzinfo=timezone.utc)
-    try:
-        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            # Kaggle обычно отдаёт даты с 'Z', но на случай строки без смещения
-            # приводим к UTC вручную — иначе sort() ниже упадёт при сравнении
-            # naive datetime с aware datetime.min от других кандидатов
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt
-    except (ValueError, TypeError):
-        logger.warning(f"Не удалось распарсить дату обновления: {raw}")
-        return datetime.min.replace(tzinfo=timezone.utc)
+# Поля метаданных Kaggle, где могут лежать собственные теги датасета (ТЗ 4.1)
+_TAG_KEYS = ("tags", "keywords", "categories")
+# Поля со счётчиком решений/ноутбуков (ТЗ 4.2)
+# kernelCount — реальное поле ответа dataset_get (проверено на uciml/iris); остальные — запасные из ТЗ
+_KERNEL_COUNT_KEYS = ("kernelCount", "totalKernels", "kernelsCount", "scriptCount")
+_VOTE_KEYS = ("voteCount", "totalVotes", "votes")
+
+
+def _extract_tags(detail: dict) -> list[str]:
+    """Собственные теги Kaggle: tags / keywords / categories. Элементы бывают строками или
+    объектами ({"name": ..} / {"title": ..} / {"slug": ..}); строку через запятую разбиваем."""
+    tags: list[str] = []
+    for key in _TAG_KEYS:
+        value = detail.get(key)
+        if not value:
+            continue
+        if isinstance(value, str):
+            value = value.split(",")
+        if not isinstance(value, (list, tuple)):
+            continue
+        for item in value:
+            if isinstance(item, dict):
+                item = item.get("name") or item.get("title") or item.get("slug") or item.get("ref")
+            if isinstance(item, str) and item.strip():
+                tags.append(item.strip())
+    return list(dict.fromkeys(tags))  # дедуп с сохранением порядка
+
+
+def _first_int(detail: dict, keys: tuple) -> int | None:
+    for key in keys:
+        value = detail.get(key)
+        if value is None or isinstance(value, bool):
+            continue
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _build_kaggle_code_link(code_url: str, count: int | None) -> dict:
+    """ТЗ п.5: элемент related_links типа kaggle_code; count — только если число известно."""
+    link = {"type": "kaggle_code", "name": "Решения (Code)", "url": code_url}
+    if count is not None:
+        link["count"] = count
+    return link
 
 
 # --- Сбор кандидатов (list + get) для датасетов и моделей ---
@@ -191,8 +219,15 @@ async def _collect_dataset_candidates(session: ClientSession, query: str, limit:
             "type": "dataset",
             "title": item["title"],
             "full_text": full_text,
-            "last_updated": _parse_last_updated(detail),
             "url": f"{KAGGLE_BASE_URL}/datasets/{owner}/{slug}",
+            "tags": _extract_tags(detail),
+            "votes": _first_int(detail, _VOTE_KEYS) or 0,
+            "related_links": [
+                _build_kaggle_code_link(
+                    f"{KAGGLE_BASE_URL}/datasets/{owner}/{slug}/code",
+                    _first_int(detail, _KERNEL_COUNT_KEYS),
+                )
+            ],
         })
     return candidates
 
@@ -228,8 +263,10 @@ async def _collect_model_candidates(session: ClientSession, query: str, limit: i
             "type": "model",
             "title": item["title"],
             "full_text": full_text,
-            "last_updated": _parse_last_updated(detail),
             "url": f"{KAGGLE_BASE_URL}/models/{owner}/{slug}",
+            "tags": _extract_tags(detail),
+            "votes": _first_int(detail, _VOTE_KEYS) or 0,
+            "related_links": [],
         })
     return candidates
 
@@ -264,20 +301,20 @@ async def fetch_materials_via_mcp(query: str = "machine learning") -> list[dict]
                     logger.info("Нет кандидатов для анализа. Завершение работы модуля.")
                     return articles_payload
 
-                # --- Сортировка по РЕАЛЬНОЙ дате обновления, до LLM ---
-                all_candidates.sort(key=lambda c: c["last_updated"], reverse=True)
-                for c in all_candidates[:FRESHNESS_TOP_N]:
-                    logger.info(f"Кандидат по свежести: {c['last_updated']} — {c['title']}")
-
-                freshest_candidates = all_candidates[:FRESHNESS_TOP_N]
-                candidates_by_id = {c["id"]: c for c in freshest_candidates}
+                # Порядок задаёт Kaggle — локально по дате НЕ пересортировываем. Чтобы в выборку попали и датасеты, и модели, берём кандидатов
+                # попеременно, сохраняя исходный ранг внутри каждого типа.
+                trending_candidates = [
+                    c for c in chain.from_iterable(zip_longest(dataset_candidates, model_candidates))
+                    if c is not None
+                ][:TRENDING_TOP_N]
+                candidates_by_id = {c["id"]: c for c in trending_candidates}
 
                 llm_input = [
                     {"id": c["id"], "type": c["type"], "title": c["title"], "full_text": c["full_text"]}
-                    for c in freshest_candidates
+                    for c in trending_candidates
                 ]
 
-                logger.info(f"Отправка {len(llm_input)} самых свежих кандидатов в LLM API на тематический отбор...")
+                logger.info(f"Отправка {len(llm_input)} трендовых кандидатов в LLM API на тематический отбор...")
                 start_time = time.perf_counter()
 
                 try:
@@ -302,6 +339,11 @@ async def fetch_materials_via_mcp(query: str = "machine learning") -> list[dict]
                             # Kaggle отдаёт и датасеты, и модели вперемешку —
                             # используем реальный тип кандидата, а не общий "датасет".
                             "source_type": "модель" if original["type"] == "model" else "датасет",
+                            # ТЗ 4.1: нативные теги Kaggle -> поле tags таблицы articles
+                            "tags": original["tags"],
+                            "stars": original["votes"],
+                            # ТЗ 4.2 / п.5: ссылка на вкладку /code со счётчиком решений
+                            "related_links": original["related_links"],
                         })
                 except ValidationError as val_err:
                     logger.error(f"LLM нарушил контракт Pydantic-схемы: {val_err}")

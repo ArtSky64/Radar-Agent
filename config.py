@@ -128,4 +128,16 @@ HF_TRENDING_URL_RU_1 = "https://huggingface.co/models?language=ru&sort=trending"
 HF_TRENDING_URL_RU_2 = "https://huggingface.co/models?language=rus&sort=trending"
 HF_TRENDING_LIMIT = 50
 
-
+# --- Связанные сущности датасета: статьи, модели, спейсы (ТЗ п.3.1-3.2) ---
+# Прямая ссылка на статью по arXiv ID из тегов; paperswithcode_id обрабатывается отдельно как ID датасета в Papers With Code.
+HF_PAPER_URL_TEMPLATE = "https://huggingface.co/papers/{arxiv_id}"
+# Топ-3 модели, обученные на датасете, отсортированные по downloads.
+HF_DATASET_MODELS_API = "https://huggingface.co/api/models?filter=dataset:{dataset_id}&sort=downloads&direction=-1&limit=3"
+# Готовый отфильтрованный каталог моделей на сайте HF (смарт-кнопка "Обученные модели").
+# ВАЖНО: значение параметра dataset должно идти с префиксом "dataset:" — без него сайт
+# воспринимает его как обычный тег и показывает 0 результатов (в ТЗ п.3.2 префикса нет — ошибка ТЗ).
+HF_DATASET_MODELS_CATALOG_URL = "https://huggingface.co/models?dataset=dataset:{dataset_id}&sort=trending"
+# Топ-3 спейса, использующих датасет.
+HF_DATASET_SPACES_API = "https://huggingface.co/api/spaces?filter=dataset:{dataset_id}&limit=3"
+# Каталог спейсов на сайте HF (смарт-кнопка "Спейсы").
+HF_DATASET_SPACES_CATALOG_URL = "https://huggingface.co/spaces?dataset={dataset_id}"

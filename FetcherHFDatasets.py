@@ -16,6 +16,114 @@ except ImportError:
 
 logger = logging.getLogger("hf_datasets_fetcher")
 
+# Тег карточки датасета вида 'arxiv:2310.12345' (допускаем суффикс версии v2)
+ARXIV_TAG_RE = re.compile(r"^arxiv:(\d{4}\.\d{4,5})(?:v\d+)?$", re.IGNORECASE)
+ARXIV_ID_RE = re.compile(r"^(?:arxiv:)?(\d{4}\.\d{4,5})(?:v\d+)?$", re.IGNORECASE)
+
+
+def extract_dataset_papers(tags: list, paperswithcode_id: str | None) -> list[dict]:
+    """
+    ТЗ 3.1.1: из tags карточки датасета достаём 'arxiv:XXXX.YYYYY', а также проверяем
+    поле paperswithcode_id (если там лежит arXiv ID). Возвращает элементы related_links
+    типа 'paper' (ТЗ п.5): {"type": "paper", "name": "arXiv:ID", "url": ".../papers/ID"}.
+    """
+    arxiv_ids: list[str] = []
+    for tag in tags or []:
+        match = ARXIV_TAG_RE.match(str(tag).strip())
+        if match:
+            arxiv_ids.append(match.group(1))
+    # paperswithcode_id обычно — slug датасета в PwC, а не arXiv ID; такой slug
+    # статьёй не является и в related_links не попадает. Берём только значение,
+    # которое реально выглядит как arXiv ID.
+    if paperswithcode_id:
+        match = ARXIV_ID_RE.match(str(paperswithcode_id).strip())
+        if match:
+            arxiv_ids.append(match.group(1))
+
+    return [
+        {
+            "type": "paper",
+            "name": f"arXiv:{arxiv_id}",
+            "url": config.HF_PAPER_URL_TEMPLATE.format(arxiv_id=arxiv_id),
+        }
+        for arxiv_id in dict.fromkeys(arxiv_ids)  # дедуп с сохранением порядка
+    ]
+
+
+async def fetch_dataset_models_top3(client: httpx.AsyncClient, dataset_id: str) -> list[str] | None:
+    """
+    ТЗ 3.1.2: топ-3 модели, обученные на датасете, по downloads.
+    Возвращает короткие названия моделей (без автора) для top_items.
+    None — запрос не удался (неизвестно, есть ли модели); [] — моделей точно нет.
+    """
+    url = config.HF_DATASET_MODELS_API.format(dataset_id=dataset_id)
+    try:
+        resp = await client.get(url, timeout=15.0)
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, list):
+            return None
+        # API уже отсортирован по downloads, но дополнительно сортируем локально —
+        # защита от изменения порядка ответа.
+        data.sort(key=lambda model: model.get("downloads", 0) or 0, reverse=True)
+        names = []
+        for m in data:
+            m_id = m.get("id") or m.get("modelId")
+            if m_id:
+                names.append(m_id.split("/")[-1])
+            if len(names) == 3:
+                break
+        return names
+    except Exception as e:
+        logger.debug(f"Не удалось получить модели для датасета {dataset_id}: {e}")
+        return None
+
+
+async def fetch_dataset_has_spaces(client: httpx.AsyncClient, dataset_id: str) -> bool | None:
+    """
+    ТЗ 3.1.3: есть ли спейсы, использующие датасет (запрос limit=3).
+    В related_links хранится только ссылка на каталог, поэтому имена спейсов не нужны.
+    None — запрос не удался.
+    """
+    url = config.HF_DATASET_SPACES_API.format(dataset_id=dataset_id)
+    try:
+        resp = await client.get(url, timeout=15.0)
+        resp.raise_for_status()
+        data = resp.json()
+        if not isinstance(data, list):
+            return None
+        return len(data) > 0
+    except Exception as e:
+        logger.debug(f"Не удалось получить спейсы для датасета {dataset_id}: {e}")
+        return None
+
+
+def build_related_links(dataset_id: str, papers: list[dict],
+                        top_models: list[str] | None, has_spaces: bool | None) -> list[dict]:
+    """
+    ТЗ 3.2 «Каталог + Топ-3» и п.5: собирает поле related_links.
+    Кнопку каталога не показываем только если API ответил и сущностей точно нет;
+    если запрос упал (None) — каталог всё равно валиден, ссылку оставляем.
+    """
+    links: list[dict] = list(papers)
+    if top_models is None or top_models:
+        entry = {
+            "type": "models_catalog",
+            "name": "Обученные модели",
+            "url": config.HF_DATASET_MODELS_CATALOG_URL.format(dataset_id=dataset_id),
+        }
+        if top_models:
+            entry["top_items"] = top_models
+        links.append(entry)
+    if has_spaces is None or has_spaces:
+        links.append({
+            "type": "spaces_catalog",
+            "name": "Spaces",
+            "url": config.HF_DATASET_SPACES_CATALOG_URL.format(dataset_id=dataset_id),
+        })
+    return links
+
+
 class SelectedDataset(BaseModel):
     id: str = Field(description="ID")
     russian_translation: str = Field(description="Summary in Russian")
@@ -125,6 +233,10 @@ async def fetch_hf_datasets_by_mode(mode: str) -> list[dict]:
             is_russian = mode == "trending_ru" or "ru" in langs or "rus" in langs
             language = "ru" if is_russian else ", ".join(langs)
 
+            # ТЗ 3.1.1: связанные статьи достаются из тех же сырых тегов, что и язык —
+            # делаем это для всех кандидатов сразу, запрос к сети для этого не нужен.
+            papers = extract_dataset_papers(tags, item.get("paperswithcode_id"))
+
             all_candidates.append({
                 "id": f"hf_dataset:{d_id}",
                 "title": d_id,
@@ -132,6 +244,8 @@ async def fetch_hf_datasets_by_mode(mode: str) -> list[dict]:
                 "url": f"https://huggingface.co/datasets/{d_id}",
                 "language": language,
                 "tags": ["#Russian"] if is_russian else [],  # только исключение из ТЗ, без сырых HF-тегов
+                "papers": papers,
+                "likes": int(item.get("likes", 0) or 0),
             })
 
         print("Кандидатов после обработки README:", len(all_candidates))
@@ -152,23 +266,46 @@ async def fetch_hf_datasets_by_mode(mode: str) -> list[dict]:
         print("Модель выбрала:", result.output.selected_datasets)
 
         candidates_by_id = {c["id"]: c for c in all_candidates}
+
+        # Собираем пары (результат LLM, оригинальный кандидат) только для реально
+        # найденных датасетов — моделей/спейсов запрашиваем именно по этому
+        # небольшому списку (а не по всем ~50 кандидатам), чтобы не перегружать API.
+        selected: list[tuple] = []
         for res_item in result.output.selected_datasets:
             dataset_id = res_item.id.removeprefix("hf_dataset:")
             original = candidates_by_id.get(f"hf_dataset:{dataset_id}")
-
             if not original:
                 logger.warning(
                     f"Выбранный датасет не найден среди кандидатов: {res_item.id}"
                 )
                 continue
+            selected.append((dataset_id, res_item, original))
 
-            articles_payload.append({
-                "title": f"[HF Dataset] {original['title']}",
-                "text": f"Датасет: {original['title']}\n\nОписание:\n{res_item.russian_translation}",
-                "source_url": original["url"],
-                "language": original.get("language", ""),
-                "tags": original.get("tags", []),
-            })
+        if selected:
+            async with httpx.AsyncClient(trust_env=False) as client:
+                models_lists, spaces_flags = await asyncio.gather(
+                    asyncio.gather(*[
+                        fetch_dataset_models_top3(client, dataset_id) for dataset_id, _, _ in selected
+                    ]),
+                    asyncio.gather(*[
+                        fetch_dataset_has_spaces(client, dataset_id) for dataset_id, _, _ in selected
+                    ]),
+                )
+
+            for (dataset_id, res_item, original), top_models, has_spaces in zip(
+                selected, models_lists, spaces_flags
+            ):
+                articles_payload.append({
+                    "title": f"[HF Dataset] {original['title']}",
+                    "text": f"Датасет: {original['title']}\n\nОписание:\n{res_item.russian_translation}",
+                    "source_url": original["url"],
+                    "language": original.get("language", ""),
+                    "tags": original.get("tags", []),
+                    "stars": original.get("likes", 0),
+                    "related_links": build_related_links(
+                        dataset_id, original.get("papers", []), top_models, has_spaces
+                    ),
+                })
 
     except Exception as e:
         logger.error(f"Error in mode {mode}: {e}")
