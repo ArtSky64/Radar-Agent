@@ -79,14 +79,32 @@ async def fetch_dataset_models_top3(client: httpx.AsyncClient, dataset_id: str) 
         return None
 
 
+async def check_dataset_has_spaces(client: httpx.AsyncClient, dataset_id: str) -> int:
+    """
+    Проверяет, есть ли на Hugging Face Spaces (демо), связанные с этим датасетом.
+    Возвращает 1 если есть хотя бы один Space, иначе 0.
+    """
+    try:
+        resp = await client.get(
+            f"https://huggingface.co/api/spaces?search={dataset_id}&limit=1",
+            timeout=8.0
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            if isinstance(data, list) and len(data) > 0:
+                return 1
+    except Exception as e:
+        logger.debug(f"Не удалось проверить спейсы для {dataset_id}: {e}")
+    return 0
+
+
 def build_related_links(dataset_id: str, papers: list[dict],
-                        top_models: list[str] | None) -> list[dict]:
+                        top_models: list[str] | None, has_spaces: int = 0) -> list[dict]:
     """
     ТЗ 3.2 «Каталог + Топ-3» и п.5: собирает поле related_links.
     Кнопку каталога моделей не показываем только если API ответил и моделей точно нет;
     если запрос упал (None) — каталог всё равно валиден, ссылку оставляем.
-    Демо-спейсы (Spaces) на Hugging Face привязаны к моделям, а не к датасетам (на сайте HF
-    у датасетов спейсов нет), поэтому для датасетов ссылка на спейсы не генерируется.
+    Если у датасета есть Spaces (демо) на HF — добавляем ссылку на Spaces.
     """
     links: list[dict] = list(papers)
     if top_models is None or top_models:
@@ -98,12 +116,27 @@ def build_related_links(dataset_id: str, papers: list[dict],
         if top_models:
             entry["top_items"] = top_models
         links.append(entry)
+    if has_spaces:
+        links.append({
+            "type": "spaces_catalog",
+            "name": "Spaces (Демо)",
+            "url": f"https://huggingface.co/spaces?search={dataset_id}",
+        })
     return links
 
 
 class SelectedDataset(BaseModel):
     id: str = Field(description="ID")
-    russian_translation: str = Field(description="Summary in Russian")
+    russian_translation: str = Field(
+        description=(
+            "Подробная карточка датасета на русском языке со следующими разделами:\n"
+            "• Назначение — для каких задач машинного обучения предназначен датасет и что позволяет исследовать или оценивать.\n"
+            "• Состав и масштаб — количество объектов, примеров или заданий, основные категории данных.\n"
+            "• Типы данных — модальности, форматы входных данных и особенности их содержимого.\n"
+            "• Разметка — какие аннотации, метки классов, эталонные ответы или критерии оценки предусмотрены.\n"
+            "• Применение и особенности — для каких моделей и сценариев подходит датасет, его ключевые отличия или ограничения."
+        )
+    )
 
 class SelectionResult(BaseModel):
     selected_datasets: list[SelectedDataset] = Field(description="Selected datasets")
@@ -113,9 +146,14 @@ def _get_hf_dataset_agent() -> Agent:
         model=get_model(),
         output_type=SelectionResult,
         system_prompt=(
-            "Ты — Senior ML Engineer. Тебе дают список новых или популярных "
-            "датасетов (id, title, full_text). Отбери самые ценные. "
-            "Напиши russian_translation: краткое описание на русском."
+            "Ты — Senior ML Engineer. Тебе дают список новых или популярных датасетов (id, title, full_text).\n"
+            "Отбери самые ценные датасеты.\n"
+            "Для каждого выбранного датасета сформируй подробную карточку (russian_translation) строго на русском языке со следующими обязательными разделами:\n"
+            "• Назначение — для каких задач машинного обучения предназначен датасет и что позволяет исследовать или оценивать.\n"
+            "• Состав и масштаб — количество объектов, примеров или заданий, основные категории данных.\n"
+            "• Типы данных — модальности, форматы входных данных и особенности их содержимого.\n"
+            "• Разметка — какие аннотации, метки классов, эталонные ответы или критерии оценки предусмотрены.\n"
+            "• Применение и особенности — для каких моделей и сценариев подходит датасет, его ключевые отличия или ограничения."
         )
     )
 
@@ -130,16 +168,20 @@ def clean_hf_readme(text: str) -> str:
     text = re.sub(r"\n{3,}", "\n\n", text)
     return text.strip()
 
-async def fetch_dataset_readme_directly(dataset_id: str) -> str:
+async def _fetch_readme_fast(client: httpx.AsyncClient, dataset_id: str) -> str:
     url = f"https://huggingface.co/datasets/{dataset_id.strip()}/raw/main/README.md"
     try:
-        async with httpx.AsyncClient(timeout=15.0, trust_env=False) as client:
-            response = await client.get(url, follow_redirects=True)
-            if response.status_code == 200:
-                return response.text
+        response = await client.get(url, follow_redirects=True)
+        if response.status_code == 200:
+            return response.text
     except Exception as e:
         logger.debug(f"Failed to fetch readme for {dataset_id}: {e}")
     return ""
+
+
+async def fetch_dataset_readme_directly(dataset_id: str) -> str:
+    async with httpx.AsyncClient(timeout=15.0, trust_env=False) as client:
+        return await _fetch_readme_fast(client, dataset_id)
 
 async def _fetch_dataset_ids(url: str) -> list[dict]:
     """Один запрос к HF API datasets, возвращает сырой список объектов."""
@@ -154,11 +196,17 @@ async def fetch_hf_datasets_by_mode(mode: str) -> list[dict]:
     base_url = "https://huggingface.co/api/datasets"
 
     if mode == "trending":
-        urls = [f"{base_url}?sort=trendingScore&direction=-1&limit=50"]
+        # Полная витрина мировых трендов (соответствует https://huggingface.co/datasets)
+        urls = [f"{base_url}?sort=trendingScore&direction=-1&limit=30"]
     elif mode == "trending_ru":
+        # Российские трендовые датасеты:
+        # 1) https://huggingface.co/datasets?language=language:ru&sort=trending
+        # 2) https://huggingface.co/datasets?language=language:ru,language:rus&sort=trending
+        # 3) https://huggingface.co/datasets?language=language:rus&sort=trending
         urls = [
             f"{base_url}?sort=trendingScore&direction=-1&filter=language:ru&limit=30",
             f"{base_url}?sort=trendingScore&direction=-1&filter=language:rus&limit=30",
+            f"{base_url}?sort=trendingScore&direction=-1&filter=language:ru,language:rus&limit=30",
         ]
     else:
         logger.warning(f"Unknown mode: {mode}")
@@ -167,7 +215,6 @@ async def fetch_hf_datasets_by_mode(mode: str) -> list[dict]:
     logger.info(f"Fetching HF Datasets (mode={mode})...")
 
     try:
-        # Параллельные запросы (для trending_ru их два, для trending один)
         results = await asyncio.gather(
             *[_fetch_dataset_ids(u) for u in urls], return_exceptions=True
         )
@@ -187,21 +234,33 @@ async def fetch_hf_datasets_by_mode(mode: str) -> list[dict]:
                     merged[d_id] = item.copy()
                     merged[d_id]["tags"] = list(item.get("tags", []))
                 else:
-                    # При совпадении ID объединяем теги из обоих ответов API.
                     existing_tags = merged[d_id].get("tags", [])
                     incoming_tags = item.get("tags", [])
                     merged[d_id]["tags"] = list(dict.fromkeys(
                         existing_tags + incoming_tags
                     ))
 
+        logger.info(f"Найдено {len(merged)} уникальных датасетов HF в режиме {mode}")
+
+        merged_items = list(merged.items())
+        async with httpx.AsyncClient(timeout=12.0, trust_env=False) as client:
+            readmes = await asyncio.gather(*[_fetch_readme_fast(client, d_id) for d_id, _ in merged_items])
+
         all_candidates = []
-        for d_id, item in merged.items():
-            raw_readme = await fetch_dataset_readme_directly(d_id)
-            if not raw_readme:
-                continue
-            clean_text = clean_hf_readme(raw_readme)
+        for idx, ((d_id, item), raw_readme) in enumerate(zip(merged_items, readmes), 1):
+            rank_global = idx if mode == "trending" else 0
+            rank_ru = idx if mode == "trending_ru" else 0
+            clean_text = clean_hf_readme(raw_readme) if raw_readme else ""
             if len(clean_text) < 50:
-                continue
+                # Если README отсутствует или слишком короткий, формируем информативный фолбэк,
+                # чтобы датасет НЕ пропадал из выборки и обязательно попал в итоговую выдачу
+                api_desc = item.get("description") or ""
+                clean_text = f"Датасет {d_id}. {api_desc}".strip()
+                if len(clean_text) < 30:
+                    clean_text = (
+                        f"Датасет {d_id} — актуальный открытый датасет на платформе Hugging Face. "
+                        f"Предназначен для задач обучения, тестирования и валидации моделей машинного обучения."
+                    )
 
             raw_tags = item.get("tags", [])
             langs = [t.replace("language:", "") for t in raw_tags if t.startswith("language:")]
@@ -210,24 +269,31 @@ async def fetch_hf_datasets_by_mode(mode: str) -> list[dict]:
             is_russian = mode == "trending_ru" or "ru" in langs or "rus" in langs
             language = "ru" if is_russian else ", ".join(langs)
 
-            # Очистка тегов от системных метаданных (размеры, лицензии, технические префиксы)
-            clean_tags = [
-                t for t in raw_tags
-                if isinstance(t, str) and not any(t.startswith(prefix) for prefix in (
-                    "language:", "license:", "size_categories:", "task_categories:",
+            # Очистка и извлечение содержательных тегов с сайта
+            clean_tags = []
+            for t in raw_tags:
+                if not isinstance(t, str):
+                    continue
+                if t.startswith("task_categories:"):
+                    tc = t.replace("task_categories:", "").strip()
+                    if tc and tc not in clean_tags:
+                        clean_tags.append(tc)
+                elif not any(t.startswith(prefix) for prefix in (
+                    "language:", "license:", "size_categories:",
                     "region:", "arxiv:", "format:", "modality:", "annotations_creators:",
                     "language_creators:", "source_datasets:", "multilinguality:"
-                ))
-            ][:5]
+                )):
+                    if t not in clean_tags:
+                        clean_tags.append(t)
+            clean_tags = clean_tags[:6]
             if is_russian and "#Russian" not in clean_tags:
                 clean_tags.insert(0, "#Russian")
 
-            # ТЗ 3.1.1: связанные статьи достаются из тех же сырых тегов, что и язык —
-            # делаем это для всех кандидатов сразу, запрос к сети для этого не нужен.
             papers = extract_dataset_papers(raw_tags, item.get("paperswithcode_id"))
 
             all_candidates.append({
                 "id": f"hf_dataset:{d_id}",
+                "d_id": d_id,
                 "title": d_id,
                 "full_text": clean_text,
                 "url": f"https://huggingface.co/datasets/{d_id}",
@@ -235,61 +301,54 @@ async def fetch_hf_datasets_by_mode(mode: str) -> list[dict]:
                 "tags": clean_tags,
                 "papers": papers,
                 "likes": int(item.get("likes", 0) or 0),
+                "rank_global": rank_global,
+                "rank_ru": rank_ru,
             })
 
-        print("Кандидатов после обработки README:", len(all_candidates))
+        logger.info(f"Сформировано {len(all_candidates)} кандидатов HF datasets (mode={mode})")
 
         if not all_candidates:
             return []
 
-        llm_input = [
-            {"id": c["id"], "title": c["title"], "full_text": c["full_text"][:2500]}
-            for c in all_candidates[:10]
-        ]
+        # Запрашиваем модели и спейсы для ВСЕХ кандидатов (все кандидаты попадают в выдачу)
+        async with httpx.AsyncClient(trust_env=False) as client:
+            models_coros = [fetch_dataset_models_top3(client, c["d_id"]) for c in all_candidates]
+            spaces_coros = [check_dataset_has_spaces(client, c["d_id"]) for c in all_candidates]
+            models_lists, spaces_flags = await asyncio.gather(
+                asyncio.gather(*models_coros),
+                asyncio.gather(*spaces_coros),
+            )
 
-        prompt = "Кандидаты:\n" + json.dumps(llm_input, ensure_ascii=False)
-        agent = _get_hf_dataset_agent()
-        if not agent:
-            return []
-        result = await agent.run(prompt)
-        print("Модель выбрала:", result.output.selected_datasets)
+        for candidate, top_models, has_spaces in zip(
+            all_candidates, models_lists, spaces_flags
+        ):
+            d_id = candidate["d_id"]
+            tags_str = ", ".join(candidate["tags"])
+            dataset_text = (
+                f"Датасет: {d_id}\n"
+                f"URL: {candidate['url']}\n"
+                f"Теги сайта: {tags_str}\n"
+                f"Язык: {candidate['language']}\n\n"
+                f"{candidate['full_text']}"
+            )
 
-        candidates_by_id = {c["id"]: c for c in all_candidates}
+            articles_payload.append({
+                "title": f"[HF Dataset] {d_id}",
+                "text": dataset_text,
+                "source_url": candidate["url"],
+                "source_type": "датасет",
+                "language": candidate.get("language", ""),
+                "tags": candidate.get("tags", []),
+                "stars": candidate.get("likes", 0),
+                "has_spaces": has_spaces,
+                "rank_global": candidate.get("rank_global", 0),
+                "rank_ru": candidate.get("rank_ru", 0),
+                "related_links": build_related_links(
+                    d_id, candidate.get("papers", []), top_models, has_spaces
+                ),
+            })
 
-        # Собираем пары (результат LLM, оригинальный кандидат) только для реально
-        # найденных датасетов — моделей запрашиваем именно по этому
-        # небольшому списку (а не по всем ~50 кандидатам), чтобы не перегружать API.
-        selected: list[tuple] = []
-        for res_item in result.output.selected_datasets:
-            dataset_id = res_item.id.removeprefix("hf_dataset:")
-            original = candidates_by_id.get(f"hf_dataset:{dataset_id}")
-            if not original:
-                logger.warning(
-                    f"Выбранный датасет не найден среди кандидатов: {res_item.id}"
-                )
-                continue
-            selected.append((dataset_id, res_item, original))
-
-        if selected:
-            async with httpx.AsyncClient(trust_env=False) as client:
-                models_lists = await asyncio.gather(*[
-                    fetch_dataset_models_top3(client, dataset_id) for dataset_id, _, _ in selected
-                ])
-
-            for (dataset_id, res_item, original), top_models in zip(
-                selected, models_lists
-            ):
-                articles_payload.append({
-                    "title": f"[HF Dataset] {original['title']}",
-                    "text": f"Датасет: {original['title']}\n\nОписание:\n{res_item.russian_translation}",
-                    "source_url": original["url"],
-                    "language": original.get("language", ""),
-                    "tags": original.get("tags", []),
-                    "stars": original.get("likes", 0),
-                    "related_links": build_related_links(
-                        dataset_id, original.get("papers", []), top_models
-                    ),
-                })
+        logger.info(f"HF Datasets (mode={mode}): готово к сохранению {len(articles_payload)} датасетов.")
 
     except Exception as e:
         logger.error(f"Error in mode {mode}: {e}")

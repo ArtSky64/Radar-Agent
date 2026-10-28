@@ -269,7 +269,7 @@ available_tags = sorted({t for art in article_list for t in art["tags"] if isins
 # Меню вкладок
 page = st.radio(
     "Разделы",
-    ["Лидерборд моделей", "Трендовые модели HF", "Тренды HF (Русский язык)", "Papers (Статьи)", "Модели", "Датасеты", "Репозитории"],
+    ["Лидерборд моделей", "Трендовые модели HF", "Трендовые модели HF с поддержкой русского языка", "Papers (Статьи)", "Датасеты", "Репозитории"],
     horizontal=True, label_visibility="collapsed",
 )
 st.divider()
@@ -280,10 +280,6 @@ _CONTENT_TABS = {
     "Papers (Статьи)": {
         "source_type": "статья",
         "hint": "Научные статьи и препринты из Hugging Face Papers и Papers with Code (PwC) — склеены по arxiv_id, ранжированы по upvotes, саммари и теги сформированы ИИ.",
-    },
-    "Модели": {
-        "source_type": "модель",
-        "hint": "Новые модели с Hugging Face — отобраны и описаны ИИ-агентом по карточке модели.",
     },
     "Датасеты": {
         "source_type": "датасет",
@@ -322,8 +318,8 @@ with st.sidebar:
                 unsafe_allow_html=True,
             )
 
-    elif page in ("Трендовые модели HF", "Тренды HF (Русский язык)"):
-        is_ru_page = (page == "Тренды HF (Русский язык)")
+    elif page in ("Трендовые модели HF", "Трендовые модели HF с поддержкой русского языка"):
+        is_ru_page = (page == "Трендовые модели HF с поддержкой русского языка")
         title_prefix = "Тренды HF (RU)" if is_ru_page else "Мировые тренды HF"
         st.markdown(f"<h5 style='color:#FFFFFF; margin-bottom:10px;'>Фильтры: {title_prefix}</h5>", unsafe_allow_html=True)
 
@@ -377,7 +373,25 @@ with st.sidebar:
         # Язык сейчас заполняется только у HF-датасетов, поэтому фильтр
         # показываем только на вкладке "Датасеты".
         selected_languages = []
+        selected_has_spaces = "Все"
+        selected_ds_source = "Все источники"
+        sort_ds = "По российскому рейтингу (RU)"
         if page == "Датасеты":
+            selected_ds_source = st.selectbox(
+                "Источник датасета",
+                ["Все источники", "Hugging Face", "Kaggle"],
+                key="ds_source"
+            )
+            sort_ds = st.selectbox(
+                "Сортировка датасетов",
+                [
+                    "По российскому рейтингу (RU)",
+                    "По мировому рейтингу (Global)",
+                    "По лайкам / голосам",
+                    "Сначала новые"
+                ],
+                key="ds_sort"
+            )
             available_languages = sorted({
                 lang.strip()
                 for a in article_list
@@ -385,6 +399,11 @@ with st.sidebar:
                 for lang in (a.get("language") or "").split(",")
                 if lang.strip()
             })
+            selected_has_spaces = st.selectbox(
+                "Наличие Spaces (демо)",
+                ["Все", "Только со Spaces (True)", "Без Spaces (False)"],
+                key="ds_has_spaces"
+            )
             if available_languages:
                 selected_languages = st.multiselect(
                     "Язык датасета", available_languages, placeholder="Все языки..."
@@ -700,8 +719,8 @@ elif page == "Трендовые модели HF":
         st.info("Нет моделей по выбранным фильтрам.")
 
 
-elif page == "Тренды HF (Русский язык)":
-    st.markdown("<h1>🇷🇺 Тренды Hugging Face с поддержкой русского языка</h1>", unsafe_allow_html=True)
+elif page == "Трендовые модели HF с поддержкой русского языка":
+    st.markdown("<h1>🇷🇺 Трендовые модели Hugging Face с поддержкой русского языка</h1>", unsafe_allow_html=True)
     st.info("Объединённый рейтинг моделей по ссылкам huggingface.co/models?language=ru&sort=trending и huggingface.co/models?language=rus&sort=trending с дедупликацией и сквозным рейтингом.")
 
     col_btn, col_info = st.columns([1, 3])
@@ -917,10 +936,20 @@ elif page in _CONTENT_TABS:
     if selected_tags:
         articles = [a for a in articles if any(t in selected_tags for t in a.get("tags", []))]
 
-    if page == "Датасеты" and selected_languages:
+    if page == "Датасеты":
+        if selected_ds_source == "Hugging Face":
+            articles = [a for a in articles if "huggingface.co" in (a.get("source_url") or "").lower() or str(a.get("title", "")).startswith("[HF")]
+        elif selected_ds_source == "Kaggle":
+            articles = [a for a in articles if "kaggle.com" in (a.get("source_url") or "").lower() or str(a.get("title", "")).startswith("[Kaggle]")]
+
+        if selected_has_spaces == "Только со Spaces (True)":
+            articles = [a for a in articles if a.get("has_spaces")]
+        elif selected_has_spaces == "Без Spaces (False)":
+            articles = [a for a in articles if not a.get("has_spaces")]
+        # Фильтр датасетов по языку
         articles = [
             a for a in articles
-            if any(lang.strip() in selected_languages for lang in (a.get("language") or "").split(","))
+            if not selected_languages or any(lang.strip() in selected_languages for lang in (a.get("language") or "").split(","))
         ]
 
     if page == "Papers (Статьи)":
@@ -1138,11 +1167,46 @@ elif page in _CONTENT_TABS:
 
         article_code_badge = code_badge if source_type == "статья" else ""
 
+        dataset_spaces_badge = ""
+        dataset_rank_badge = ""
+        if source_type == "датасет":
+            is_hf = "huggingface.co" in (source_url or "").lower() or str(a.get("title", "")).startswith("[HF")
+            is_kaggle = "kaggle.com" in (source_url or "").lower() or str(a.get("title", "")).startswith("[Kaggle")
+            rank_g = int(a.get("rank_global", 0) or 0)
+            rank_r = int(a.get("rank_ru", 0) or 0)
+
+            if is_hf:
+                badges_list = []
+                if rank_r > 0:
+                    badges_list.append(
+                        f'<span style="font-size:0.7rem; font-weight:700; color:#34D399; background:#064E3B; border:1px solid #059669; border-radius:6px; padding:2px 8px; margin-right:6px;">🇷🇺 RU #{rank_r}</span>'
+                    )
+                if rank_g > 0:
+                    badges_list.append(
+                        f'<span style="font-size:0.7rem; font-weight:700; color:#A78BFA; background:#2E1065; border:1px solid #7C3AED; border-radius:6px; padding:2px 8px; margin-right:6px;">🌍 Global #{rank_g}</span>'
+                    )
+                elif rank_r > 0 and rank_g == 0:
+                    badges_list.append(
+                        f'<span style="font-size:0.7rem; font-weight:600; color:#9CA3AF; background:#1F2937; border:1px solid #374151; border-radius:6px; padding:2px 8px; margin-right:6px;">🌍 Вне мирового топа</span>'
+                    )
+                dataset_rank_badge = "".join(badges_list)
+
+                has_spaces = bool(a.get("has_spaces"))
+                if has_spaces:
+                    dataset_spaces_badge = '<span style="font-size:0.7rem; font-weight:700; color:#E879F9; background:#4A044E; border:1px solid #A21CAF; border-radius:6px; padding:2px 8px; margin-right:8px;">🚀 Spaces: Есть (True)</span>'
+                else:
+                    dataset_spaces_badge = '<span style="font-size:0.7rem; font-weight:700; color:#9CA3AF; background:#1F2937; border:1px solid #374151; border-radius:6px; padding:2px 8px; margin-right:8px;">🚀 Spaces: Нет (False)</span>'
+            elif is_kaggle:
+                k_rank = rank_g if rank_g > 0 else (a.get("rowid") or 0)
+                if k_rank > 0:
+                    dataset_rank_badge = f'<span style="font-size:0.7rem; font-weight:700; color:#38BDF8; background:#0C4A6E; border:1px solid #0284C7; border-radius:6px; padding:2px 8px; margin-right:6px;">🏆 Kaggle #{k_rank}</span>'
+                dataset_spaces_badge = '<span style="font-size:0.7rem; font-weight:500; color:#94A3B8; background:#0F172A; border:1px solid #334155; border-radius:6px; padding:2px 8px; margin-right:8px;">Kaggle (без Spaces)</span>'
+
         st.markdown(
             f'<div class="custom-card">'
-            f'<div class="article-tags">{type_badge}{upvotes_badge}{article_code_badge}{repo_extra_badges}{lang_badge}{likes_badge}{topic_badge}{tags_html}</div>'
+            f'<div class="article-tags">{type_badge}{dataset_rank_badge}{upvotes_badge}{article_code_badge}{dataset_spaces_badge}{repo_extra_badges}{lang_badge}{likes_badge}{topic_badge}{tags_html}</div>'
             f'<h4 style="margin:0; color:#FFFFFF;">{a.get("title") or a.get("repo_name")}</h4>'
-            f'<p style="font-size:0.9rem; color:#D4D4D8; margin:8px 0; line-height:1.5;">{a.get("summary")}</p>'
+            f'<div style="font-size:0.9rem; color:#D4D4D8; margin:10px 0; line-height:1.6; white-space:pre-line;">{a.get("summary")}</div>'
             f'{source_art_html}{rel_html}{top_models_html}'
             f'<div style="margin-top:8px;">{link_html}</div></div>',
             unsafe_allow_html=True)
@@ -1178,6 +1242,69 @@ elif page in _CONTENT_TABS:
                     render_article_card(a)
             else:
                 st.info("Нет статей за месяц по выбранным фильтрам.")
+    elif page == "Датасеты":
+        if sort_ds == "По российскому рейтингу (RU)":
+            articles = sorted(articles, key=lambda x: (x.get("rank_ru") if (x.get("rank_ru") or 0) > 0 else 9999, -(x.get("stars") or 0)))
+        elif sort_ds == "По мировому рейтингу (Global)":
+            articles = sorted(articles, key=lambda x: (x.get("rank_global") if (x.get("rank_global") or 0) > 0 else 9999, -(x.get("stars") or 0)))
+        elif sort_ds == "По лайкам / голосам":
+            articles = sorted(articles, key=lambda x: int(x.get("stars", 0) or 0), reverse=True)
+        elif sort_ds == "Сначала новые":
+            articles = sorted(articles, key=lambda x: (x.get("added_at") or "", x.get("rowid", 0)), reverse=True)
+
+        tab_ru, tab_global, tab_kaggle, tab_all = st.tabs([
+            "🇷🇺 Российские тренды (RU)",
+            "🌍 Мировые тренды HF",
+            "🏆 Kaggle Trending",
+            "📋 Все датасеты"
+        ])
+
+        with tab_ru:
+            ru_datasets = [
+                a for a in articles
+                if (a.get("rank_ru") or 0) > 0 or "ru" in (a.get("language") or "").lower() or "#Russian" in (a.get("tags") or [])
+            ]
+            ru_datasets.sort(key=lambda x: (x.get("rank_ru") if (x.get("rank_ru") or 0) > 0 else 9999, -(x.get("stars") or 0)))
+            if ru_datasets:
+                st.caption(f"Найдено датасетов с поддержкой русского языка: {len(ru_datasets)}")
+                for a in ru_datasets:
+                    render_article_card(a)
+            else:
+                st.info("Нет русскоязычных датасетов по выбранным фильтрам.")
+
+        with tab_global:
+            global_datasets = [
+                a for a in articles
+                if (a.get("rank_global") or 0) > 0 and ("huggingface.co" in (a.get("source_url") or "").lower() or str(a.get("title", "")).startswith("[HF"))
+            ]
+            global_datasets.sort(key=lambda x: (x.get("rank_global") if (x.get("rank_global") or 0) > 0 else 9999, -(x.get("stars") or 0)))
+            if global_datasets:
+                st.caption(f"Найдено мировых трендовых датасетов HF: {len(global_datasets)}")
+                for a in global_datasets:
+                    render_article_card(a)
+            else:
+                st.info("Нет мировых датасетов по выбранным фильтрам.")
+
+        with tab_kaggle:
+            kaggle_datasets = [
+                a for a in articles
+                if "kaggle.com" in (a.get("source_url") or "").lower() or str(a.get("title", "")).startswith("[Kaggle")
+            ]
+            kaggle_datasets.sort(key=lambda x: (x.get("rank_global") if (x.get("rank_global") or 0) > 0 else (x.get("rowid") or 9999)))
+            if kaggle_datasets:
+                st.caption(f"Найдено трендовых датасетов Kaggle: {len(kaggle_datasets)}")
+                for a in kaggle_datasets:
+                    render_article_card(a)
+            else:
+                st.info("Нет датасетов Kaggle по выбранным фильтрам.")
+
+        with tab_all:
+            if articles:
+                st.caption(f"Всего датасетов в каталоге: {len(articles)}")
+                for a in articles:
+                    render_article_card(a)
+            else:
+                st.info("Нет датасетов по выбранным фильтрам.")
     else:
         if articles:
             for a in articles:

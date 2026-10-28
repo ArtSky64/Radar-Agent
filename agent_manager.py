@@ -3,7 +3,7 @@ import re
 import threading
 import time
 
-import httpx2
+import httpx
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
@@ -76,7 +76,7 @@ def get_model() -> OpenAIChatModel:
             "VLLM_BASE_URL не найден. Создай файл .env на основе .env.example "
             "и укажи там адрес своего vLLM (например, http://127.0.0.1:2233/v1)."
         )
-    http_client = httpx2.AsyncClient(timeout=180.0)
+    http_client = httpx.AsyncClient(timeout=180.0)
     return OpenAIChatModel(
         config.VLLM_MODEL_NAME,
         provider=OpenAIProvider(
@@ -102,16 +102,16 @@ class AnalysisError(Exception):
 def _is_retryable_error(exception: BaseException) -> bool:
     """
     True для ошибок, на которые имеет смысл ретраить с backoff:
-    - 429 (rate limit) от Mistral;
-    - сетевые/таймаут-ошибки httpx (ReadTimeout, ConnectTimeout, PoolTimeout,
-      ConnectError и т.п.) — у них str(exception) часто ПУСТОЙ, поэтому раньше
-      они не матчились ни под одно условие и падали без retry с пустым текстом
-      ошибки в логах.
+    - 429 (rate limit);
+    - сетевые/таймаут-ошибки httpx (ReadTimeout, ConnectTimeout, PoolTimeout).
+    Если сервер недоступен (ConnectError / connection refused), повторы не делаются.
     """
+    if isinstance(exception, httpx.ConnectError) or "connection error" in str(exception).lower() or "connection refused" in str(exception).lower():
+        return False
     status_code = getattr(exception, "status_code", None)
     if status_code == 429:
         return True
-    if isinstance(exception, (httpx2.TimeoutException, httpx2.TransportError)):
+    if isinstance(exception, (httpx.TimeoutException, httpx.TransportError)):
         return True
     text = str(exception).lower()
     return "429" in text or "rate limit" in text
@@ -737,6 +737,158 @@ def analyze_github_repo(repo_name: str, readme_text: str, description: str = "")
     except Exception as e:
         logger.warning(f"LLM-анализ недоступен для '{repo_name}' ({type(e).__name__}: {e}). Используем фолбэк-карточку.")
         return _mock_github_repo_card(repo_name, readme_text, description)
+
+
+# ==========================================
+# КАРТОЧКА ДАТАСЕТА
+# ==========================================
+
+class DatasetCard(BaseModel):
+    """Структурированная карточка датасета."""
+    summary: str = Field(
+        description=(
+            "Развёрнутая подробная карточка датасета на русском языке, строго структурированная по разделам:\n"
+            "• Назначение — целевые задачи машинного обучения, предметная область и исследовательская ценность.\n"
+            "• Состав и масштаб — количество объектов, примеров или заданий, распределение по сплитам, категории и языки.\n"
+            "• Типы данных — модальности, форматы входных данных, структура полей и особенности содержимого.\n"
+            "• Разметка — методология аннотации, метки классов, эталонные ответы или критерии оценки.\n"
+            "• Применение и особенности — совместимые архитектуры моделей, рекомендации по использованию и ограничения."
+        )
+    )
+    tags: list[str] = Field(
+        default_factory=list,
+        description="3-6 содержательных тегов (напр. ['NLP', 'Classification', 'Russian', 'Tabular'])"
+    )
+
+
+DATASET_SYSTEM_PROMPT = """
+Ты — ведущий эксперт по машинному обучению, Data Science и инженер открытых датасетов.
+Тебе передаётся название датасета, его теги и выдержка из описания/README.
+
+ТВОЯ ЗАДАЧА — составить подробную, профессиональную и развёрнутую аналитическую карточку датасета strictly на русском языке.
+Каждый раздел должен быть содержательным, конкретным и информативным (по 2-4 полноценных предложения с максимумом фактуры и технических деталей). Избегай общих и пустых фраз.
+
+СТРОГО соблюдай следующую структуру в поле summary (с маркерами • и точным названием разделов):
+
+• Назначение — подробно опиши целевые задачи машинного обучения (классификация, генерация, регрессия, RAG, RLHF, fine-tuning, претрейн, бенчмаркинг и др.), для которых создан датасет, его исследовательскую ценность, область применения и решаемые прикладные проблемы.
+• Состав и масштаб — детально укажи объём данных (количество записей, сэмплов, изображений, часов аудио, токенов), распределение по сплитам (train, test, validation), охват тем, предметные категории и поддерживаемые языки. Если точные числа не указаны, опиши структуру и оценочный масштаб.
+• Типы данных — перечисли модальности (текст, табличные данные, изображения, аудио, видео, мультимодальные), форматы файлов (Parquet, JSONL, Arrow, CSV, WAV, MP3 и др.), структуру полей/признаков, целевые атрибуты и специфические характеристики содержимого.
+• Разметка — подробно поясни, как формировалась разметка (экспертная разметка человеком, краудсорсинг, синтетическая генерация через LLM, эвристические правила), какие классы, эталонные ответы или критерии качества используются для супервизорного обучения или валидации.
+• Применение и особенности — укажи совместимые архитектуры моделей (LLM, Vision Transformers, GNN, градиентный бустинг и др.), рекомендуемые сценарии инференса/обучения, ограничения датасета, рекомендации по фильтрации/предобработке и условия лицензирования.
+
+В поле tags сгенерируй от 3 до 6 содержательных тегов на русском или английском (задачи ML, модальности данных, ключевые технологии и предметные области, например: ['NLP', 'Text Generation', 'Russian', 'Instruction Tuning', 'Synthetic']).
+"""
+
+
+def _get_dataset_agent() -> Agent:
+    return Agent(
+        model=get_model(),
+        output_type=DatasetCard,
+        system_prompt=DATASET_SYSTEM_PROMPT,
+    )
+
+
+@retry(
+    retry=retry_if_exception(_is_retryable_error),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=1, max=30),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True,
+)
+def _call_dataset_agent(prompt: str):
+    _throttle()
+    return _safe_run_agent_sync(_get_dataset_agent(), prompt)
+
+
+def _mock_dataset_card(title: str, text: str = "") -> DatasetCard:
+    clean_title = title.removeprefix("[HF Dataset]").removeprefix("[Kaggle]").strip()
+    low_text = (clean_title + " " + text[:3000]).lower()
+
+    # Определение модальности
+    is_vision = any(k in low_text for k in ("image", "vision", "video", "photo", "segmentation", "detection", "yolo", "cv", "visual", "cervical", "cancer image"))
+    is_audio = any(k in low_text for k in ("audio", "speech", "voice", "sound", "asr", "tts", "wav", "mp3"))
+    is_tabular = any(k in low_text for k in ("tabular", "csv", "table", "dataframe", "columns", "features", "stock", "tick", "market", "order book"))
+    is_russian = bool(re.search(r"(?:\b(russian|rus|россия|русск\w*|cyrillic)\b|язык:\s*ru|#russian)", low_text, re.IGNORECASE))
+    is_llm = any(k in low_text for k in ("llm", "prompt", "instruct", "conversational", "chat", "passage", "reasoning", "jailbreak", "synthetic", "tokens"))
+    is_medical = any(k in low_text for k in ("medical", "cancer", "health", "clinical", "biomedical", "knee", "rsna", "hospital", "patient"))
+
+    # Формирование разделов
+    if is_vision:
+        modal_name = "компьютерного зрения (Computer Vision)"
+        data_type = "графические файлы изображений или видеоматериалов с сопутствующими метаданными"
+        storage_fmt = "PNG/JPEG, Arrow/WebDataset или специализированные бинарные форматы"
+        target_models = "сверточные нейросети (CNN) и модели Vision Transformer (ViT, Swin, YOLO)"
+        default_tag = "Computer Vision"
+    elif is_audio:
+        modal_name = "обработки и распознавания речи (Audio & Speech Processing)"
+        data_type = "аудиозаписи и спектрограммы с текстовыми транскрипциями"
+        storage_fmt = "WAV/FLAC/MP3 аудиоконтейнеры и таблицы метаданных"
+        target_models = "акустические энкодеры и диффузионные аудио-модели (Whisper, Wav2Vec, Conformer)"
+        default_tag = "Audio"
+    elif is_tabular:
+        modal_name = "табличного анализа данных и классического машинного обучения"
+        data_type = "структурированные числовые, категориальные и временные признаки"
+        storage_fmt = "Parquet, CSV или Feather с типизированными столбцами"
+        target_models = "алгоритмы градиентного бустинга (XGBoost, CatBoost, LightGBM) и табличные трансформеры"
+        default_tag = "Tabular"
+    else:
+        modal_name = "обработки естественного языка (NLP) и языкового моделирования"
+        data_type = "текстовые последовательности, документы или структурированные диалоговые реплики"
+        storage_fmt = "JSONL, Parquet или Arrow с поддержкой потоковой декомпрессии"
+        target_models = "большие языковые модели (LLM), трансформеры архитектуры Decoder-only и Encoder-only"
+        default_tag = "NLP"
+
+    domain_desc = "медицинских и биомедицинских исследований" if is_medical else "исследовательских и прикладных задач искусственного интеллекта"
+
+    summary = (
+        f"• Назначение — датасет {clean_title} разработан для решения прикладных задач в области {modal_name} "
+        f"и ориентирован на сценарии {domain_desc}. Набор данных позволяет проводить обучение, тонкую настройку (fine-tuning) "
+        f"и всестороннее тестирование моделей, обеспечивая воспроизводимый бенчмаркинг алгоритмов.\n"
+        f"• Состав и масштаб — коллекция включает репрезентативную выборку подготовленных объектов, "
+        f"стратифицированных по ключевым категориям и сплитам (обучение, валидация и отложенный тест). "
+        f"Объём выборки оптимизирован для эффективной генерализации моделей и выявления сложных закономерностей в данных"
+        f"{' с акцентом на русскоязычный корпус' if is_russian else ''}.\n"
+        f"• Типы данных — основу датасета составляют {data_type}, представленные в оптимизированных форматах хранения ({storage_fmt}). "
+        f"Структура полей стандартизирована, что обеспечивает быструю загрузку через современные библиотеки загрузки данных.\n"
+        f"• Разметка — данные снабжены целевыми атрибутами, классами или эталонными ответами, полученными в процессе верифицированной разметки. "
+        f"Предусмотрены критерии валидации и схемы оценки качества, минимизирующие уровень шума и смещения в обучающих сэмплах.\n"
+        f"• Применение и особенности — датасет рекомендован для интеграции в пайплайны {target_models}. "
+        f"Перед обучением рекомендуется базовая нормализация и фильтрация; лицензия и структура датасета поддерживают открытые исследовательские инициативы."
+    )
+
+    tags = ["Dataset", default_tag, "Machine Learning"]
+    if is_russian:
+        tags.insert(0, "#Russian")
+        tags.append("Russian")
+    if is_llm and "LLM" not in tags:
+        tags.append("LLM")
+    if is_medical and "Healthcare" not in tags:
+        tags.append("Healthcare")
+
+    return DatasetCard(
+        summary=summary,
+        tags=tags[:6],
+    )
+
+
+def analyze_dataset(title: str, text: str) -> DatasetCard:
+    """
+    Синхронный анализ датасета через LLM / PydanticAI.
+    Возвращает DatasetCard с развёрнутыми 5 разделами:
+    - Назначение
+    - Состав и масштаб
+    - Типы данных
+    - Разметка
+    - Применение и особенности
+    При недоступности LLM возвращает качественный эвристический фолбэк.
+    """
+    prompt = f"Название датасета: {title}\n\nОписание / README:\n{text[:4000]}"
+    try:
+        result = _call_dataset_agent(prompt)
+        return result.output
+    except Exception as e:
+        logger.warning(f"LLM-анализ недоступен для датасета '{title}' ({type(e).__name__}: {e}). Используем фолбэк-карточку.")
+        return _mock_dataset_card(title, text)
 
 if __name__ == "__main__":
     print("\n" + "=" * 70)

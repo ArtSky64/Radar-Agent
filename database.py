@@ -110,6 +110,9 @@ def init_db():
             stars INTEGER NOT NULL DEFAULT 0,
             is_trending INTEGER NOT NULL DEFAULT 0,
             has_code INTEGER NOT NULL DEFAULT 0,
+            has_spaces INTEGER NOT NULL DEFAULT 0,
+            rank_global INTEGER NOT NULL DEFAULT 0,
+            rank_ru INTEGER NOT NULL DEFAULT 0,
             added_at TEXT DEFAULT CURRENT_TIMESTAMP
         );""")
 
@@ -138,6 +141,13 @@ def init_db():
             cursor.execute("ALTER TABLE articles ADD COLUMN is_trending INTEGER NOT NULL DEFAULT 0")
         if 'has_code' not in existing_cols:
             cursor.execute("ALTER TABLE articles ADD COLUMN has_code INTEGER NOT NULL DEFAULT 0")
+        if 'has_spaces' not in existing_cols:
+            cursor.execute("ALTER TABLE articles ADD COLUMN has_spaces INTEGER NOT NULL DEFAULT 0")
+        if 'rank_global' not in existing_cols:
+            cursor.execute("ALTER TABLE articles ADD COLUMN rank_global INTEGER NOT NULL DEFAULT 0")
+        if 'rank_ru' not in existing_cols:
+            cursor.execute("ALTER TABLE articles ADD COLUMN rank_ru INTEGER NOT NULL DEFAULT 0")
+
 
         # Миграция: связанные сущности HF-датасетов хранились в отдельных колонках
         # hf_papers / hf_models_top3 / hf_*_catalog_url. По ТЗ (п.5) всё лежит в
@@ -329,6 +339,9 @@ def save_article(article: dict) -> None:
     stars = int(article.get('stars', 0) or article.get('upvotes', 0) or 0)
     is_trending = int(bool(article.get('is_trending', 0)))
     has_code = int(bool(article.get('has_code', 0)))
+    has_spaces = int(bool(article.get('has_spaces', 0)))
+    rank_global = int(article.get('rank_global', 0) or 0)
+    rank_ru = int(article.get('rank_ru', 0) or 0)
     if not has_code:
         # Автоопределение по ссылкам и тексту
         if ('github' in str(related_links).lower()
@@ -347,13 +360,19 @@ def save_article(article: dict) -> None:
                 UPDATE articles
                 SET stars = MAX(stars, ?),
                     has_code = MAX(has_code, ?),
+                    has_spaces = MAX(has_spaces, ?),
+                    rank_global = CASE WHEN ? > 0 THEN (CASE WHEN rank_global = 0 THEN ? ELSE MIN(rank_global, ?) END) ELSE rank_global END,
+                    rank_ru = CASE WHEN ? > 0 THEN (CASE WHEN rank_ru = 0 THEN ? ELSE MIN(rank_ru, ?) END) ELSE rank_ru END,
                     summary = CASE WHEN summary = '' OR summary IS NULL THEN ? ELSE summary END,
                     period = CASE WHEN period = '' OR period IS NULL THEN ? ELSE period END,
                     related_links = CASE WHEN related_links = '' OR related_links = '[]' OR related_links IS NULL THEN ? ELSE related_links END,
                     topic_tag = CASE WHEN topic_tag = '' OR topic_tag IS NULL THEN ? ELSE topic_tag END
                 WHERE rowid = ?
             ''', (
-                stars, has_code, summary, article.get('period', ''), related_links, article.get('topic_tag', ''),
+                stars, has_code, has_spaces,
+                rank_global, rank_global, rank_global,
+                rank_ru, rank_ru, rank_ru,
+                summary, article.get('period', ''), related_links, article.get('topic_tag', ''),
                 row['rowid'],
             ))
             return
@@ -362,9 +381,10 @@ def save_article(article: dict) -> None:
             INSERT INTO articles (
                 title, summary, source_url, tags, source_type, language,
                 topic_tag, related_links, source_article_url, period,
-                directions, task_types, stars, is_trending, has_code
+                directions, task_types, stars, is_trending, has_code, has_spaces,
+                rank_global, rank_ru
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             article['title'],
             summary,
@@ -381,6 +401,9 @@ def save_article(article: dict) -> None:
             stars,
             is_trending,
             has_code,
+            has_spaces,
+            rank_global,
+            rank_ru,
         ))
 
 

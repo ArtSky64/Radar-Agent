@@ -4,9 +4,8 @@ import numpy as np
 
 import config
 from dedup import text_to_vector, is_duplicate
-from agent_manager import analyze_article, AnalysisError
+from agent_manager import analyze_article, analyze_dataset, DatasetCard, AnalysisError
 from database import init_db, get_all_vectors, save_vector, save_article, delete_old_vectors, save_trending_models, upsert_related_material
-from FetcherHF import stream_hf_articles
 from FetcherHFDatasets import stream_hf_datasets_by_mode
 from mcp_fetcher_kaggle import stream_kaggle_articles
 from mcp_fetcher_papers import stream_papers_articles
@@ -77,11 +76,6 @@ def _tag_source_type(articles, source_type: str):
 
 
 def stream_all_new_articles():
-    try:
-        yield from _tag_source_type(stream_hf_articles("LLM"), "модель")
-    except Exception as e:
-        logger.error(f"Источник Hugging Face (модели) недоступен: {e}")
-
     # Раньше тут был единственный статичный запрос "machine learning" — при
     # повторных прогонах (раз в 3 дня, плюс ручные запуски) HF отдаёт почти
     # одну и ту же топ-выдачу по этому запросу, и все кандидаты уходят в дедуп
@@ -113,11 +107,10 @@ def stream_all_new_articles():
             logger.error(f"Источник GitHub Trending ({period}) недоступен: {e}")
 
 
-    for kaggle_q in ("machine learning", "LLM"):
-        try:
-            yield from _tag_source_type(stream_kaggle_articles(kaggle_q), "датасет")
-        except Exception as e:
-            logger.error(f"Источник Kaggle (запрос='{kaggle_q}') недоступен: {e}")
+    try:
+        yield from _tag_source_type(stream_kaggle_articles(), "датасет")
+    except Exception as e:
+        logger.error(f"Источник Kaggle недоступен: {e}")
 
 # Тренды HF — отдельный пайплайн: без дедупа и LLM-анализа, просто снимок
 # витрины (name/downloads/likes/tags), который save_trending_models() каждый
@@ -170,13 +163,12 @@ def stream_dataset_articles():
         except Exception as e:
             logger.error(f"Источник Hugging Face (датасеты, режим='{mode}') недоступен: {e}")
 
-    for kaggle_q in ("machine learning", "LLM"):
-        try:
-            for article in stream_kaggle_articles(kaggle_q):
-                if article.get("source_type") == "датасет":
-                    yield article
-        except Exception as e:
-            logger.error(f"Источник Kaggle (запрос='{kaggle_q}') недоступен: {e}")
+    try:
+        for article in stream_kaggle_articles():
+            if article.get("source_type") == "датасет":
+                yield article
+    except Exception as e:
+        logger.error(f"Источник Kaggle недоступен: {e}")
 
 
 def process_articles_stream(articles_stream):
@@ -200,15 +192,28 @@ def process_articles_stream(articles_stream):
         # 3. Текст -> вектор (реальные эмбеддинги через fastembed, Sprint 3)
         new_vector = text_to_vector(text)
 
-        # 4. Проверка на дубликат (со всей БД + со статьями, добавленными в этом же цикле)
-        if is_duplicate(new_vector, memory_vectors):
+        source_type = article.get("source_type", "статья")
+
+        # 4. Проверка на дубликат (статьи дедуплицируются по семантическому вектору;
+        # датасеты с уникальным source_url сохраняются, чтобы все трендовые датасеты с сайта попали в выдачу)
+        if source_type != "датасет" and is_duplicate(new_vector, memory_vectors):
             logger.info(f"[SKIP] Дубликат: {title}")
             skipped += 1
             continue
 
         # 5. Уникальный материал — отправляем в агента (PydanticAI)
         try:
-            analysis = analyze_article(title, text)
+            if source_type == "датасет":
+                existing_summary = article.get("summary")
+                if existing_summary and "Назначение" in existing_summary and "Состав и масштаб" in existing_summary:
+                    analysis = DatasetCard(
+                        summary=existing_summary,
+                        tags=article.get("tags") or ["датасет", "AI/ML"],
+                    )
+                else:
+                    analysis = analyze_dataset(title, text)
+            else:
+                analysis = analyze_article(title, text)
         except AnalysisError as e:
             logger.error(f"[FAIL] {title}: {e}")
             failed += 1
@@ -216,12 +221,16 @@ def process_articles_stream(articles_stream):
 
         # 6. Сохраняем вектор ОТДЕЛЬНО от статьи — по контракту database.py
         save_vector(new_vector.tolist())
+        memory_vectors.append(new_vector)
+
+        # Объединяем сгенерированные теги LLM и теги, спарсенные с сайта (HF / Kaggle), без дублей
+        all_tags = list(dict.fromkeys(list(getattr(analysis, "tags", []) or []) + [t for t in article.get("tags", []) if t]))
 
         payload = {
             "title": title,
             "summary": analysis.summary,
             "source_url": source_url,
-            "tags": list(analysis.tags) + [t for t in article.get("tags", []) if t not in analysis.tags], #изменено под работу с тегом #Russian из датасетов HF
+            "tags": all_tags,
             "directions": article.get("directions", []),
             "task_types": article.get("task_types", []),
             "stars": int(article.get("stars") or article.get("upvotes") or 0),
@@ -234,6 +243,9 @@ def process_articles_stream(articles_stream):
             "source_article_url": article.get("source_article_url", ""),
             "period": article.get("period", ""),
             "has_code": article.get("has_code", 0),
+            "has_spaces": article.get("has_spaces", 0),
+            "rank_global": int(article.get("rank_global", 0) or 0),
+            "rank_ru": int(article.get("rank_ru", 0) or 0),
         }
 
         save_article(payload)
