@@ -236,8 +236,21 @@ def init_db():
             category TEXT NOT NULL,
             model_name TEXT NOT NULL,
             rating INTEGER NOT NULL,
-            fetched_at TEXT NOT NULL
+            fetched_at TEXT NOT NULL,
+            organization TEXT NOT NULL DEFAULT '',
+            license TEXT NOT NULL DEFAULT '',
+            vote_count INTEGER NOT NULL DEFAULT 0,
+            summary TEXT NOT NULL DEFAULT ''
         );''')
+        lb_cols = {row['name'] for row in cursor.execute("PRAGMA table_info(leaderboard)")}
+        if 'organization' not in lb_cols:
+            cursor.execute("ALTER TABLE leaderboard ADD COLUMN organization TEXT NOT NULL DEFAULT ''")
+        if 'license' not in lb_cols:
+            cursor.execute("ALTER TABLE leaderboard ADD COLUMN license TEXT NOT NULL DEFAULT ''")
+        if 'vote_count' not in lb_cols:
+            cursor.execute("ALTER TABLE leaderboard ADD COLUMN vote_count INTEGER NOT NULL DEFAULT 0")
+        if 'summary' not in lb_cols:
+            cursor.execute("ALTER TABLE leaderboard ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
         cursor.execute('''CREATE TABLE IF NOT EXISTS leaderboard_analysis (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             fetched_at TEXT NOT NULL,
@@ -523,19 +536,43 @@ def save_leaderboard_data(data: dict) -> None:
     fetched_at = data['fetched_at']
     records_to_insert = []
 
-    # 1. Разворачиваем структуру categories в плоский список записей
+    # 1. Разворачиваем структуру categories в плоский список записей с расширенными метаданными
     for category, models in data['categories'].items():
         for model in models:
-            records_to_insert.append((category, model['name'], model['rating'], fetched_at))
+            records_to_insert.append((
+                category,
+                model['name'],
+                model['rating'],
+                fetched_at,
+                model.get('organization', '') or '',
+                model.get('license', '') or '',
+                int(model.get('vote_count', 0) or 0),
+                model.get('summary', '') or '',
+            ))
 
     with get_connection() as conn:
-        # 2. Проверяем существование таблицы (на всякий случай, по ТЗ)
+        # 2. Проверяем существование таблицы и колонок
         conn.execute('''CREATE TABLE IF NOT EXISTS leaderboard (
             category TEXT NOT NULL,
             model_name TEXT NOT NULL,
             rating INTEGER NOT NULL,
-            fetched_at TEXT NOT NULL
+            fetched_at TEXT NOT NULL,
+            organization TEXT NOT NULL DEFAULT '',
+            license TEXT NOT NULL DEFAULT '',
+            vote_count INTEGER NOT NULL DEFAULT 0,
+            summary TEXT NOT NULL DEFAULT ''
         );''')
+
+        cursor = conn.cursor()
+        lb_cols = {row['name'] for row in cursor.execute("PRAGMA table_info(leaderboard)")}
+        if 'organization' not in lb_cols:
+            cursor.execute("ALTER TABLE leaderboard ADD COLUMN organization TEXT NOT NULL DEFAULT ''")
+        if 'license' not in lb_cols:
+            cursor.execute("ALTER TABLE leaderboard ADD COLUMN license TEXT NOT NULL DEFAULT ''")
+        if 'vote_count' not in lb_cols:
+            cursor.execute("ALTER TABLE leaderboard ADD COLUMN vote_count INTEGER NOT NULL DEFAULT 0")
+        if 'summary' not in lb_cols:
+            cursor.execute("ALTER TABLE leaderboard ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
 
         # 3. Проверка текущего объема (ищем уникальные даты)
         cursor = conn.execute('SELECT DISTINCT fetched_at FROM leaderboard ORDER BY fetched_at DESC')
@@ -548,8 +585,8 @@ def save_leaderboard_data(data: dict) -> None:
 
         # 5. Массовая вставка всех записей одной операцией
         conn.executemany('''
-            INSERT INTO leaderboard (category, model_name, rating, fetched_at)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO leaderboard (category, model_name, rating, fetched_at, organization, license, vote_count, summary)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ''', records_to_insert)
 
 
@@ -764,9 +801,14 @@ def get_all_leaderboard_snapshots() -> list[dict]:
         if cat not in snapshots_map[f_at]["categories"]:
             snapshots_map[f_at]["categories"][cat] = []
 
+        keys = row.keys() if hasattr(row, 'keys') else []
         snapshots_map[f_at]["categories"][cat].append({
             "name": row['model_name'],
-            "rating": row['rating']
+            "rating": row['rating'],
+            "organization": row['organization'] if 'organization' in keys else '',
+            "license": row['license'] if 'license' in keys else '',
+            "vote_count": row['vote_count'] if 'vote_count' in keys else 0,
+            "summary": row['summary'] if 'summary' in keys else '',
         })
 
     return list(snapshots_map.values())

@@ -1,6 +1,7 @@
 # для запуска: uvicorn app:app --reload (бэкенд), затем python -m streamlit run frontend.py (фронтенд)
 
 import os
+import urllib.parse
 from html import escape
 import requests
 import streamlit as st
@@ -209,6 +210,12 @@ elif not github_last_fetched_at and github_trending_list:
 
 
 analysis_list = analysis_res.get("data", []) if analysis_res.get("status") == "success" else []
+if not analysis_list:
+    try:
+        from database import get_analysis_history
+        analysis_list = get_analysis_history(limit=10)
+    except Exception:
+        pass
 latest_analysis = analysis_list[0] if analysis_list else None
 
 
@@ -638,14 +645,54 @@ if page == "Лидерборд моделей":
                 f'</div>'
             ) if cat_badges else ""
 
+            org = escape(str(rec.get("organization") or "").strip())
+            lic = escape(str(rec.get("license") or "").strip())
+            votes = int(rec.get("vote_count", 0) or 0)
+            raw_summary = str(rec.get("summary") or "").strip()
+            if not raw_summary:
+                raw_summary = f"• Назначение (для чего): Модель {name} для аналитики и решения профильных задач.\n• Архитектура и стек: {org.upper() if org else 'AI'}.\n• Результаты в Arena: Рейтинг {format_rating(rec['rating'])} Elo."
+
+            escaped_summary = escape(raw_summary)
+            formatted_summary = (
+                escaped_summary
+                .replace("• Назначение (для чего):", '<strong style="color:#C084FC;">• Назначение (для чего):</strong>')
+                .replace("• Архитектура и стек:", '<strong style="color:#38BDF8;">• Архитектура и стек:</strong>')
+                .replace("• Результаты в Arena:", '<strong style="color:#34D399;">• Результаты в Arena:</strong>')
+            )
+
+            meta_badges = []
+            if org:
+                meta_badges.append(
+                    f'<span style="font-size:0.75rem; font-weight:700; color:#38BDF8; background:#0F172A; border:1px solid #0284C7; border-radius:6px; padding:2px 8px; margin-right:6px;">🏢 {org.upper()}</span>'
+                )
+            if lic:
+                meta_badges.append(
+                    f'<span style="font-size:0.75rem; font-weight:600; color:#A1A1AA; background:#18181B; border:1px solid #27272A; border-radius:6px; padding:2px 8px; margin-right:6px;">⚖️ {lic}</span>'
+                )
+
+            all_tags_html = (
+                f'<div class="article-tags" style="margin-bottom:8px; display:flex; gap:4px; flex-wrap:wrap; align-items:center;">'
+                f'{"".join(meta_badges)}{"".join(cat_badges)}'
+                f'</div>'
+            ) if (meta_badges or cat_badges) else ""
+
+            votes_str = f'<div style="font-size:0.8rem; color:#71717A; margin-top:2px;">🗳️ {votes:,} голосов</div>' if votes > 0 else ""
+            model_query = urllib.parse.quote_plus(raw_name.split()[0] if raw_name else "")
+            hf_search_url = f"https://huggingface.co/models?search={model_query}"
+
             st.markdown(
                 f'<div class="custom-card">'
                 f'{all_tags_html}'
-                f'<div style="display:flex; justify-content:space-between; align-items:center;">'
-                f'<div>'
-                f'<strong style="font-size:1.15rem; color:#FFFFFF;">#{idx + 1} {name}</strong>'
+                f'<div style="display:flex; justify-content:space-between; align-items:flex-start;">'
+                f'<div style="flex:1; padding-right:16px;">'
+                f'<h4 style="margin:0 0 6px 0;"><a href="{hf_search_url}" target="_blank" style="color:#FFFFFF; text-decoration:none;"><strong style="font-size:1.15rem;">#{idx + 1} {name}</strong></a></h4>'
+                f'<div style="font-size:0.88rem; color:#D4D4D8; margin:8px 0 10px 0; line-height:1.6; white-space:pre-line;">{formatted_summary}</div>'
+                f'<a href="{hf_search_url}" target="_blank" style="font-size:0.82rem; color:#A78BFA; text-decoration:none;">Искать на Hugging Face →</a>'
                 f'</div>'
+                f'<div style="text-align:right; min-width:110px;">'
                 f'<div style="font-size:1.25rem; font-weight:700; color:#A78BFA;">{format_rating(rec["rating"])} <span style="font-size:0.85rem; color:#8B5CF6;">Elo</span></div>'
+                f'{votes_str}'
+                f'</div>'
                 f'</div>'
                 f'</div>',
                 unsafe_allow_html=True,

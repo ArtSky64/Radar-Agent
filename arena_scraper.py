@@ -1,10 +1,11 @@
 import datetime
 import json
 import logging
-import time
-import random
+import ssl
+import urllib.request
 import re
 from collections import defaultdict
+
 try:
     from playwright.sync_api import sync_playwright
 except ImportError:
@@ -14,11 +15,7 @@ from database import init_db, save_leaderboard_data
 
 logger = logging.getLogger("arena_scraper")
 
-# ==========================================
-# ЧАСТЬ 1: КАНОНИЧЕСКИЕ URL АРЕНЫ
-# ==========================================
-# Точные канонические URL без промежуточных 301-редиректов,
-# исключающие вызовы антибот-проверок Cloudflare.
+# Канонические URL Арены (для совместимости)
 CATEGORY_URLS = {
     "text": "https://arena.ai/leaderboard/chat/text",
     "vision": "https://arena.ai/leaderboard/chat/vision",
@@ -35,24 +32,147 @@ CATEGORY_URLS = {
     "alignment": "https://arena.ai/leaderboard/agent/alignment",
 }
 
+# Соответствие категорий Арены официальным конфигам датасета lmarena-ai/leaderboard-dataset
+CATEGORY_MAP = {
+    "text": "text",
+    "vision": "vision",
+    "search": "search",
+    "document": "document",
+    "webdev": "webdev",
+    "text-to-image": "text_to_image",
+    "image-edit": "image_edit",
+    "text-to-video": "text_to_video",
+    "image-to-video": "image_to_video",
+    "video-edit": "video_edit",
+    "agent": "agent",
+}
 
-# ==========================================
-# ЧАСТЬ 2: ПАРСЕР ТАБЛИЦЫ ЛИДЕРБОРДА
-# ==========================================
-def parse(page) -> list[dict]:
+HF_DATASET_NAME = "lmarena-ai/leaderboard-dataset"
+HF_API_BASE = "https://datasets-server.huggingface.co/rows"
+
+
+def generate_model_breakdown(name: str, org: str, category: str, rating: float, license_str: str, vote_count: int) -> str:
+    """Генерирует развернутую карточку модели: назначение (для чего), архитектура и результаты в Arena."""
+    org_title = org.title() if org else "Ведущая AI-лаборатория"
+    cat_lower = (category or "").lower()
+    name_lower = (name or "").lower()
+
+    if any(k in cat_lower for k in ("webdev", "code", "coding")) or "coder" in name_lower:
+        purpose = "Сложная веб-разработка, сквозное написание и аудит кода (фронтенд/бэкенд), проектирование архитектуры ПО, рефакторинг и дебаггинг кодовых баз."
+        stack_info = "Оптимизирована для работы с AST-деревьями, синтаксисом современных фреймворков и длинными контекстами проектов."
+    elif "agent" in cat_lower or "agent" in name_lower:
+        purpose = "Автономные ИИ-агенты, мультиагентные сценарии, планирование цепочек действий, надежный вызов инструментов (Tool/Function Calling) и структурированный вывод."
+        stack_info = "Обладает высокой устойчивостью к сбоям в цикле рассуждений (reflection/re-planning) и точным следованием системным инструкциям."
+    elif any(k in cat_lower for k in ("vision", "document", "search")) or "vision" in name_lower or "ocr" in name_lower:
+        purpose = "Мультимодальный анализ, распознавание схем, таблиц, графиков, обработка отсканированных документов высокой плотности (OCR) и фактологический поиск."
+        stack_info = "Включает сбалансированные визуально-текстовые энкодеры для кросс-модальных рассуждений без потери детализации."
+    elif any(k in cat_lower for k in ("video", "text-to-video", "image-to-video")):
+        purpose = "Генерация динамических видеороликов, интерполяция кадров, преобразование статических изображений в видео и анимация со стабильной физикой движения."
+        stack_info = "Современная диффузионная или авторегрессионная видео-архитектура с пространственно-временным вниманием (Spatiotemporal Attention)."
+    elif any(k in cat_lower for k in ("image", "text-to-image", "image-edit")):
+        purpose = "Фотореалистичная и художественная генерация изображений, точное редактирование по маске, композиция сцен и сохранение стиля."
+        stack_info = "Высокое разрешение генерации, улучшенная анатомия и точное следование комплексным текстовым промптам."
+    else:
+        purpose = "Глубокие логические и математические рассуждения (reasoning), аналитика сложных текстов, научные изыскания, экспертные диалоги и синтез информации."
+        stack_info = "Флагманский уровень языкового интеллекта с развитой способностью к пошаговому логическому выводу (chain-of-thought)."
+
+    is_open = license_str and license_str.lower() not in ("proprietary", "commercial", "closed", "unknown", "")
+    if is_open:
+        lic_desc = f"открытые веса ({license_str}), подходит для локального развертывания (vLLM, Ollama, SGLang)"
+    else:
+        lic_desc = f"коммерческое облачное API ({license_str or 'Proprietary'})"
+
+    special_note = ""
+    if "gemini" in name_lower:
+        special_note = " Нативно поддерживает длинный контекст до 2M токенов и мультимодальный ввод."
+    elif "claude" in name_lower:
+        special_note = " Выделяется эталонной безопасностью, качеством генерации кода и аккуратным следованием системному промпту."
+    elif "gpt" in name_lower or "o1" in name_lower or "o3" in name_lower:
+        special_note = " Продвинутые возможности рассуждения с генерацией внутренних цепочек мысли перед ответом."
+    elif "mimo" in name_lower:
+        special_note = " Высокая энергоэффективность и оптимальный баланс скорости инференса к качеству."
+    elif "deepseek" in name_lower:
+        special_note = " MoE-архитектура с эффективной активацией экспертов и низкой стоимостью токена."
+    elif "qwen" in name_lower:
+        special_note = " Сильная мультиязычность, поддержка математики и кодинга на открытых весах."
+
+    votes_str = f" на основе {vote_count:,} слепых матчей" if vote_count > 0 else ""
+    return (
+        f"• Назначение (для чего): {purpose}\n"
+        f"• Архитектура и стек: Разработка {org_title} ({lic_desc}). {stack_info}{special_note}\n"
+        f"• Результаты в Arena: {rating} Elo в категории «{category.upper()}»{votes_str}."
+    )
+
+
+def fetch_category_from_hf(config_name: str, limit: int = 25) -> list[dict]:
     """
-    Извлекает топ-5 моделей из таблицы текущей категории лидерборда.
-    Динамически определяет индексы колонок названия модели и рейтинга (Elo / Score).
+    Забирает свежий срез категории лидерборда из официального датасета lmarena-ai на Hugging Face.
+    Работает быстро по HTTP без браузера, капч и таймаутов Cloudflare.
     """
+    url = f"{HF_API_BASE}?dataset={HF_DATASET_NAME}&config={config_name}&split=latest&offset=0&limit={limit}"
+    req = urllib.request.Request(
+        url,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; ArenaRadarBot/1.0)"}
+    )
+
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+
+    with urllib.request.urlopen(req, context=ctx, timeout=15) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+
+    results = []
+    seen = set()
+    for item in data.get("rows", []):
+        row = item.get("row", {})
+        name = (row.get("model_name") or "").strip()
+        if not name or name in seen:
+            continue
+
+        if "rating" in row and row["rating"] is not None:
+            rating = round(float(row["rating"]), 1)
+        elif "score" in row and row["score"] is not None:
+            raw_s = float(row["score"])
+            # В бенчмарке agent оценка — нормализованная доля (0.208 -> 20.8%)
+            rating = round(raw_s * 100, 1) if abs(raw_s) <= 1.0 else round(raw_s, 1)
+        else:
+            continue
+
+        organization = (row.get("organization") or "").strip()
+        license_str = (row.get("license") or "").strip()
+        vote_count = int(row.get("vote_count") or 0)
+
+        summary = generate_model_breakdown(
+            name=name,
+            org=organization,
+            category=config_name,
+            rating=rating,
+            license_str=license_str,
+            vote_count=vote_count
+        )
+
+        seen.add(name)
+        results.append({
+            "name": name,
+            "rating": rating,
+            "organization": organization,
+            "license": license_str,
+            "vote_count": vote_count,
+            "summary": summary,
+        })
+
+    return results
+
+
+def parse_browser_page(page) -> list[dict]:
+    """Резервный парсер HTML-страницы через Playwright (если HF недоступен)."""
     table = page.locator("table").first
     table.locator("tbody tr").first.wait_for(timeout=10000)
 
-    # 1. Анализируем заголовки таблицы для определения колонок
     headers = table.locator("thead th, tr:first-child th").all()
-
     model_idx = 1
     score_idx = 2
-
     for i, header in enumerate(headers):
         text = header.inner_text().lower()
         if "model" in text:
@@ -66,7 +186,7 @@ def parse(page) -> list[dict]:
     seen_names = set()
 
     for index, row in enumerate(visible_rows):
-        if len(parsed_data) >= 5:
+        if len(parsed_data) >= 25:
             break
         try:
             cells = row.locator("td").all()
@@ -75,143 +195,101 @@ def parse(page) -> list[dict]:
 
             raw_name = cells[model_idx].inner_text().strip()
             raw_rating = cells[score_idx].inner_text().strip()
+            clean_name = raw_name.split("\n")[0].strip()
+            clean_rating_str = raw_rating.split("\n")[0].strip().replace("%", "")
 
-            clean_name = raw_name.split('\n')[0].strip()
-            clean_rating_str = raw_rating.split('\n')[0].strip().replace('%', '')
-
-            # Извлекаем числовое значение рейтинга (отсекая погрешности вида ±7, +14/-14)
-            rating_match = re.search(r'([0-9]+(?:\.[0-9]+)?)', clean_rating_str)
+            rating_match = re.search(r"([0-9]+(?:\.[0-9]+)?)", clean_rating_str)
             if rating_match:
                 val_str = rating_match.group(1)
-                clean_rating = float(val_str) if '.' in val_str else int(val_str)
+                clean_rating = float(val_str) if "." in val_str else int(val_str)
             else:
                 try:
-                    clean_rating = float(clean_rating_str) if '.' in clean_rating_str else int(clean_rating_str)
+                    clean_rating = float(clean_rating_str) if "." in clean_rating_str else int(clean_rating_str)
                 except ValueError:
                     clean_rating = clean_rating_str
 
             if clean_name and clean_name not in seen_names:
                 seen_names.add(clean_name)
                 parsed_data.append({"name": clean_name, "rating": clean_rating})
-
-        except Exception as e:
-            logger.debug(f"Ошибка парсинга строки {index + 1}: {e}")
+        except Exception:
             continue
 
     return parsed_data
 
 
-# ==========================================
-# ЧАСТЬ 3: КООРДИНАТОР И ЗАПУСК
-# ==========================================
-def collect_all_categories(category_urls=None):
+def collect_all_categories(category_urls=None, limit: int = 25) -> dict:
     """
-    Собирает данные лидерборда LMSYS Arena по всем категориям.
-    Каждая категория опрашивается по каноническому URL в изолированном контексте браузера
-    с глубокой stealth-маскировкой, исключающей вызовы Cloudflare Turnstile.
-    Никаких устаревших моделей 2024 года в базу не подмешивается.
+    Собирает данные лидерборда LMSYS Arena по всем ключевым категориям.
+    Основной надежный метод — через официальный датасет lmarena-ai/leaderboard-dataset на HF.
+    При сбое обращается к Playwright как к запасному варианту.
     """
-    if category_urls is None:
-        category_urls = CATEGORY_URLS
-
     fetched_at = datetime.datetime.now().isoformat()
     all_data = {}
 
-    if sync_playwright is None:
-        logger.warning("Playwright не установлен в окружении.")
-        print("[ОШИБКА] Playwright не установлен в окружении. Сбор невозможен.")
-        return {"fetched_at": fetched_at, "categories": {}}
+    print(f"\n[Арена] Сбор данных через официальный API lmarena-ai (Hugging Face)...")
+    total_cats = len(CATEGORY_MAP)
+    for idx, (cat_name, hf_config) in enumerate(CATEGORY_MAP.items(), start=1):
+        try:
+            models = fetch_category_from_hf(hf_config, limit=limit)
+            if models:
+                all_data[cat_name] = models
+                top1 = models[0]
+                print(f"[{idx}/{total_cats}] [OK] {cat_name:<15} ({len(models)} моделей) -> #1 {top1['name']} ({top1['rating']})")
+            else:
+                logger.warning(f"Категория '{cat_name}' вернула пустой список.")
+        except Exception as e:
+            logger.warning(f"Ошибка при получении '{cat_name}' через HF: {e}")
+            print(f"[{idx}/{total_cats}] [ОШИБКА HF] {cat_name}: {e}")
 
-    try:
-        with sync_playwright() as playwright:
-            browser = playwright.chromium.launch(
-                headless=True,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-setuid-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-infobars",
-                    "--window-size=1920,1080",
-                    "--ignore-certificate-errors",
-                    "--disable-gpu",
-                ]
-            )
-
-            total_cats = len(category_urls)
-            for cat_idx, (category, url) in enumerate(category_urls.items(), start=1):
-                print(f"\n--- [{cat_idx}/{total_cats}] Собираем категорию: {category} ---")
-                print(f"Открываем страницу: {url}")
-
-                context = browser.new_context(
-                    user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-                    viewport={"width": 1920, "height": 1080},
-                    locale="en-US",
-                    timezone_id="America/New_York",
-                    java_script_enabled=True,
+    # Резервный Playwright (если HF полностью упал и ничего не вернул)
+    if not all_data and sync_playwright is not None:
+        print("[Арена] HF недоступен, пробуем резервный Playwright...")
+        urls = category_urls or CATEGORY_URLS
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(
+                    headless=True,
+                    args=["--disable-blink-features=AutomationControlled", "--no-sandbox"]
                 )
-                page = context.new_page()
-
-                page.add_init_script("""
-                    Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                    Object.defineProperty(navigator, 'plugins', {
-                        get: () => [{ name: 'PDF Viewer' }, { name: 'Chrome PDF Viewer' }, { name: 'Chromium PDF Viewer' }]
-                    });
-                    Object.defineProperty(navigator, 'languages', { get: () => ['ru-RU', 'ru', 'en-US', 'en'] });
-                    Object.defineProperty(navigator, 'platform', { get: () => 'Linux x86_64' });
-                    window.chrome = { runtime: {}, loadTimes: Date.now, csi: () => {}, app: {} };
-                """)
-
-                try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=25000)
-                    page.wait_for_selector("table", timeout=20000)
-                    parsed_list = parse(page)
-                    if parsed_list:
-                        all_data[category] = parsed_list
-                        top1 = parsed_list[0]
-                        print(f"[УСПЕХ] Собрано {len(parsed_list)} моделей для категории '{category}'")
-                        print(f"        #1 {top1['name']} ({top1['rating']} Elo)")
-                    else:
-                        print(f"[ПРЕДУПРЕЖДЕНИЕ] Категория '{category}' не вернула строк.")
-                except Exception as e:
-                    print(f"[ПРОПУСК] Категория '{category}' пропущена: {e}")
-                    logger.warning(f"Не удалось собрать категорию '{category}': {e}")
-                finally:
-                    context.close()
-
-                # Небольшая естественная пауза между запросами
-                time.sleep(random.uniform(1.2, 2.2))
-
-            browser.close()
-    except Exception as e:
-        logger.warning(f"Сбой при работе браузера Playwright: {e}")
-        print(f"[ПРЕДУПРЕЖДЕНИЕ] Ошибка браузера Playwright: {e}")
+                for cat, url in urls.items():
+                    try:
+                        ctx = browser.new_context(user_agent="Mozilla/5.0")
+                        page = ctx.new_page()
+                        page.goto(url, wait_until="domcontentloaded", timeout=25000)
+                        page.wait_for_selector("table", timeout=15000)
+                        p = parse_browser_page(page)
+                        if p:
+                            all_data[cat] = p
+                        ctx.close()
+                    except Exception:
+                        pass
+                browser.close()
+        except Exception as e:
+            logger.warning(f"Сбой резервного Playwright: {e}")
 
     if not all_data:
-        logger.error("Скрапинг арены в реальном времени не дал результатов.")
+        logger.error("Сбор лидерборда Arena не дал результатов.")
         print("[ОШИБКА] Не удалось собрать ни одной категории лидерборда Arena.")
     else:
-        print(f"\n[ИТОГ] Собрано актуальных категорий с живого сайта: {len(all_data)}/{len(category_urls)}")
+        print(f"\n[ИТОГ] Успешно собрано категорий лидерборда Arena: {len(all_data)}/{len(CATEGORY_MAP)}")
 
-    final_snapshot = {
+    return {
         "fetched_at": fetched_at,
         "categories": all_data
     }
 
-    return final_snapshot
 
-
-def save_to_db(data):
+def save_to_db(data: dict) -> None:
     if not data or not data.get("categories"):
         print("\n[ПРЕДУПРЕЖДЕНИЕ] Новые данные лидерборда отсутствуют. Предыдущие данные сохранены в базе.")
         return
 
     init_db()
     save_leaderboard_data(data)
-    print(f"\n[УСПЕХ] Сохранено в БД: {sum(len(v) for v in data['categories'].values())} строк "
-          f"по {len(data['categories'])} категориям (снимок от {data['fetched_at']})")
+    total_models = sum(len(v) for v in data["categories"].values())
+    print(f"\n[УСПЕХ] Сохранено в БД: {total_models} строк по {len(data['categories'])} категориям (снимок {data['fetched_at']})")
 
-    print("[АНАЛИЗ] Строим инкрементальный анализ (новый снимок + предыдущий + предыдущий анализ)...")
+    print("[АНАЛИЗ] Строим инкрементальный анализ (новый снимок + предыдущий)...")
     try:
         from leaderboard_analyzer import run_leaderboard_analysis
         run_leaderboard_analysis()
@@ -236,9 +314,7 @@ def format_cat_plural(n: int) -> str:
 def aggregate_all_categories(records: list[dict], method: str = "avg") -> list[dict]:
     """
     Агрегация «Все категории» лидерборда Arena.
-    Группирует записи по model_name и вычисляет:
-    - method='avg': средний рейтинг Elo по категориям модели.
-    - method='max': максимальный рейтинг.
+    Группирует записи по model_name и вычисляет средний или максимальный рейтинг.
     """
     by_model = defaultdict(list)
     for r in records:
@@ -278,10 +354,10 @@ def aggregate_all_categories(records: list[dict], method: str = "avg") -> list[d
 
 
 def main():
-    print(f"Запуск скрапера Arena AI для {len(CATEGORY_URLS)} категорий...")
-    data = collect_all_categories(CATEGORY_URLS)
+    print("Запуск сбора лидерборда LMSYS Arena (через Hugging Face)...")
+    data = collect_all_categories()
     save_to_db(data)
-    print("\n[УСПЕХ] Сбор данных Arena AI завершен!")
+    print("\n[УСПЕХ] Обновление лидерборда Arena полностью завершено!")
 
 
 if __name__ == "__main__":

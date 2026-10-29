@@ -53,6 +53,10 @@ def build_latest_records(snapshots: list[dict]) -> list[dict]:
                     "model_name": name,
                     "rating": rating,
                     "fetched_at": fetched_at,
+                    "organization": m.get("organization") or "",
+                    "license": m.get("license") or "",
+                    "vote_count": int(m.get("vote_count", 0) or 0),
+                    "summary": m.get("summary") or "",
                 })
     return records
 
@@ -77,11 +81,16 @@ def aggregate_all_categories(records: list[dict], method: str = "avg") -> list[d
             rating = sum(r["rating"] for r in rows) / len(rows)
             cat_label = category_count_label(len(rows))
 
+        first_row = rows[0]
         result.append({
             "model_name": name,
             "rating": rating,
             "categories": sorted(r["category"] for r in rows),
             "category": cat_label,
+            "organization": first_row.get("organization") or "",
+            "license": first_row.get("license") or "",
+            "vote_count": sum(r.get("vote_count", 0) for r in rows),
+            "summary": first_row.get("summary") or "",
         })
 
     return sorted(result, key=lambda x: x["rating"], reverse=True)
