@@ -47,15 +47,29 @@ def _get_model():
 
 def _load_cache() -> dict:
     if CACHE_FILE.exists():
-        with open(CACHE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
+        try:
+            with open(CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Файл кэша эмбеддингов поврежден ({e}), сбрасываю кэш...")
+            try:
+                corrupted_bak = CACHE_DIR / "cache_corrupted.bak"
+                CACHE_FILE.replace(corrupted_bak)
+            except Exception:
+                pass
+            return {}
     return {}
 
 
 def _save_cache(cache: dict) -> None:
-    CACHE_DIR.mkdir(exist_ok=True)
-    with open(CACHE_FILE, "w", encoding="utf-8") as f:
-        json.dump(cache, f)
+    try:
+        CACHE_DIR.mkdir(exist_ok=True)
+        tmp_file = CACHE_DIR / "cache.json.tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
+        tmp_file.replace(CACHE_FILE)
+    except Exception as e:
+        logger.warning(f"Не удалось сохранить кэш эмбеддингов: {e}")
 
 
 def text_to_vector(text: str) -> np.ndarray:

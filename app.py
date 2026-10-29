@@ -223,3 +223,52 @@ def trigger_datasets_refresh(background_tasks: BackgroundTasks):
         "status": "success",
         "message": "Сбор датасетов (Hugging Face + Kaggle) запущен в фоне.",
     }
+
+
+# --- RAG РЕКОМЕНДАТЕЛЬНЫЕ ЭНДПОИНТЫ ---
+from pydantic import BaseModel, Field
+import rag_service
+import rag_agent
+
+
+class RagChatRequest(BaseModel):
+    messages: list[dict] = Field(default_factory=list, description="История диалога")
+    category: str = Field(default="all", description="Категория: all, датасет, модель, репозиторий, статья")
+    top_k: int = Field(default=5, ge=1, le=20, description="Количество карточек в рекомендации")
+
+
+@app.post("/rag/chat")
+def rag_chat_endpoint(req: RagChatRequest):
+    """
+    Интеллектуальный диалоговый RAG-эндпоинт:
+    Классифицирует намерение, при необходимости производит семантический поиск карточек и формирует рекомендации.
+    """
+    try:
+        res = rag_agent.process_dialogue(
+            history=req.messages,
+            category_filter=req.category,
+            top_k=req.top_k,
+        )
+        return {"status": "success", "data": res}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "data": None}
+
+
+@app.get("/rag/stats")
+def rag_stats_endpoint():
+    """Возвращает статистику проиндексированных сущностей для RAG."""
+    try:
+        stats = rag_service.get_catalog_stats()
+        return {"status": "success", "data": stats}
+    except Exception as e:
+        return {"status": "error", "message": str(e), "data": {}}
+
+
+@app.post("/rag/reindex")
+def rag_reindex_endpoint():
+    """Принудительно перестраивает векторный индекс базы знаний."""
+    try:
+        count = rag_service.build_index(force=True)
+        return {"status": "success", "indexed_count": count}
+    except Exception as e:
+        return {"status": "error", "message": str(e)}

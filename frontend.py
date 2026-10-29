@@ -181,11 +181,21 @@ st.markdown(custom_css, unsafe_allow_html=True)
 API_URL = os.getenv("API_URL", "http://localhost:8000")
 
 
-def fetch_data(endpoint):
+@st.cache_data(ttl=5)
+def _check_api_alive():
     try:
-        res = requests.get(f"{API_URL}/{endpoint}", timeout=5)
+        return requests.get(f"{API_URL}/docs", timeout=0.3).status_code == 200
+    except Exception:
+        return False
+
+
+def fetch_data(endpoint):
+    if not _check_api_alive():
+        return {"status": "connect_error", "data": []}
+    try:
+        res = requests.get(f"{API_URL}/{endpoint}", timeout=2)
         return res.json() if res.status_code == 200 else {"status": "error", "data": []}
-    except:
+    except Exception:
         return {"status": "connect_error", "data": []}
 
 
@@ -276,8 +286,8 @@ available_tags = sorted({t for art in article_list for t in art["tags"] if isins
 # Меню вкладок
 page = st.radio(
     "Разделы",
-    ["Лидерборд моделей", "Трендовые модели HF", "Трендовые модели HF с поддержкой русского языка", "Papers (Статьи)", "Датасеты", "Репозитории"],
-    horizontal=True, label_visibility="collapsed",
+    ["Лидерборд моделей", "Трендовые модели HF", "Трендовые модели HF с поддержкой русского языка", "Papers (Статьи)", "Датасеты", "Репозитории", "🤖 ИИ-Рекомендации (RAG)"],
+    horizontal=True, label_visibility="collapsed", key="nav_page_selection",
 )
 st.divider()
 
@@ -483,6 +493,112 @@ with st.sidebar:
                     unsafe_allow_html=True,
                 )
 
+
+
+    elif page == "🤖 ИИ-Рекомендации (RAG)":
+        st.markdown("<h5 style='color:#FFFFFF; margin-bottom:10px;'>Параметры RAG</h5>", unsafe_allow_html=True)
+        try:
+            import rag_service
+            stats = rag_service.get_catalog_stats()
+            total_c = stats.get("всего", 0)
+            datasets_c = stats.get("датасет", 0)
+            models_c = stats.get("модель", 0)
+            st.markdown(
+                f"<div style='margin-bottom:14px; padding:10px 12px; background:#12121A; border:1px solid #2D1B4E; border-radius:8px; font-size:0.8rem; color:#A1A1AA;'>"
+                f"📚 <strong>База знаний активна:</strong><br>"
+                f"<span style='color:#34D399; font-weight:600;'>{total_c} карточек</span> "
+                f"({datasets_c} датасетов, {models_c} моделей)"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        except Exception:
+            pass
+
+        rag_category_choice = st.selectbox(
+            "Искать по типу:",
+            ["Все материалы", "Только датасеты", "Только модели", "Только репозитории", "Только статьи"],
+            help="Фильтровать выдачу рекомендаций по типу ресурса",
+            key="rag_cat_select"
+        )
+        cat_map = {
+            "Все материалы": "all",
+            "Только датасеты": "датасет",
+            "Только модели": "модель",
+            "Только репозитории": "репозиторий",
+            "Только статьи": "статья",
+        }
+        st.session_state["rag_selected_category"] = cat_map[rag_category_choice]
+
+        st.session_state["rag_top_k"] = st.slider(
+            "Количество карточек (Top-K):",
+            min_value=1,
+            max_value=10,
+            value=5,
+            help="Сколько наиболее релевантных карточек передавать в контекст для анализа",
+            key="rag_topk_slider"
+        )
+
+        if st.button("🔄 Переиндексировать базу", help="Обновить векторный индекс карточек из базы данных"):
+            try:
+                import rag_service
+                count = rag_service.build_index(force=True)
+                st.success(f"Индекс успешно обновлён ({count} карточек)!")
+            except Exception as e:
+                st.error(f"Ошибка индексации: {e}")
+
+        if st.button("🗑 Очистить историю чата"):
+            st.session_state["rag_messages"] = []
+            st.rerun()
+
+
+def render_rag_card(c: dict):
+    title = c.get("title", "Без названия")
+    url = c.get("url", "#")
+    category = (c.get("category") or "материал").lower()
+    summary = c.get("summary") or ""
+    tags = c.get("tags") or []
+    metrics = c.get("metrics") or {}
+
+    cat_colors = {
+        "датасет": ("#34D399", "#064E3B", "#059669"),
+        "модель": ("#A78BFA", "#2E1065", "#7C3AED"),
+        "репозиторий": ("#38BDF8", "#0C4A6E", "#0284C7"),
+        "статья": ("#FBBF24", "#451A03", "#D97706"),
+    }
+    text_c, bg_c, border_c = cat_colors.get(category, ("#A78BFA", "#2E1065", "#7C3AED"))
+
+    cat_badge = (
+        f'<span style="font-size:0.75rem; font-weight:700; text-transform:uppercase; '
+        f'color:{text_c}; background:{bg_c}; border:1px solid {border_c}; '
+        f'border-radius:6px; padding:2px 8px; margin-right:8px;">{category}</span>'
+    )
+
+    metrics_parts = []
+    if metrics.get("stars"):
+        metrics_parts.append(f'<span style="font-size:0.75rem; color:#FBBF24; margin-right:10px;">⭐ {metrics["stars"]:,}</span>')
+    if metrics.get("downloads"):
+        metrics_parts.append(f'<span style="font-size:0.75rem; color:#38BDF8; margin-right:10px;">⬇ {metrics["downloads"]:,}</span>')
+    if metrics.get("likes"):
+        metrics_parts.append(f'<span style="font-size:0.75rem; color:#EC4899; margin-right:10px;">♡ {metrics["likes"]:,}</span>')
+    metrics_html = "".join(metrics_parts)
+
+    tags_html = "".join([f'<span class="article-tag">{escape(str(t))}</span>' for t in tags[:6]])
+
+    summary_preview = summary[:280] + "..." if len(summary) > 280 else summary
+    summary_html = f'<p style="font-size:0.88rem; color:#D4D4D8; margin:8px 0 10px 0; line-height:1.5;">{escape(summary_preview)}</p>' if summary else ""
+
+    st.markdown(
+        f'<div class="custom-card" style="margin-bottom:12px; border:1px solid #3B1B54; background:linear-gradient(180deg, #160D29 0%, #0F091C 100%);">'
+        f'<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">'
+        f'  <div>{cat_badge} {metrics_html}</div>'
+        f'  <a href="{url}" target="_blank" style="font-size:0.8rem; color:#A78BFA; text-decoration:none;">Открыть ресурс ↗</a>'
+        f'</div>'
+        f'<h4 style="margin:4px 0 8px 0;"><a href="{url}" target="_blank" style="color:#FFFFFF; text-decoration:none;">{escape(title)}</a></h4>'
+        f'{summary_html}'
+        f'<div class="article-tags">{tags_html}</div>'
+        f'</div>',
+        unsafe_allow_html=True,
+    )
 
 
 def render_hf_model_card(m: dict, is_ru_tab: bool = False):
@@ -1358,3 +1474,89 @@ elif page in _CONTENT_TABS:
                 render_article_card(a)
         else:
             st.info("Материалы не найдены.")
+
+elif page == "🤖 ИИ-Рекомендации (RAG)":
+    st.markdown("<h1>🤖 Интеллектуальный подбор и рекомендации (RAG)</h1>", unsafe_allow_html=True)
+    st.markdown(
+        "<p style='color:#A1A1AA; font-size:0.95rem; line-height:1.6;'>"
+        "Интеллектуальный диалоговый консультант по собранной базе данных. "
+        "Ассистент поддерживает естественный диалог, уточняет требования и только при наличии конкретной задачи "
+        "выполняет семантический поиск по векторному сходству, после чего Qwen формулирует подробный экспертный ответ."
+        "</p>",
+        unsafe_allow_html=True,
+    )
+    st.divider()
+
+    if "rag_messages" not in st.session_state:
+        st.session_state["rag_messages"] = []
+
+    # Быстрые кнопки для старта, если чат пуст
+    if not st.session_state["rag_messages"]:
+        st.markdown("<h5 style='color:#FFFFFF; margin-bottom:8px;'>Быстрый старт — примеры запросов:</h5>", unsafe_allow_html=True)
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("💬 «Привет! Что ты умеешь и какие данные у тебя есть?»", use_container_width=True):
+                st.session_state["rag_pending_query"] = "Привет! Что ты умеешь и какие данные у тебя есть?"
+                st.rerun()
+            if st.button("🛡️ «Найди датасеты для выявления кибератак и безопасности»", use_container_width=True):
+                st.session_state["rag_pending_query"] = "Найди датасеты для выявления кибератак и безопасности"
+                st.rerun()
+        with col2:
+            if st.button("🎨 «Посоветуй актуальные модели для генерации изображений»", use_container_width=True):
+                st.session_state["rag_pending_query"] = "Посоветуй актуальные модели для генерации изображений"
+                st.rerun()
+            if st.button("🏥 «Мне нужны материалы для медицины и здравоохранения»", use_container_width=True):
+                st.session_state["rag_pending_query"] = "Мне нужны материалы для медицины и здравоохранения"
+                st.rerun()
+        st.markdown("<br>", unsafe_allow_html=True)
+
+    # Вывод истории диалога
+    for msg in st.session_state["rag_messages"]:
+        role = msg.get("role", "user")
+        with st.chat_message(role):
+            st.markdown(msg.get("content", ""))
+            cards = msg.get("cards", [])
+            if cards:
+                st.markdown(f"<div style='margin-top:14px; margin-bottom:8px; font-weight:600; color:#A78BFA;'>✨ Рекомендованные материалы из базы данных ({len(cards)}):</div>", unsafe_allow_html=True)
+                for c in cards:
+                    render_rag_card(c)
+
+    prompt = None
+    if st.session_state.get("rag_pending_query"):
+        prompt = st.session_state.pop("rag_pending_query")
+    else:
+        prompt = st.chat_input("Напишите ваш запрос или вопрос, например: «Найди датасеты для анализа кибератак»...")
+
+    if prompt:
+        st.session_state["rag_messages"].append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Ассистент анализирует контекст диалога и сверяется с базой данных..."):
+                import rag_agent
+                cat = st.session_state.get("rag_selected_category", "all")
+                top_k = st.session_state.get("rag_top_k", 5)
+
+                response = rag_agent.process_dialogue(
+                    history=st.session_state["rag_messages"],
+                    category_filter=cat,
+                    top_k=top_k,
+                )
+
+                reply_content = response.get("content", "")
+                cards = response.get("cards", [])
+
+                st.markdown(reply_content)
+                if cards:
+                    st.markdown(f"<div style='margin-top:14px; margin-bottom:8px; font-weight:600; color:#A78BFA;'>✨ Рекомендованные материалы из базы данных ({len(cards)}):</div>", unsafe_allow_html=True)
+                    for c in cards:
+                        render_rag_card(c)
+
+                st.session_state["rag_messages"].append({
+                    "role": "assistant",
+                    "content": reply_content,
+                    "cards": cards,
+                    "action": response.get("action"),
+                })
+        st.rerun()
