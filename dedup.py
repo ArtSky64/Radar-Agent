@@ -2,6 +2,9 @@
 import hashlib
 import json
 import logging
+import os
+import threading
+import uuid
 from pathlib import Path
 
 import numpy as np
@@ -11,6 +14,9 @@ logger = logging.getLogger("dedup")
 
 CACHE_DIR = Path(__file__).parent / ".embeddings_cache"
 CACHE_FILE = CACHE_DIR / "cache.json"
+
+# Потокобезопасный лок для предотвращения гонок внутри одного процесса
+_CACHE_LOCK = threading.Lock()
 
 # Модель грузится лениво (только при первом реальном вызове text_to_vector),
 # чтобы просто импортировать dedup.py (например, в тестах на цельность
@@ -62,14 +68,33 @@ def _load_cache() -> dict:
 
 
 def _save_cache(cache: dict) -> None:
+    """
+    Безопасное атомарное сохранение кэша на диск.
+    Использует уникальный временный файл с PID и UUID,
+    чтобы исключить состояние гонки (race condition) между
+    фоновым пайплайном сбора и FastAPI API сервисом.
+    """
+    tmp_file = None
     try:
-        CACHE_DIR.mkdir(exist_ok=True)
-        tmp_file = CACHE_DIR / "cache.json.tmp"
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        # Объединяем с текущим состоянием на диске, чтобы не затереть ключи от других параллельных процессов
+        disk_data = _load_cache()
+        merged = {**disk_data, **cache}
+
+        # Уникальное имя временного файла исключает коллизии между процессами
+        tmp_file = CACHE_DIR / f"cache_{os.getpid()}_{uuid.uuid4().hex[:8]}.tmp"
         with open(tmp_file, "w", encoding="utf-8") as f:
-            json.dump(cache, f)
+            json.dump(merged, f)
+
+        # Атомарная замена целевого файла
         tmp_file.replace(CACHE_FILE)
     except Exception as e:
         logger.warning(f"Не удалось сохранить кэш эмбеддингов: {e}")
+        if tmp_file and tmp_file.exists():
+            try:
+                tmp_file.unlink()
+            except Exception:
+                pass
 
 
 def text_to_vector(text: str) -> np.ndarray:
@@ -83,21 +108,24 @@ def text_to_vector(text: str) -> np.ndarray:
     повторно для одинаковых текстов.
     """
     global _cache
-    if _cache is None:
-        _cache = _load_cache()
+    with _CACHE_LOCK:
+        if _cache is None:
+            _cache = _load_cache()
 
     key = hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-    if key in _cache:
-        return np.array(_cache[key], dtype=np.float32)
+    with _CACHE_LOCK:
+        if key in _cache:
+            return np.array(_cache[key], dtype=np.float32)
 
     model = _get_model()
     # fastembed.embed() принимает список текстов и возвращает генератор
     # numpy-векторов — берём единственный элемент для одного текста.
     vector = next(model.embed([text]))
 
-    _cache[key] = vector.tolist()
-    _save_cache(_cache)
+    with _CACHE_LOCK:
+        _cache[key] = vector.tolist()
+        _save_cache(_cache)
 
     return vector
 

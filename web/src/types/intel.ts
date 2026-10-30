@@ -34,10 +34,13 @@ export interface IntelItem {
 
 export interface RadarTelemetry {
   threshold: number;
+  cosine_threshold?: string | number;
   vector_dim: number;
   vector_index_count: number;
+  vector_indexed_count?: number;
   db_size_mb: number;
   db_total_records: number;
+  total_records?: number;
   counts: {
     models: number;
     github: number;
