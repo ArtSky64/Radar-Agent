@@ -276,16 +276,18 @@ def rag_reindex_endpoint():
 
 class IntelQueryRequest(BaseModel):
     prompt: str
+    category: str = "all"
+    top_k: int = 5
 
 
 @app.post("/api/v1/rag/query")
 def api_v1_rag_query(req: IntelQueryRequest):
-    """Эндпоинт для прямого взаимодействия с новым Sci-Fi HUD терминалом RAG-агента."""
+    """Эндпоинт для прямого взаимодействия с Copilot терминалом RAG-агента."""
     try:
         res = rag_agent.process_dialogue(
             history=[{"role": "user", "content": req.prompt}],
-            category_filter="all",
-            top_k=4,
+            category_filter=req.category,
+            top_k=req.top_k,
         )
         cards = res.get("cards", [])
         sources = [
@@ -302,6 +304,14 @@ def api_v1_rag_query(req: IntelQueryRequest):
             "status": "success",
             "answer": res.get("content", ""),
             "sources": sources,
+            "cards": cards,
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "answer": f"Ошибка обработки RAG-запроса: {e}",
+            "sources": [],
+            "cards": [],
         }
     except Exception as e:
         return {
