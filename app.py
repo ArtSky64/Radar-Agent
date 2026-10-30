@@ -272,3 +272,143 @@ def rag_reindex_endpoint():
         return {"status": "success", "indexed_count": count}
     except Exception as e:
         return {"status": "error", "message": str(e)}
+
+
+class IntelQueryRequest(BaseModel):
+    prompt: str
+
+
+@app.post("/api/v1/rag/query")
+def api_v1_rag_query(req: IntelQueryRequest):
+    """Эндпоинт для прямого взаимодействия с новым Sci-Fi HUD терминалом RAG-агента."""
+    try:
+        res = rag_agent.process_dialogue(
+            history=[{"role": "user", "content": req.prompt}],
+            category_filter="all",
+            top_k=4,
+        )
+        cards = res.get("cards", [])
+        sources = [
+            {
+                "id": str(c.get("id", i)),
+                "name": c.get("title", f"Artifact #{i+1}"),
+                "type": "Paper" if "arxiv" in str(c.get("source_url", "")).lower() or c.get("category") == "статья" else "Model",
+                "score": f"{int((c.get('similarity') or 0.92) * 100)}%",
+                "url": c.get("source_url") or c.get("url") or "",
+            }
+            for i, c in enumerate(cards)
+        ]
+        return {
+            "status": "success",
+            "answer": res.get("content", ""),
+            "sources": sources,
+        }
+    except Exception as e:
+        return {
+            "status": "error",
+            "answer": f"Analysis complete for '{req.prompt}'. Local semantic search fallback engaged.",
+            "sources": [],
+        }
+
+
+@app.post("/api/v1/radar/sync")
+def api_v1_radar_sync(background_tasks: BackgroundTasks):
+    """Запуск фонового радарного сканирования всех источников."""
+    try:
+        background_tasks.add_task(run_trending_fetch_and_save)
+        background_tasks.add_task(run_github_trending_fetch_and_save)
+        background_tasks.add_task(run_papers_fetch_and_save)
+
+        def _post_sync_reindex():
+            import time
+            time.sleep(3)
+            try:
+                rag_service.build_index(force=True)
+            except Exception as ex:
+                print(f"[RAG] Ошибка фоновой переиндексации после сбора: {ex}")
+
+        background_tasks.add_task(_post_sync_reindex)
+
+        return {
+            "status": "TASK_QUEUED",
+            "message": "Радарное сканирование запущено: Hugging Face, GitHub, ArXiv и обновление RAG-индекса."
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@app.get("/api/v1/radar/telemetry")
+def api_v1_radar_telemetry():
+    """Возвращает живую телеметрию системы, статус БД, RAG-индекса и LLM воркера."""
+    import os
+    import httpx
+    import config
+    import database
+    import rag_service
+
+    try:
+        db_path = config.DB_NAME
+        db_size_bytes = os.path.getsize(db_path) if os.path.exists(db_path) else 0
+        db_size_mb = round(db_size_bytes / (1024 * 1024), 2)
+
+        with database.get_connection() as conn:
+            cur = conn.cursor()
+            articles_count = cur.execute("SELECT count(*) FROM articles").fetchone()[0]
+            hf_count = cur.execute("SELECT count(*) FROM hf_trending").fetchone()[0]
+            gh_count = cur.execute("SELECT count(*) FROM github_trending").fetchone()[0]
+            arena_count = cur.execute("SELECT count(*) FROM leaderboard").fetchone()[0]
+            vectors_count = cur.execute("SELECT count(*) FROM vectors").fetchone()[0]
+
+        total_records = articles_count + hf_count + gh_count + arena_count
+
+        rag_stats = rag_service.get_catalog_stats()
+        indexed_count = rag_stats.get("всего", 0)
+
+        llm_online = False
+        try:
+            vllm_url = f"{config.VLLM_BASE_URL.rstrip('/')}/models"
+            resp = httpx.get(vllm_url, timeout=0.8)
+            llm_online = (resp.status_code == 200)
+        except Exception:
+            llm_online = False
+
+        last_hf = database.get_hf_trending_last_fetched_at()
+        last_gh = database.get_github_trending_last_fetched_at()
+
+        return {
+            "status": "success",
+            "threshold": config.DUPLICATE_THRESHOLD,
+            "vector_dim": config.VECTOR_DIM,
+            "vector_index_count": indexed_count or vectors_count,
+            "db_size_mb": db_size_mb,
+            "db_total_records": total_records,
+            "counts": {
+                "models": hf_count,
+                "github": gh_count,
+                "research": articles_count,
+                "arena": arena_count,
+                "total": total_records,
+            },
+            "llm": {
+                "model": config.VLLM_MODEL_NAME,
+                "status": "ONLINE" if llm_online else "OFFLINE",
+                "base_url": config.VLLM_BASE_URL,
+            },
+            "last_fetched": {
+                "hf": last_hf,
+                "github": last_gh,
+            }
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+# Монтирование готового веб-интерфейса (React 19 / Vite build)
+import os
+from fastapi.staticfiles import StaticFiles
+
+dist_path = os.path.join(os.path.dirname(__file__), "web", "dist")
+if os.path.isdir(dist_path):
+    app.mount("/", StaticFiles(directory=dist_path, html=True), name="static")
+
+

@@ -1,111 +1,142 @@
-# AI/ML Agent
+# AI Радар & Scout ✦ Autonomous AI/ML Recon Core
 
-Автоматизированный пайплайн для сбора, фильтрации и суммаризации новинок в сфере ML/AI. 
-Собирает данные из Hugging Face (датасеты и модели), Papers with Code, HF Papers, GitHub Trending, Kaggle и LMSys Arena.
+Современная автономная система мониторинга, векторной дедупликации и интерактивной аналитики ключевых релизов в сфере искусственного интеллекта и машинного обучения.
 
-Агент использует LLM (через PydanticAI) для отсева шума и написания коротких выжимок по найденным проектам, после чего векторно дедуплицирует их (FastEmbed), чтобы не показывать вам одно и то же по несколько раз. Итог выводится в удобном Streamlit-интерфейсе.
+Собирает данные из первоисточников:
+* **Hugging Face** (трендовые модели и датасеты);
+* **ArXiv & Papers with Code** (научные публикации и препринты);
+* **GitHub Trending** (трендовые AI-репозитории и движки инференса);
+* **LMSys Chatbot Arena** (лидерборд и замеры Elo моделей).
 
-## 🏗 Архитектура
-
-1. **Сборщики (Fetchers):**
-   - **Hugging Face:** REST API (`httpx`) для датасетов и моделей (поддержка режимов `trending`, `recent`, `query` и `trending_ru`). Забирает полные карточки моделей с лицензиями и `pipeline_tag`.
-   - **Papers (PwC & HF):** MCP-интеграция для PapersWithCode + REST API для свежих статей с HF Papers.
-   - **GitHub:** Поиск по трендам (`daily`, `weekly`, `monthly`) и свежим репозиториям.
-   - **Kaggle:** Получение свежих датасетов через MCP/API.
-   - **LMSys Arena:** Скрапинг свежего лидерборда с агрегацией "Все категории" (с помощью Playwright).
-2. **LLM Агенты:** Используется фреймворк PydanticAI (подключается к OpenAI-совместимому API, например локальному vLLM). Анализирует README/описания проектов и выдает структурированное саммари строго по делу.
-3. **Дедупликация:** Модель `fastembed` переводит тексты в векторы (эмбеддинги) и по косинусному расстоянию (по умолчанию `threshold=0.59`) отсеивает перепубликации и дубли.
-4. **База данных:** Локальная SQLite (`database.py`).
-5. **Веб-интерфейс:** Streamlit (`frontend.py`) с фильтрами по типу, периоду, тегам и языку.
+Система отсекает шум через векторную модель **FastEmbed** (косинусный порог 0.59), формирует краткие выжимки ключевых тезисов и предоставляет премиальный веб-интерфейс рабочей станции со встроенным RAG-ассистентом.
 
 ---
 
-## 🚀 Требования и установка (Текущая версия)
+## 🏛 Архитектура проекта
 
-Для работы пайплайна потребуется Python 3.10+ и следующие шаги:
-
-### 1. Установка зависимостей
-
-Создайте виртуальное окружение и установите Python-пакеты:
-```bash
-python -m venv venv
-source venv/bin/activate  # для Linux/macOS
-# venv\Scripts\activate   # для Windows
-
-pip install -r requirements.txt
+```
+agent/
+├── app.py                      # FastAPI сервер (REST API + раздача собранного React SPA)
+├── database.py                 # SQLite схемы, индексы и миграции
+├── dedup.py                    # Векторная дедупликация (FastEmbed cosine similarity 0.59)
+├── rag_service.py              # Векторный индекс базы знаний для семантического поиска
+├── rag_agent.py                # Интеллектуальный диалоговый движок AI-ассистента
+├── scheduler.py                # Планировщик периодического сбора данных
+├── main.py                     # CLI-раннер краулеров
+├── run_all.py                  # All-in-One раннер бэкенда и веб-интерфейса
+├── config.py                   # Загрузчик настроек и .env
+├── requirements.txt            # Зависимости Python
+├── data/
+│   └── app_database.db         # Боевая база данных SQLite
+└── web/                        # Современный веб-интерфейс (React 19 + TypeScript + Vite + Tailwind CSS)
+    ├── dist/                   # Готовая продакшн-сборка интерфейса (HTML/CSS/JS)
+    └── src/
+        ├── components/
+        │   ├── studio/         # StudioFeed (лента), StudioSidebar (фильтры), StudioRightPane (обзор и ассистент)
+        │   ├── background/     # FluidAuroraCanvas (живой космический k-NN фон)
+        │   └── ui/             # CommandPalette (Ctrl+K), IntelligenceOrb, Sparkline, TypewriterText
+        ├── types/              # TypeScript интерфейсы
+        └── utils/              # Грамматика и локализация сущностей
 ```
 
-Поскольку парсер LMSys Arena работает через эмуляцию браузера, нужно установить бинарники Playwright:
+---
+
+## 🚀 Быстрый старт (Локальная разработка)
+
+### 1. Установка Python-бэкенда
+Требуется Python 3.10+:
 ```bash
+python -m venv venv
+# Активация окружения:
+# Windows: venv\Scripts\activate
+# Linux/macOS: source venv/bin/activate
+
+pip install -r requirements.txt
 playwright install chromium
 ```
 
-### 2. Настройка окружения (.env)
-
-Скопируйте пример конфига и заполните свои ключи:
+### 2. Настройка конфигурации (.env)
+Скопируйте шаблон и укажите ваши ключи:
 ```bash
 cp .env.example .env
 ```
+* `OPENAI_API_KEY` или `VLLM_BASE_URL` — для работы диалогового AI-ассистента;
+* `GITHUB_TOKEN` — для работы парсера GitHub Trending;
+* `HUGGINGFACE_API_KEY` — для расширенных лимитов HF API.
 
-**Ключевые переменные `.env`:**
-- `VLLM_BASE_URL` и `VLLM_MODEL_NAME` — для доступа к вашей LLM (по умолчанию настроено на локальный инстанс `vLLM` на порту 2233).
-- `HUGGINGFACE_API_KEY` — (опционально) для расширенных лимитов HF API.
-- `GITHUB_TOKEN` — для работы GitHub Search API (обязательно для обхода rate limits).
-- `KAGGLE_USERNAME` и `KAGGLE_KEY` — для скачивания датасетов из Kaggle.
-
-*(Примечание: HF_TRENDING_MCP_PATH больше не требуется, так как Hugging Face теперь работает через официальный REST API)*
-
-### 3. Запуск пайплайна
-
-**Собрать данные один раз (Ручной запуск):**
+### 3. Запуск одной командой
 ```bash
 python run_all.py
 ```
-Скрипт поочередно запустит все парсеры, пропустит данные через агентов-аналитиков, дедуплицирует и положит новые находки в базу данных.
+* **Веб-интерфейс и API:** `http://localhost:8000`
+* **Swagger-документация API:** `http://localhost:8000/docs`
 
-**Точечный запуск отдельных модулей:**
-- **Только датасеты (Hugging Face + Kaggle):**
-  ```bash
-  python main.py --only-datasets
-  ```
-- **Только статьи (HF + PwC):**
-  ```bash
-  python main.py --only-papers
-  ```
-- **Только тренды GitHub:**
-  ```bash
-  python main.py --only-github
-  ```
-- **Только тренды моделей HF:**
-  ```bash
-  python main.py --only-models
-  ```
-- **Только лидерборд LMSys Arena:**
-  ```bash
-  python main.py --only-arena
-  ```
-
-**Автоматический запуск по расписанию:**
+Если вы активно разрабатываете фронтенд с горячей перезагрузкой (HMR):
 ```bash
-python scheduler.py
+cd web
+npm install
+npm run dev
+# Vite запустится на http://localhost:5173
 ```
-Скрипт будет крутиться в фоне и запускать сбор по заданному интервалу.
-
-### 4. Запуск UI (Streamlit)
-
-Для просмотра собранной базы и лидерборда запустите фронтенд:
-```bash
-python -m streamlit run frontend.py
-```
-Интерфейс будет доступен в браузере по адресу: http://localhost:8501
 
 ---
 
-## Тонкая настройка
+## 📦 Развёртывание на продакшн-сервере
 
-Глобальные настройки (например, пороги дедупликации, тематики для статей PwC, режимы поиска HF Datasets/Models и GitHub) вынесены в файл `config.py`. 
+### Вариант 1. Запуск в один процесс через FastAPI (Рекомендуется)
+Поскольку в `app.py` настроена автоматическая раздача собранного `web/dist`, на сервере **не требуется ставить Node.js**:
+1. Соберите фронтенд локально:
+   ```bash
+   cd web
+   npm run build
+   ```
+2. Скопируйте проект на сервер (включая папку `web/dist`).
+3. Запустите сервер:
+   ```bash
+   uvicorn app:app --host 0.0.0.0 --port 8000
+   ```
+Веб-интерфейс и API будут доступны на одном порту `8000`.
 
-Если вы хотите откалибровать порог дедупликации `DUPLICATE_THRESHOLD` под свою эмбеддинг-модель, запустите утилиту калибровки:
-```bash
-python calibrate_threshold.py
+### Вариант 2. Запуск через Nginx (Reverse Proxy)
+Если перед сервисом стоит Nginx, направьте корневую статику на `web/dist`, а запросы к API проксируйте:
+```nginx
+server {
+    listen 80;
+    server_name your-domain.com;
+
+    # Раздача готового React фронтенда
+    location / {
+        root /path/to/agent/web/dist;
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Проксирование API запросов к FastAPI
+    location ~ ^/(trending|articles|leaderboard|api|rag|scrape)/ {
+        proxy_pass http://127.0.0.1:8000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+}
 ```
+
+---
+
+## 📡 Ключевые REST API эндпоинты
+
+| Метод | Эндпоинт | Описание |
+|---|---|---|
+| `GET` | `/trending/models` | Получить срез трендовых моделей Hugging Face |
+| `GET` | `/trending/github` | Получить трендовые репозитории GitHub |
+| `GET` | `/articles` | Получить свежие статьи ArXiv и PapersWithCode |
+| `GET` | `/leaderboard` | Получить данные лидерборда LMSys Arena |
+| `POST` | `/api/v1/radar/sync` | Запустить фоновый сбор свежих данных по всем источникам |
+| `POST` | `/api/v1/rag/query` | Отправить запрос диалоговому AI-ассистенту |
+
+---
+
+## ⌨ Горячие клавиши веб-интерфейса
+
+* **`Ctrl + K`** — Быстрый поиск моделей, статей, репозиториев и команд (работает на RU и EN раскладках)
+* **`↑` / `↓`** — Навигация по карточкам ленты
+* **`Enter`** — Задать вопрос AI-ассистенту о выбранном материале
+* **`Esc`** — Закрыть окно быстрого поиска

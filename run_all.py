@@ -1,24 +1,17 @@
 """
 Единый All-in-One раннер для AI/ML Radar Agent.
 Запускает все компоненты проекта одной командой (без Docker):
-  - api      -> FastAPI бэкенд (uvicorn app:app)
-  - frontend -> Streamlit веб-интерфейс (frontend.py)
+  - api      -> FastAPI бэкенд + встроенная раздача React SPA (uvicorn app:app)
   - pipeline -> Основной пайплайн сбора и планировщик (scheduler.py / main.py)
-
-Особенности:
-  - Автоматическая инициализация БД (init_db) и применение миграций перед стартом.
-  - Мгновенный вывод логов построчно (PYTHONUNBUFFERED=1, sys.executable -u).
-  - Красивые цветовые префиксы [api], [frontend], [pipeline], [system].
-  - Надежное завершение всего дерева процессов при нажатии Ctrl+C (Windows & Linux).
-  - Поддержка гибких аргументов командной строки.
+  - web-dev  -> (Опционально) Vite dev server для горячей разработки интерфейса
 
 Запуск:
   python run_all.py
 
 Дополнительные флаги:
   python run_all.py --run-once        # Запустить main.py один раз вместо цикличного планировщика
-  python run_all.py --no-pipeline    # Запустить только Web UI и API (без сбора)
-  python run_all.py --no-frontend    # Запустить только API и пайплайн
+  python run_all.py --no-pipeline    # Запустить только Web/API (без фонового сбора)
+  python run_all.py --dev-web        # Запустить Vite dev server на порту 5173 для горячей разработки
   python run_all.py --host 127.0.0.1 # Привязать к localhost
 """
 
@@ -37,7 +30,7 @@ if sys.platform == "win32":
 # Цвета для вывода логов
 COLORS = {
     "api": "\033[36m",       # Cyan
-    "frontend": "\033[35m",  # Magenta
+    "web": "\033[35m",       # Magenta
     "pipeline": "\033[33m",  # Yellow
     "system": "\033[32m",    # Green
     "error": "\033[31m",     # Red
@@ -83,7 +76,6 @@ def kill_proc_tree(proc: subprocess.Popen) -> None:
     pid = proc.pid
     if sys.platform == "win32":
         try:
-            # На Windows принудительно гасим все дерево процессов через taskkill
             subprocess.run(
                 ["taskkill", "/F", "/T", "/PID", str(pid)],
                 stdout=subprocess.DEVNULL,
@@ -140,14 +132,12 @@ def init_database_safe() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="AI/ML Radar Agent All-in-One Runner")
-    parser.add_argument("--host", default="0.0.0.0", help="Хост для API и Streamlit (default: 0.0.0.0)")
-    parser.add_argument("--api-port", type=int, default=8000, help="Порт для FastAPI (default: 8000)")
-    parser.add_argument("--frontend-port", type=int, default=8501, help="Порт для Streamlit (default: 8501)")
-    parser.add_argument("--no-pipeline", action="store_true", help="Не запускать пайплайн сбора данных")
-    parser.add_argument("--no-frontend", action="store_true", help="Не запускать веб-интерфейс Streamlit")
-    parser.add_argument("--no-api", action="store_true", help="Не запускать FastAPI бэкенд")
+    parser.add_argument("--host", default="0.0.0.0", help="Хост для сервисов (default: 0.0.0.0)")
+    parser.add_argument("--port", type=int, default=8000, help="Порт для FastAPI + Web UI (default: 8000)")
+    parser.add_argument("--no-pipeline", action="store_true", help="Не запускать фоновый сбор данных")
     parser.add_argument("--run-once", action="store_true", help="Запустить main.py один раз вместо цикличного scheduler.py")
-    parser.add_argument("--only-datasets", action="store_true", help="Запустить сбор только датасетов (main.py --only-datasets)")
+    parser.add_argument("--only-datasets", action="store_true", help="Запустить сбор только датасетов")
+    parser.add_argument("--dev-web", action="store_true", help="Запустить Vite dev server для разработки")
 
     args = parser.parse_args()
 
@@ -166,27 +156,19 @@ def main() -> None:
     # 1. Инициализируем БД
     init_database_safe()
 
-    # Формируем конфигурацию запускаемых процессов
     root_dir = os.path.dirname(os.path.abspath(__file__)) or "."
     env = {**os.environ, "PYTHONUNBUFFERED": "1"}
 
     commands: dict[str, list[str]] = {}
 
-    if not args.no_api:
-        commands["api"] = [
-            sys.executable, "-u", "-m", "uvicorn", "app:app",
-            "--host", args.host,
-            "--port", str(args.api_port),
-        ]
+    # Главный сервер (FastAPI + React SPA)
+    commands["api"] = [
+        sys.executable, "-u", "-m", "uvicorn", "app:app",
+        "--host", args.host,
+        "--port", str(args.port),
+    ]
 
-    if not args.no_frontend:
-        commands["frontend"] = [
-            sys.executable, "-u", "-m", "streamlit", "run", "frontend.py",
-            "--server.address", args.host,
-            "--server.port", str(args.frontend_port),
-            "--server.headless", "true",
-        ]
-
+    # Пайплайн сбора
     if not args.no_pipeline:
         if args.only_datasets:
             commands["pipeline"] = [sys.executable, "-u", "main.py", "--only-datasets"]
@@ -195,23 +177,24 @@ def main() -> None:
         else:
             commands["pipeline"] = [sys.executable, "-u", "scheduler.py"]
 
-    # Выводим красивый информационный баннер
+    # Опциональный Vite dev server для разработчиков
+    if args.dev_web and os.path.isdir(os.path.join(root_dir, "web")):
+        npm_cmd = "npm.cmd" if sys.platform == "win32" else "npm"
+        commands["web"] = [
+            npm_cmd, "--prefix", "web", "run", "dev", "--", "--host", args.host
+        ]
+
+    # Информационный баннер
     print("\n" + "=" * 70)
-    print(f"{BOLD}AI/ML Radar Agent — All-in-One Environment{RESET}")
+    print(f"{BOLD}AI Радар & Scout — All-in-One Runner{RESET}")
     print("=" * 70)
-    if not args.no_frontend:
-        print(f"  {BOLD}Веб-интерфейс (Streamlit):{RESET}  http://localhost:{args.frontend_port}")
-    if not args.no_api:
-        print(f"  {BOLD}REST API (FastAPI):{RESET}        http://localhost:{args.api_port}")
-        print(f"  {BOLD}Документация API:{RESET}          http://localhost:{args.api_port}/docs")
+    print(f"  {BOLD}Веб-интерфейс & API:{RESET}      http://localhost:{args.port}")
+    print(f"  {BOLD}Документация API:{RESET}         http://localhost:{args.port}/docs")
     if not args.no_pipeline:
-        if args.only_datasets:
-            mode_text = "main.py --only-datasets (только датасеты)"
-        elif args.run_once:
-            mode_text = "main.py (разовый запуск)"
-        else:
-            mode_text = "scheduler.py (цикличный сбор)"
-        print(f"  {BOLD}Пайплайн сбора данных:{RESET}    {mode_text}")
+        mode_text = "main.py (разовый запуск)" if args.run_once else "scheduler.py (цикличный сбор)"
+        print(f"  {BOLD}Пайплайн сбора данных:{RESET}   {mode_text}")
+    if args.dev_web:
+        print(f"  {BOLD}Vite Dev Server:{RESET}         http://localhost:5173")
     print("=" * 70)
     print(f"Для остановки всех сервисов нажмите {BOLD}Ctrl + C{RESET}\n")
 
@@ -233,12 +216,11 @@ def main() -> None:
         except Exception as e:
             log_error(f"Не удалось запустить процесс [{name}]: {e}")
 
-    # Главный цикл поддержания жизни раннера
+    # Главный цикл
     try:
         while not stop_event.is_set():
-            # Если все процессы завершились сами
             if procs and all(p.poll() is not None for p in procs.values()):
-                log_system("Все дочерние процессы завершили работу.")
+                log_system("Все процессы завершили работу.")
                 break
             time.sleep(1)
     except KeyboardInterrupt:
