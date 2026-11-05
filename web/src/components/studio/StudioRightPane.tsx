@@ -17,10 +17,12 @@ import {
   ArrowLeftRight,
   Compass,
   TrendingUp,
+  Plus,
 } from 'lucide-react';
 import { Sparkline } from '../ui/Sparkline';
 import { IntelligenceOrb } from '../ui/IntelligenceOrb';
 import { TypewriterText } from '../ui/TypewriterText';
+import { MarkdownRenderer } from '../ui/MarkdownRenderer';
 import type { IntelItem, ChatMessage } from '../../types/intel';
 import { getItemGrammar } from '../../utils/intelItemLabels';
 
@@ -28,7 +30,7 @@ interface StudioRightPaneProps {
   mode?: 'center' | 'docked';
   selectedItem: IntelItem | null;
   onClearSelectedItem: () => void;
-  onAskCopilot: (prompt: string) => void;
+  onAskAssistant?: (prompt: string) => void;
   onCollapse: () => void;
   onTransitionToHub?: () => void;
   onTransitionToCenter?: () => void;
@@ -88,7 +90,7 @@ export const StudioRightPane: React.FC<StudioRightPaneProps> = ({
   mode = 'docked',
   selectedItem,
   onClearSelectedItem,
-  onAskCopilot,
+  onAskAssistant,
   onCollapse,
   onTransitionToHub,
   onTransitionToCenter,
@@ -100,8 +102,8 @@ export const StudioRightPane: React.FC<StudioRightPaneProps> = ({
   onSendMessage: externalSendMessage,
   isLoading: externalIsLoading,
 }) => {
-  const [activeTab, setActiveTab] = useState<'copilot' | 'inspector'>(
-    selectedItem ? 'inspector' : 'copilot'
+  const [activeTab, setActiveTab] = useState<'assistant' | 'inspector'>(
+    selectedItem ? 'inspector' : 'assistant'
   );
   const [localMessages, setLocalMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState('');
@@ -132,7 +134,7 @@ export const StudioRightPane: React.FC<StudioRightPaneProps> = ({
 
   useEffect(() => {
     if (injectedPrompt) {
-      setActiveTab('copilot');
+      setActiveTab('assistant');
       handleSend(injectedPrompt);
       if (onClearInjectedPrompt) onClearInjectedPrompt();
     }
@@ -168,7 +170,7 @@ export const StudioRightPane: React.FC<StudioRightPaneProps> = ({
     setLocalIsLoading(true);
 
     try {
-      const res = await fetch('http://localhost:8000/api/v1/rag/query', {
+      const res = await fetch('/api/v1/rag/query', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ prompt: q }),
@@ -332,7 +334,7 @@ export const StudioRightPane: React.FC<StudioRightPaneProps> = ({
   }
 
   // =========================================================================
-  // РЕЖИМ 2: ДОК-ПАНЕЛЬ В РАБОЧЕЙ СТАНЦИИ (STUDIO COPILOT & INSPECTOR)
+  // РЕЖИМ 2: ДОК-ПАНЕЛЬ В РАБОЧЕЙ СТАНЦИИ (STUDIO AI ASSISTANT & INSPECTOR)
   // Полноценная боковая колонка со всей историей диалога и детальным инспектором.
   // =========================================================================
   return (
@@ -345,9 +347,9 @@ export const StudioRightPane: React.FC<StudioRightPaneProps> = ({
       <div className="h-10 shrink-0 px-4 border-b border-white/[0.08] bg-[#0c0c12]/90 flex items-center justify-between text-xs select-none shadow-[inset_0_1px_0_0_rgba(255,255,255,0.04)]">
         <div className="flex items-center space-x-1">
           <button
-            onClick={() => setActiveTab('copilot')}
+            onClick={() => setActiveTab('assistant')}
             className={`flex items-center space-x-1.5 px-3 py-1 rounded-lg text-xs font-medium transition-colors cursor-pointer ${
-              activeTab === 'copilot'
+              activeTab === 'assistant'
                 ? 'bg-white/[0.08] text-white font-semibold shadow-[inset_0_1px_0_0_rgba(255,255,255,0.08)]'
                 : 'text-zinc-400 hover:text-white hover:bg-white/[0.04]'
             }`}
@@ -370,6 +372,19 @@ export const StudioRightPane: React.FC<StudioRightPaneProps> = ({
         </div>
 
         <div className="flex items-center space-x-1 text-zinc-400">
+          {activeTab === 'assistant' && (
+            <button
+              onClick={() => {
+                setLocalMessages([]);
+                setInput('');
+              }}
+              className="p-1.5 rounded-md hover:bg-white/10 hover:text-white transition-colors cursor-pointer text-zinc-400"
+              title="Новый диалог (очистить историю)"
+            >
+              <Plus className="w-3.5 h-3.5" />
+            </button>
+          )}
+
           {onToggleDockSide && (
             <button
               onClick={onToggleDockSide}
@@ -404,8 +419,8 @@ export const StudioRightPane: React.FC<StudioRightPaneProps> = ({
         </div>
       </div>
 
-      {/* Режим Copilot в доке */}
-      {activeTab === 'copilot' && (
+      {/* Режим AI Ассистента в доке */}
+      {activeTab === 'assistant' && (
         <div className="flex-1 flex flex-col justify-between overflow-hidden">
           <div className="flex-1 overflow-y-auto p-4 space-y-4">
             {messages.length === 0 ? (
@@ -434,7 +449,11 @@ export const StudioRightPane: React.FC<StudioRightPaneProps> = ({
                       </div>
                     )}
 
-                    <p className="whitespace-pre-wrap">{m.content}</p>
+                    {m.role === 'user' ? (
+                      <p className="whitespace-pre-wrap">{m.content}</p>
+                    ) : (
+                      <MarkdownRenderer content={m.content} />
+                    )}
 
                     {m.sources && m.sources.length > 0 && (
                       <div className="mt-3 pt-2.5 border-t border-white/[0.08] flex flex-wrap gap-1.5">
@@ -625,7 +644,7 @@ export const StudioRightPane: React.FC<StudioRightPaneProps> = ({
                   <div className="space-y-2 pt-2">
                     <button
                       onClick={() => {
-                        setActiveTab('copilot');
+                        setActiveTab('assistant');
                         handleSend(`Сделай глубокий анализ ${grammar.genitive} "${selectedItem.title}"`);
                       }}
                       className="w-full flex items-center justify-center space-x-2 py-3 px-4 rounded-xl bg-gradient-to-r from-blue-600 via-indigo-600 to-violet-600 hover:from-blue-500 hover:to-violet-500 text-white font-semibold text-xs transition-all shadow-md shadow-indigo-600/25 cursor-pointer"

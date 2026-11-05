@@ -234,7 +234,8 @@ import rag_agent
 class RagChatRequest(BaseModel):
     messages: list[dict] = Field(default_factory=list, description="История диалога")
     category: str = Field(default="all", description="Категория: all, датасет, модель, репозиторий, статья")
-    top_k: int = Field(default=5, ge=1, le=20, description="Количество карточек в рекомендации")
+    max_sources: int = Field(default=5, ge=1, le=20, description="Количество карточек в рекомендации")
+    top_k: int | None = Field(default=None, ge=1, le=20, description="Алиас для обратной совместимости")
 
 
 @app.post("/rag/chat")
@@ -244,10 +245,11 @@ def rag_chat_endpoint(req: RagChatRequest):
     Классифицирует намерение, при необходимости производит семантический поиск карточек и формирует рекомендации.
     """
     try:
+        limit = req.top_k if req.top_k is not None else req.max_sources
         res = rag_agent.process_dialogue(
             history=req.messages,
             category_filter=req.category,
-            top_k=req.top_k,
+            max_sources=limit,
         )
         return {"status": "success", "data": res}
     except Exception as e:
@@ -277,17 +279,19 @@ def rag_reindex_endpoint():
 class IntelQueryRequest(BaseModel):
     prompt: str
     category: str = "all"
-    top_k: int = 5
+    max_sources: int = 5
+    top_k: int | None = None
 
 
 @app.post("/api/v1/rag/query")
 def api_v1_rag_query(req: IntelQueryRequest):
-    """Эндпоинт для прямого взаимодействия с Copilot терминалом RAG-агента."""
+    """Эндпоинт для прямого взаимодействия с диалоговым AI-ассистентом RAG."""
     try:
+        limit = req.top_k if req.top_k is not None else req.max_sources
         res = rag_agent.process_dialogue(
             history=[{"role": "user", "content": req.prompt}],
             category_filter=req.category,
-            top_k=req.top_k,
+            max_sources=limit,
         )
         cards = res.get("cards", [])
         sources = [
@@ -312,12 +316,6 @@ def api_v1_rag_query(req: IntelQueryRequest):
             "answer": f"Ошибка обработки RAG-запроса: {e}",
             "sources": [],
             "cards": [],
-        }
-    except Exception as e:
-        return {
-            "status": "error",
-            "answer": f"Analysis complete for '{req.prompt}'. Local semantic search fallback engaged.",
-            "sources": [],
         }
 
 

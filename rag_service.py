@@ -213,6 +213,7 @@ def build_index(force: bool = False) -> int:
 def search_cards(
     query: str,
     category: str = "all",
+    max_sources: int | None = None,
     top_k: int = 5,
     min_score: float = 0.20,
 ) -> list[dict[str, Any]]:
@@ -221,10 +222,12 @@ def search_cards(
 
     :param query: Поисковый запрос (например: 'медицинские датасеты снимков МРТ')
     :param category: Фильтр по категории ('all', 'датасет', 'модель', 'репозиторий', 'статья')
-    :param top_k: Количество карточек на выходе (по умолчанию 5)
+    :param max_sources: Количество найденных источников на выходе (по умолчанию 5)
+    :param top_k: Алиас для обратной совместимости
     :param min_score: Минимальный порог косинусного сходства
     :return: Список словарей [{'card': card_data, 'score': float}, ...]
     """
+    limit = max_sources if max_sources is not None else top_k
     build_index()
 
     if not _INDEX_CARDS or _INDEX_VECTORS is None or len(_INDEX_VECTORS) == 0:
@@ -261,7 +264,7 @@ def search_cards(
 
     # Сортировка по убыванию релевантности
     results.sort(key=lambda x: x["score"], reverse=True)
-    return results[:top_k]
+    return results[:limit]
 
 
 def get_catalog_stats() -> dict[str, int]:

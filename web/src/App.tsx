@@ -19,7 +19,7 @@ import { HFModelsSection } from './components/views/HFModelsSection';
 import { PapersSection } from './components/views/PapersSection';
 import { DatasetsSection } from './components/views/DatasetsSection';
 import { RepositoriesSection } from './components/views/RepositoriesSection';
-import { RAGSection } from './components/views/RAGSection';
+import { RAGSection, type ChatSession } from './components/views/RAGSection';
 import { FluidAuroraCanvas } from './components/background/FluidAuroraCanvas';
 import { IntelligenceOrb } from './components/ui/IntelligenceOrb';
 import type {
@@ -61,6 +61,69 @@ export default function App() {
   const [telemetry, setTelemetry] = useState<RadarTelemetry | null>(null);
   const [isSyncing, setIsSyncing] = useState(false);
   const [isReindexing, setIsReindexing] = useState(false);
+
+  // Стейт независимых сессий чата (вкладки диалогов, сохраняются в localStorage)
+  const [sessions, setSessions] = useState<ChatSession[]>(() => {
+    if (typeof window !== 'undefined') {
+      try {
+        const saved = localStorage.getItem('scout_chat_sessions');
+        if (saved) {
+          const parsed = JSON.parse(saved);
+          if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+        }
+      } catch (e) {
+        console.warn('Failed to load chat sessions from localStorage:', e);
+      }
+    }
+    return [
+      {
+        id: 'session_' + Date.now(),
+        title: 'Диалог 1',
+        messages: [],
+        createdAt: Date.now(),
+      },
+    ];
+  });
+
+  const [activeSessionId, setActiveSessionId] = useState<string>(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('scout_active_session_id');
+      if (saved) return saved;
+    }
+    return 'default';
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('scout_chat_sessions', JSON.stringify(sessions));
+    } catch (e) {
+      console.warn('Failed to save chat sessions to localStorage:', e);
+    }
+  }, [sessions]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('scout_active_session_id', activeSessionId);
+    } catch (e) {
+      console.warn('Failed to save active session ID to localStorage:', e);
+    }
+  }, [activeSessionId]);
+
+  // Стейт открытия боковой панели ассистента
+  const [isAssistantOpen, setIsAssistantOpen] = useState<boolean>(() => {
+    if (typeof window !== 'undefined') {
+      return localStorage.getItem('scout_assistant_open') === 'true';
+    }
+    return false;
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('scout_assistant_open', isAssistantOpen ? 'true' : 'false');
+    } catch (e) {
+      console.warn('Failed to save assistant open state:', e);
+    }
+  }, [isAssistantOpen]);
 
   // Загрузка лидерборда и анализа
   const fetchLeaderboard = async () => {
@@ -327,6 +390,21 @@ export default function App() {
             </div>
           )}
 
+          {/* Быстрая кнопка AI Ассистента в шапке */}
+          <button
+            onClick={() => setIsAssistantOpen((prev) => !prev)}
+            className={`flex items-center gap-2 px-3.5 py-1.5 text-xs font-semibold rounded-xl transition-all cursor-pointer border ${
+              isAssistantOpen
+                ? 'bg-purple-600 text-white border-purple-400 shadow-lg shadow-purple-600/30'
+                : 'bg-[#150D2E] text-purple-300 hover:bg-[#1E1242] border-[#3B156E] hover:text-white'
+            }`}
+            title="Открыть / скрыть AI Ассистент"
+          >
+            <Bot className="w-4 h-4 text-purple-400" />
+            <span>AI Ассистент</span>
+            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+          </button>
+
           <button
             onClick={handleForceScan}
             disabled={isSyncing}
@@ -340,7 +418,7 @@ export default function App() {
 
       {/* Основной двухколоночный контент */}
       <div className="relative z-10 w-full flex-1 flex overflow-hidden">
-        {/* Боковая панель с 7 разделами */}
+        {/* Боковая панель с 6 разделами каталога */}
         <StudioSidebar
           activeTab={activeTab}
           onTabChange={setActiveTab}
@@ -351,9 +429,11 @@ export default function App() {
           onRefreshTelemetry={fetchTelemetry}
           onReindex={handleReindex}
           isReindexing={isReindexing}
+          onToggleAssistant={() => setIsAssistantOpen((prev) => !prev)}
+          isAssistantOpen={isAssistantOpen}
         />
 
-        {/* Рабочая область выбранного раздела */}
+        {/* Рабочая область выбранного раздела каталога */}
         <main className="flex-1 h-full overflow-y-auto p-6 md:p-8 bg-[#07070B]/50">
           <div className="max-w-6xl mx-auto pb-12">
             {activeTab === 'leaderboard' && (
@@ -411,10 +491,47 @@ export default function App() {
               />
             )}
 
-            {activeTab === 'rag' && <RAGSection />}
+            {activeTab === 'rag' && (
+              <RAGSection
+                sessions={sessions}
+                setSessions={setSessions}
+                activeSessionId={activeSessionId}
+                setActiveSessionId={setActiveSessionId}
+                isSidePanel={false}
+              />
+            )}
           </div>
         </main>
+
+        {/* Выдвижная боковая панель AI-Ассистента (сохраняет историю диалога и контекст) */}
+        <aside
+          className={`shrink-0 h-full border-l border-[#2D1B4E] bg-[#0E071A]/95 backdrop-blur-md flex flex-col z-30 shadow-2xl transition-all duration-200 ${
+            isAssistantOpen ? 'w-full md:w-[460px]' : 'hidden'
+          }`}
+        >
+          <RAGSection
+            sessions={sessions}
+            setSessions={setSessions}
+            activeSessionId={activeSessionId}
+            setActiveSessionId={setActiveSessionId}
+            isSidePanel={true}
+            onClose={() => setIsAssistantOpen(false)}
+          />
+        </aside>
       </div>
+
+      {/* Плавающая кнопка быстрого открытия ассистента в правом нижнем углу */}
+      {!isAssistantOpen && (
+        <button
+          onClick={() => setIsAssistantOpen(true)}
+          className="fixed bottom-6 right-6 z-40 flex items-center space-x-2.5 px-4 py-2.5 rounded-2xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white text-xs font-semibold shadow-2xl shadow-purple-600/40 transition-all cursor-pointer border border-purple-400/40 hover:scale-105 active:scale-95"
+          title="Открыть панель AI-Ассистента"
+        >
+          <Bot className="w-4 h-4 text-purple-200" />
+          <span>AI Ассистент</span>
+          <span className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+        </button>
+      )}
     </div>
   );
 }

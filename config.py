@@ -11,7 +11,14 @@ except ImportError:
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 
-# --- Локальная модель (vLLM, OpenAI-совместимый API) ---
+# --- Провайдеры LLM (Gemini / OpenAI / vLLM / Ollama) ---
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY") or ""
+GEMINI_MODEL_NAME = os.getenv("GEMINI_MODEL_NAME", "gemini-2.5-flash")
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+OPENAI_MODEL_NAME = os.getenv("OPENAI_MODEL_NAME", "gpt-4o-mini")
+OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "")
+
 VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://127.0.0.1:2233/v1")
 VLLM_MODEL_NAME = os.getenv("VLLM_MODEL_NAME", "Qwen/Qwen3.6-27B")
 VLLM_API_KEY = os.getenv("VLLM_API_KEY", "not-needed")

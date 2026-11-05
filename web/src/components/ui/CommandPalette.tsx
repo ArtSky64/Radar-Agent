@@ -133,7 +133,7 @@ export const CommandPalette: React.FC<CommandPaletteProps> = ({
       action: () => { onForceScan(); onClose(); },
     },
     {
-      id: 'act-copilot',
+      id: 'act-assistant',
       category: 'Actions',
       label: 'Свернуть / развернуть AI Ассистента',
       subtitle: 'Управление боковой панелью аналитика',

@@ -7,12 +7,10 @@ import {
   Database,
   GitFork,
   Bot,
-  Activity,
-  CheckCircle2,
   RotateCw,
   RefreshCw,
-  Sliders,
-  Layers,
+  Activity,
+  CheckCircle2,
 } from 'lucide-react';
 import type { NavigationTab } from '../../types/domain';
 import type { RadarTelemetry } from '../../types/intel';
@@ -34,6 +32,8 @@ interface StudioSidebarProps {
   onRefreshTelemetry?: () => void;
   onReindex?: () => void;
   isReindexing?: boolean;
+  onToggleAssistant?: () => void;
+  isAssistantOpen?: boolean;
 }
 
 export const StudioSidebar: React.FC<StudioSidebarProps> = ({
@@ -46,6 +46,8 @@ export const StudioSidebar: React.FC<StudioSidebarProps> = ({
   onRefreshTelemetry,
   onReindex,
   isReindexing = false,
+  onToggleAssistant,
+  isAssistantOpen = false,
 }) => {
   const navItems: {
     id: NavigationTab;
@@ -96,22 +98,16 @@ export const StudioSidebar: React.FC<StudioSidebarProps> = ({
       count: counts.repositories,
       color: 'text-sky-400',
     },
-    {
-      id: 'rag',
-      label: 'ИИ-Рекомендации (RAG)',
-      icon: <Bot className="w-4 h-4 text-fuchsia-400" />,
-      color: 'text-fuchsia-400',
-    },
   ];
 
   return (
     <aside className="w-64 shrink-0 h-full bg-[#0A0A0F] border-r border-[#2D1B4E] flex flex-col justify-between select-none shadow-xl">
-      <div className="p-4 space-y-6 overflow-y-auto">
+      <div className="p-4 space-y-5 overflow-y-auto">
         {/* Заголовок бокового меню */}
         <div>
           <div className="px-3 mb-2 text-[10px] uppercase tracking-wider text-zinc-500 font-semibold flex items-center justify-between">
-            <span>Разделы радара</span>
-            <span className="text-[10px] text-zinc-500 font-mono">7 разделов</span>
+            <span>Разделы каталога</span>
+            <span className="text-[10px] text-zinc-500 font-mono">6 разделов</span>
           </div>
           <div className="space-y-1">
             {navItems.map((item) => {
@@ -146,6 +142,33 @@ export const StudioSidebar: React.FC<StudioSidebarProps> = ({
             })}
           </div>
         </div>
+
+        {/* Вызов ассистента */}
+        {onToggleAssistant && (
+          <div className="pt-2 border-t border-[#2D1B4E]">
+            <div className="px-3 mb-2 text-[10px] uppercase tracking-wider text-zinc-500 font-semibold flex items-center justify-between">
+              <span>Интеллект</span>
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
+            </div>
+            <button
+              onClick={onToggleAssistant}
+              className={`w-full flex items-center justify-between px-3 py-2.5 rounded-xl text-xs font-semibold transition-all cursor-pointer ${
+                isAssistantOpen
+                  ? 'bg-purple-600 text-white shadow-lg shadow-purple-600/30 border border-purple-400'
+                  : 'bg-purple-950/40 text-purple-300 hover:bg-purple-900/50 border border-purple-700/50'
+              }`}
+              title="Открыть / скрыть боковую панель AI-Ассистента"
+            >
+              <div className="flex items-center space-x-2.5">
+                <Bot className="w-4 h-4 text-purple-400" />
+                <span>AI Ассистент</span>
+              </div>
+              <span className="text-[10px] px-1.5 py-0.5 rounded bg-black/40 text-purple-300 border border-purple-500/30 font-mono">
+                {isAssistantOpen ? 'Открыт' : 'Чат'}
+              </span>
+            </button>
+          </div>
+        )}
 
         {/* Быстрые действия */}
         <div className="pt-2 border-t border-[#2D1B4E]">

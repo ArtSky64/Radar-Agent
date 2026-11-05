@@ -1,0 +1,36 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.pytest_cache/
+.embeddings_cache/
+
+# Git
+.git/
+.gitignore
+
+# Environment & local secrets
+.env
+
+# Editor & OS artifacts
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# Node & Frontend (собирается внутри Docker multi-stage)
+web/node_modules/
+web/dist/
+
+# Tests & temporary files
+tests/
+tmp/
+data/*.log
+data/errors.log
