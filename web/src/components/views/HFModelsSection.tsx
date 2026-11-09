@@ -1,5 +1,6 @@
 import React, { useState, useMemo } from 'react';
 import {
+  Sparkles,
   RotateCw,
   Search,
   ExternalLink,
@@ -21,6 +22,7 @@ interface HFModelsSectionProps {
   lastFetchedAt?: string | null;
   onRefresh: () => void;
   isRefreshing?: boolean;
+  onAskAssistant?: (prompt: string) => void;
 }
 
 export const HFModelsSection: React.FC<HFModelsSectionProps> = ({
@@ -29,6 +31,7 @@ export const HFModelsSection: React.FC<HFModelsSectionProps> = ({
   lastFetchedAt,
   onRefresh,
   isRefreshing = false,
+  onAskAssistant,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [selectedDirections, setSelectedDirections] = useState<string[]>([]);
@@ -371,7 +374,7 @@ export const HFModelsSection: React.FC<HFModelsSectionProps> = ({
 
                 {/* Описание / summary */}
                 {m.summary && (
-                  <p className="text-zinc-300 mt-1.5 text-[11px] leading-relaxed line-clamp-3">
+                  <p className="text-zinc-300 mt-2 text-xs leading-relaxed whitespace-pre-line">
                     {m.summary}
                   </p>
                 )}
@@ -393,14 +396,24 @@ export const HFModelsSection: React.FC<HFModelsSectionProps> = ({
                     </span>
                   ) : null}
 
-                  <a
-                    href={modelUrl}
-                    target="_blank"
-                    rel="noreferrer"
-                    className="ml-auto text-purple-400 hover:text-purple-300 underline font-medium"
-                  >
-                    Открыть на Hugging Face →
-                  </a>
+                  <div className="ml-auto flex items-center gap-3">
+                    <button
+                      onClick={() => onAskAssistant?.(`Расскажи подробно про модель ${modelName}: архитектура, назначение, сильные стороны и как её запустить`)}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-purple-600/20 hover:bg-purple-600/40 text-purple-300 hover:text-white border border-purple-500/30 text-[11px] font-semibold transition-all cursor-pointer shadow-sm"
+                      title="Спросить у AI Ассистента"
+                    >
+                      <Sparkles className="w-3 h-3 text-purple-400" />
+                      <span>Спросить ассистента</span>
+                    </button>
+                    <a
+                      href={modelUrl}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="text-purple-400 hover:text-purple-300 underline font-medium"
+                    >
+                      Открыть на Hugging Face →
+                    </a>
+                  </div>
                 </div>
               </div>
             );

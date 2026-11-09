@@ -1,281 +1,276 @@
 """
-Модуль интеллектуального диалогового агента Radar Scout.
-Работает как автономная экспертная модель уровня Gemini / ChatGPT, глубоко ориентированная
-на данные сервиса AI/ML Radar (лидерборд LMSYS Arena, модели Hugging Face, датасеты Kaggle,
-репозитории GitHub, статьи ArXiv и Papers with Code).
-Работает полностью автономно и локально, не требуя внешних платных API или сторонних нейросетей.
+Модуль интеллектуального диалогового агента Radar Scout на базе PydanticAI и Qwen/Qwen3.6-27B.
+Работает полностью автономно и локально через vLLM, ориентируясь по базе знаний Radar
+с помощью нативных инструментов (Function Calling / Tools).
 """
 
+import asyncio
+import concurrent.futures
+from dataclasses import dataclass, field
 import json
 import logging
+import os
 import re
+import time
 from typing import Any
 
+os.environ.setdefault("PYDANTIC_AI_NO_BANNER", "1")
+
 import httpx
-from openai import OpenAI
+from pydantic_ai import Agent, RunContext
+from pydantic_ai.messages import (
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    TextPart,
+    UserPromptPart,
+)
+from pydantic_ai.models.openai import OpenAIChatModel
+from pydantic_ai.providers.openai import OpenAIProvider
 
 import config
+import database
 import rag_service
 
 logger = logging.getLogger("rag_agent")
 
-# Шаблоны приветствий, смолл-тока и благодарностей
+# Кэш состояния онлайн-сервера vLLM для предотвращения задержек
+_VLLM_STATUS: dict[str, Any] = {"online": None, "checked_at": 0.0}
+
+
+def _clean_card_title(raw_title: str) -> str:
+    """Удаляет вложенные квадратные скобки [[Kaggle] Title] для корректного Markdown."""
+    if not raw_title:
+        return "Материал"
+    clean = re.sub(r"^\[(.*?)\]\s*", r"\1: ", raw_title.strip())
+    clean = clean.replace("[", "(").replace("]", ")")
+    return re.sub(r"\s+", " ", clean).strip()
+
+
+def _is_vllm_online() -> bool:
+    """
+    Быстро проверяет доступность vLLM сервера с кэшированием статуса на 15 секунд.
+    Позволяет мгновенно переключаться на локальный резерв, если сервер не запущен.
+    """
+    now = time.monotonic()
+    if _VLLM_STATUS["online"] is not None and (now - _VLLM_STATUS["checked_at"] < 15.0):
+        return _VLLM_STATUS["online"]
+
+    base_url = config.VLLM_BASE_URL or "http://127.0.0.1:2233/v1"
+    models_url = f"{base_url.rstrip('/')}/models"
+    try:
+        with httpx.Client(timeout=0.3) as client:
+            resp = client.get(models_url)
+            is_ok = (resp.status_code == 200)
+    except Exception:
+        is_ok = False
+
+    _VLLM_STATUS["online"] = is_ok
+    _VLLM_STATUS["checked_at"] = now
+    return is_ok
+
+
+# --- ПРОВАЙДЕР ЛОКАЛЬНОЙ МОДЕЛИ QWEN 3.6 27B ---
+
+def get_rag_model() -> OpenAIChatModel:
+    """
+    Возвращает модель OpenAI-совместимого провайдера (vLLM Qwen 3.6 27B).
+    Параметры берутся из config.py / .env.
+    """
+    base_url = config.VLLM_BASE_URL or "http://127.0.0.1:2233/v1"
+    model_name = config.VLLM_MODEL_NAME or "Qwen/Qwen3.6-27B"
+    api_key = config.VLLM_API_KEY or "not-needed"
+
+    if config.OPENAI_BASE_URL:
+        base_url = config.OPENAI_BASE_URL
+        model_name = config.OPENAI_MODEL_NAME or model_name
+        api_key = config.OPENAI_API_KEY or api_key
+
+    timeout_cfg = httpx.Timeout(connect=3.0, read=60.0, write=10.0, pool=10.0)
+    http_client = httpx.AsyncClient(timeout=timeout_cfg)
+
+    return OpenAIChatModel(
+        model_name,
+        provider=OpenAIProvider(
+            base_url=base_url,
+            api_key=api_key,
+            http_client=http_client,
+        ),
+    )
+
+
+# --- КОНТЕКСТ ДИАЛОГА И ТУЛОВ ---
+
+@dataclass
+class RagAgentDeps:
+    """Контекст исполнения запроса агентом: собирает вызванные карточки и параметры."""
+    category: str = "all"
+    limit: int = 5
+    retrieved_cards: list[dict[str, Any]] = field(default_factory=list)
+    search_query: str | None = None
+    used_leaderboard: bool = False
+
+
+RADAR_SYSTEM_PROMPT = """Ты — интеллектуальный персональный AI-ассистент сервиса AI/ML Radar Scout на базе Qwen.
+Твоя база знаний охватывает:
+- Предобученные модели (Hugging Face, рейтинги LMSYS Arena).
+- Датасеты для обучения и валидации (Kaggle, Hugging Face Datasets).
+- Репозитории с исходным кодом и инструментами (GitHub Trending).
+- Исследовательские статьи и препринты (ArXiv, Papers with Code).
+
+ТВОИ ИНСТРУМЕНТЫ (TOOLS):
+1. search_radar: используй для семантического поиска по базе знаний, когда пользователь ищет модели, датасеты, код или статьи по конкретной задаче или домену (CV, NLP, Audio, медицина, табличные данные, MLOps и т.д.). Формулируй понятный поисковый запрос (например: «сегментация снимков МРТ», «распознавание речи whisper», «градиентный бустинг»).
+2. get_leaderboard_data: используй, когда пользователь спрашивает про рейтинги, арену LMSYS или топовые LLM.
+3. Если пользователь просто здоровается («Привет»), благодарит («Спасибо»), ведет смолл-ток («Как дела?») или спрашивает о контексте разговора («Что мы обсуждали?») — НЕ вызывай инструменты поиска, отвечай напрямую как дружелюбный эксперт.
+
+ТРЕБОВАНИЯ К ОТВЕТУ:
+- Отвечай структурированно, профессионально и живо на русском языке.
+- Для КАЖДОЙ рекомендуемой карточки обязательно делай кликабельную Markdown-ссылку в формате [Название карточки](url).
+- Анализируй и сравнивай найденные материалы: поясняй, чем они хороши, под какие сценарии подходят.
+- Оформляй ответ в красивом GitHub Markdown: заголовки ##, жирный шрифт, списки, таблицы или блоки кода при необходимости.
+"""
+
+
+def _create_rag_agent() -> Agent[RagAgentDeps, str]:
+    """Создает PydanticAI-агента с нативными инструментами поиска для Qwen 3.6 27B."""
+    agent: Agent[RagAgentDeps, str] = Agent(
+        model=get_rag_model(),
+        deps_type=RagAgentDeps,
+        system_prompt=RADAR_SYSTEM_PROMPT,
+    )
+
+    @agent.tool
+    def search_radar(
+        ctx: RunContext[RagAgentDeps],
+        query: str,
+        category: str = "all",
+    ) -> list[dict[str, Any]]:
+        """
+        Семантический поиск по локальной векторной базе знаний Radar Scout.
+        :param query: поисковая фраза (по теме задачи, архитектуре или домену).
+        :param category: фильтр: 'all', 'модель', 'датасет', 'репозиторий', 'статья'.
+        :return: список найденных карточек с метаданными.
+        """
+        eff_cat = category if category and category != "all" else ctx.deps.category
+        results = rag_service.search_cards(
+            query=query,
+            category=eff_cat,
+            top_k=ctx.deps.limit,
+            min_score=0.15,
+        )
+        if not results and eff_cat != "all":
+            results = rag_service.search_cards(
+                query=query,
+                category="all",
+                top_k=ctx.deps.limit,
+                min_score=0.15,
+            )
+
+        cards: list[dict[str, Any]] = []
+        compact_payload: list[dict[str, Any]] = []
+        for r in results:
+            c = dict(r["card"])
+            score_val = float(r.get("score", 0.0))
+            c["similarity"] = score_val
+            c["title"] = _clean_card_title(c.get("title", ""))
+            cards.append(c)
+
+            compact_payload.append({
+                "title": c.get("title"),
+                "category": c.get("category"),
+                "url": c.get("url"),
+                "summary": (c.get("summary") or "")[:350],
+                "tags": c.get("tags", [])[:5],
+                "similarity": round(score_val, 2),
+            })
+
+        ctx.deps.retrieved_cards = cards
+        ctx.deps.search_query = query
+        return compact_payload
+
+    @agent.tool
+    def get_leaderboard_data(ctx: RunContext[RagAgentDeps]) -> list[dict[str, Any]]:
+        """Возвращает актуальный снимок лидерборда моделей LMSYS Arena."""
+        ctx.deps.used_leaderboard = True
+        try:
+            snapshots = database.get_all_leaderboard_snapshots()
+            return snapshots[:8] if isinstance(snapshots, list) else []
+        except Exception as e:
+            logger.warning(f"Ошибка получения лидерборда: {e}")
+            return []
+
+    return agent
+
+
+def _safe_run_agent(agent: Agent, prompt: str, **kwargs) -> Any:
+    """Безопасный синхронный вызов PydanticAI-агента даже внутри существующего loop'а FastAPI."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+
+    if loop is not None and loop.is_running():
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            return pool.submit(agent.run_sync, prompt, **kwargs).result()
+    else:
+        return agent.run_sync(prompt, **kwargs)
+
+
+# --- ЛОКАЛЬНЫЙ РЕЗЕРВНЫЙ ПАЙПЛАЙН (КОГДА VLLM ОФФЛАЙН / ДЛЯ ТЕСТОВ) ---
+
 GREETINGS_PATTERNS = {
     "привет", "здравствуй", "здравствуйте", "добрый день", "доброе утро",
     "добрый вечер", "хай", "салам", "ку", "hello", "hi", "hey"
 }
-
 SMALLTALK_PATTERNS = {
     "как дела", "как жизнь", "как ты", "как поживаешь", "как настроение",
     "что делаешь", "че делаешь", "как успехи", "что нового", "как сам",
     "че как", "как оно", "как делишки", "как твои дела", "how are you"
 }
-
 THANKS_PATTERNS = {
     "спасибо", "благодарю", "сенкс", "thanks", "thank you", "отлично", "супер", "класс", "круто"
 }
-
 CONTEXT_QUERY_PATTERNS = [
-    "что мы обсуждали",
-    "что мы уже обсуждали",
-    "что обсуждали",
-    "о чем мы говорили",
-    "о чем говорили",
-    "о чем шла речь",
-    "о чем мы общались",
-    "о чем был наш диалог",
-    "что я спрашивал",
-    "напомни контекст",
-    "напомни о чем",
-    "что было раньше",
-    "что было ранее",
-    "какой контекст",
-    "история диалога",
-    "что ты мне советовал",
-    "что ты советовал",
-    "что ты рекомендовал",
-    "какие модели ты предлагал",
-    "какие датасеты ты предлагал",
-    "что делали",
-    "что мы делали",
-    "что мы делали ранее",
-    "что мы тут делали",
-    "о чем этот чат",
-    "напомни историю",
-    "что мы успели сделать",
-    "что ты нашел ранее",
+    "что мы обсуждали", "что мы уже обсуждали", "что обсуждали", "о чем мы говорили",
+    "о чем говорили", "о чем шла речь", "о чем мы общались", "о чем был наш диалог",
+    "что я спрашивал", "напомни контекст", "напомни о чем", "что было раньше",
+    "что было ранее", "какой контекст", "история диалога", "что ты мне советовал",
+    "что ты советовал", "что ты рекомендовал", "какие модели ты предлагал",
+    "какие датасеты ты предлагал", "что делали", "что мы делали", "что мы делали ранее",
+    "что мы тут делали", "о чем этот чат", "напомни историю", "что мы успели сделать",
+    "что ты нашел ранее"
 ]
-
-CATEGORY_KEYWORDS: dict[str, str] = {
-    "модель": "модель",
-    "модели": "модель",
-    "моделей": "модель",
-    "веса": "модель",
-    "weights": "модель",
-    "датасет": "датасет",
-    "датасеты": "датасет",
-    "датасетов": "датасет",
-    "данные": "датасет",
-    "корпус": "датасет",
-    "репозиторий": "репозиторий",
-    "репозитории": "репозиторий",
-    "репозиториев": "репозиторий",
-    "репо": "репозиторий",
-    "библиотеки": "репозиторий",
-    "библиотека": "репозиторий",
-    "исходники": "репозиторий",
-    "код": "репозиторий",
-    "статья": "статья",
-    "статьи": "статья",
-    "статей": "статья",
-    "пейперс": "статья",
-    "papers": "статья",
-    "arxiv": "статья",
-    "исследования": "статья",
+CATEGORY_KEYWORDS = {
+    "модель": "модель", "модели": "модель", "веса": "модель",
+    "датасет": "датасет", "датасеты": "датасет", "данные": "датасет",
+    "репозиторий": "репозиторий", "репозитории": "репозиторий", "репо": "репозиторий",
+    "статья": "статья", "статьи": "статья", "papers": "статья", "arxiv": "статья",
 }
-
-DOMAIN_KEYWORDS: dict[str, tuple[str, str]] = {
-    "медицин": ("Медицина и Healthcare AI", "анализ медицинских снимков (МРТ/КТ), сегментация патологий, биомедицина и клинические исследования"),
-    "здравоохран": ("Медицина и здравоохранение", "клинические рекомендации, медицинские системы и поддержка врачей"),
-    "клинич": ("Клиническая медицина и здравоохранение", "клинические испытания, протоколы лечения и биоинформатика"),
-    "врач": ("Медицина и здравоохранение", "диагностика, медицинские ассистенты и поддержка принятия решений"),
-    "болезн": ("Медицинская диагностика", "диагностика заболеваний, биомаркеры и анализ симптомов"),
-    "диагност": ("Медицинская диагностика и визуализация", "автоматизированный анализ снимков, МРТ, КТ и рентгена"),
-    "мрт": ("Медицинская визуализация (МРТ/КТ)", "сегментация и анализ томографических снимков"),
-    "биомед": ("Биомедицина и биоинформатика", "генетические исследования, белковые структуры и биомедицинские данные"),
-    "nlp": ("NLP (обработка естественного языка)", "обработка текста, токенизация, языковые модели (LLM) и эмбеддинги"),
-    "нлп": ("NLP (обработка естественного языка)", "обработка текста, токенизация, языковые модели (LLM) и эмбеддинги"),
-    "текст": ("NLP и анализ текста", "классификация, генерация текста, поиск и суммаризация"),
-    "llm": ("Большие языковые модели (LLM)", "генеративный AI, трансформеры и диалоговые ассистенты"),
-    "cv": ("Компьютерное зрение (Computer Vision)", "детекция объектов, сегментация и генерация изображений"),
-    "зрение": ("Компьютерное зрение (Computer Vision)", "детекция объектов, сегментация и визуальные энкодеры"),
-    "картинк": ("Компьютерное зрение (Computer Vision)", "работа с изображениями и диффузионными моделями"),
-    "аудио": ("Аудио и речевые технологии (Speech & Audio)", "распознавание речи (ASR), синтез (TTS) и обработка звука"),
-    "реч": ("Аудио и речевые технологии (Speech & Audio)", "распознавание речи (ASR) и синтез голоса (TTS)"),
-    "whisper": ("Распознавание речи (Whisper / ASR)", "транскрипция аудио и речевые модели"),
-    "машинное обучение": ("Машинное обучение (Machine Learning)", "фундаментальные алгоритмы, моделирование и анализ данных"),
-    "обучени": ("Машинное и глубокое обучение", "обучение и оптимизация нейросетевых моделей"),
-    "глубокое обучение": ("Глубокое обучение (Deep Learning)", "многослойные нейросети, PyTorch и оптимизация"),
-    "mlops": ("MLOps и инференс", "оптимизация, деплой, vLLM, мониторинг и обслуживание моделей"),
-    "кибератак": ("Кибербезопасность и анализ угроз", "выявление аномалий, сетевых атак и безопасность AI"),
-    "безопасност": ("Информационная безопасность и детекция угроз", "анализ уязвимостей и классификация сетевого трафика"),
-    "табличн": ("Табличные данные и классический ML", "градиентный бустинг, CatBoost, XGBoost и Scikit-learn"),
-    "финанс": ("Финансы и Финтех AI", "финансовый скоринг, анализ временных рядов и трейдинг"),
-    "робот": ("Робототехника и автономные системы", "управление манипуляторами, навигация и SLAM"),
-}
-
-STOP_WORDS = {
-    "привет", "здравствуй", "здравствуйте", "добрый", "день", "утро", "вечер", "хай", "салам", "ку",
-    "спасибо", "благодарю", "сенкс", "thanks", "thank", "you", "отлично", "супер", "класс", "круто",
-    "дела", "как", "жизнь", "настроение", "успехи", "поживаешь", "делаешь", "нового", "сам", "оно",
-    "модель", "модели", "датасет", "датасеты", "репо", "репозиторий", "репозитории",
-    "статья", "статьи", "papers", "что", "где", "кто", "куда", "откуда", "почему", "зачем",
-    "покажи", "найди", "посоветуй", "подскажи", "расскажи", "скажи", "дай",
-    "хочу", "нужно", "надо", "можно", "есть", "было", "были", "будет", "будут",
-    "да", "нет", "ок", "еще", "ещё", "ранее", "обсуждали", "делали", "говорили", "тема",
-    "вопрос", "ответ", "помоги", "помощь", "это", "этот", "эта", "эти", "тот", "та", "те",
-    "все", "всё", "тоже", "также", "очень", "просто"
-}
-
-
-def _strip_repeated_greetings(text: str) -> str:
-    """Удаляет повторные приветствия («Привет!», «Здравствуйте!» и т.д.) из начала ответа в продолжающемся диалоге."""
-    if not text:
-        return text
-    pattern = r"^(Привет[!\.,\s]*|Здравствуйте[!\.,\s]*|Добрый день[!\.,\s]*|Доброго времени суток[!\.,\s]*|Hello[!\.,\s]*|Hi[!\.,\s]*)+"
-    cleaned = re.sub(pattern, "", text.strip(), flags=re.IGNORECASE).strip()
-    if cleaned and cleaned[0].islower():
-        cleaned = cleaned[0].upper() + cleaned[1:]
-    return cleaned if cleaned else text
-
-
-def _extract_conversation_topics(history: list[dict[str, str]]) -> list[str]:
-    """Извлекает содержательные темы из предшествующих реплик пользователя (без смолл-тока и стоп-слов)."""
-    topics = []
-    for m in history:
-        if m.get("role") == "user":
-            txt = m.get("content", "").strip().lower()
-            if _is_greeting(txt) or _is_smalltalk(txt) or _is_thanks(txt) or _is_context_query(txt):
-                continue
-            words = [re.sub(r"[^\w\s-]", "", w) for w in txt.split()]
-            meaningful = [w for w in words if len(w) > 2 and w not in STOP_WORDS]
-            if meaningful:
-                topics.append(" ".join(meaningful))
-    return topics
 
 
 def _is_greeting(text: str) -> bool:
     cleaned = re.sub(r"[^\w\s]", "", text.strip().lower())
     words = cleaned.split()
-    if not words:
-        return True
-    if any(w in GREETINGS_PATTERNS for w in words[:2]):
-        return True
-    capabilities = ["что ты умеешь", "что ты можешь", "кто ты", "как пользоваться", "помощь", "что здесь есть", "какие данные"]
-    if any(c in cleaned for c in capabilities):
-        return True
-    return False
+    return bool(words and any(w in GREETINGS_PATTERNS for w in words[:2]))
 
 
 def _is_smalltalk(text: str) -> bool:
-    """Проверяет реплики повседневного общения (как дела, как жизнь и т.д.)."""
     cleaned = re.sub(r"[^\w\s]", " ", text.strip().lower())
     cleaned = " ".join(cleaned.split())
     if any(cleaned == p or cleaned.startswith(f"{p} ") or cleaned.endswith(f" {p}") for p in SMALLTALK_PATTERNS):
         return True
-    if re.search(r"\bкак\s+(твои\s+)?(дела|жизнь|настроение|успехи|ты|оно)\b", cleaned):
-        return True
-    if re.search(r"\b(что|че)\s+(делаешь|нового)\b", cleaned):
-        return True
-    return False
-
-
-def _is_thanks(text: str) -> bool:
-    cleaned = re.sub(r"[^\w\s]", "", text.strip().lower())
-    words = cleaned.split()
-    if len(words) <= 3 and any(w in THANKS_PATTERNS for w in words):
-        return True
-    return False
+    return bool(re.search(r"\bкак\s+(твои\s+)?(дела|жизнь|настроение|успехи|ты|оно)\b", cleaned))
 
 
 def _is_context_query(text: str) -> bool:
-    """Определяет, спрашивает ли пользователь о предыдущем контексте / истории текущего диалога."""
     cleaned = re.sub(r"[^\w\s]", " ", text.strip().lower())
     cleaned = " ".join(cleaned.split())
     if any(p in cleaned for p in CONTEXT_QUERY_PATTERNS):
         return True
-    if re.search(r"(что|о чем).*(мы\s+)?(обсуждали|говорили|спрашивал|делали)", cleaned):
-        return True
-    if re.search(r"напомни.*(контекст|диалог|вопрос|тему|истори)", cleaned):
-        return True
-    if re.search(r"истори[яи].*диалог", cleaned):
-        return True
-    return False
-
-
-def _analyze_dialogue_state(history: list[dict[str, str]]) -> dict[str, Any]:
-    """
-    Анализирует всю историю сообщений для поддержания единого контекста диалога:
-    - активный домен (NLP, CV, Audio, ML, MLOps, CyberSec, Медицина)
-    - активная категория (модель, датасет, репозиторий, статья)
-    - хронология переходов пользователя
-    """
-    detected_domains: list[str] = []
-    domain_description = "машинное обучение и искусственный интеллект"
-    active_category = "all"
-    categories_history: list[str] = []
-
-    for m in history:
-        if m.get("role") == "user":
-            txt = m.get("content", "").strip().lower()
-            if _is_smalltalk(txt) or _is_greeting(txt) or _is_thanks(txt):
-                continue
-
-            # Анализ категории
-            for kw, cat in CATEGORY_KEYWORDS.items():
-                if re.search(rf"\b{kw}\b", txt):
-                    active_category = cat
-                    if cat not in categories_history:
-                        categories_history.append(cat)
-                    break
-
-            # Анализ домена
-            for kw, (d_name, d_desc) in DOMAIN_KEYWORDS.items():
-                if kw in txt:
-                    if d_name not in detected_domains:
-                        detected_domains.append(d_name)
-                    domain_description = d_desc
-
-    main_domain = detected_domains[-1] if detected_domains else "Машинное обучение"
-
-    return {
-        "main_domain": main_domain,
-        "domain_description": domain_description,
-        "all_domains": detected_domains,
-        "active_category": active_category,
-        "categories_history": categories_history,
-    }
-
-
-def _clean_summary(summary: str, max_len: int = 350) -> str:
-    """Аккуратно обрезает описание по границе предложения или слова, никогда не срезая слово на полубукве."""
-    if not summary:
-        return ""
-    clean = re.sub(r"\s+", " ", summary).strip()
-    if len(clean) <= max_len:
-        return clean
-    truncated = clean[:max_len]
-    last_dot = max(truncated.rfind(". "), truncated.rfind("! "), truncated.rfind("? "))
-    if last_dot > 120:
-        return truncated[:last_dot + 1].strip()
-    last_space = truncated.rfind(" ")
-    if last_space > 100:
-        return truncated[:last_space].strip() + "..."
-    return truncated.strip() + "..."
+    return bool(re.search(r"(что|о чем).*(мы\s+)?(обсуждали|говорили|спрашивал|делали)|напомни.*(контекст|диалог|вопрос|истори)", cleaned))
 
 
 def _format_context_summary(history_turns: list[dict[str, str]]) -> str:
-    """Формирует КРАТКУЮ СВЯЗНУЮ ВЫЖИМКУ из диалога в стиле Gemini (без механического копирования реплик по номерам)."""
     if not history_turns:
         return (
             "В этом диалоге мы ещё ничего не обсуждали — это совершенно новый диалог! 🚀\n\n"
@@ -283,400 +278,151 @@ def _format_context_summary(history_turns: list[dict[str, str]]) -> str:
             "• **Модели** (Hugging Face, LMSYS Arena)\n"
             "• **Датасеты** (Kaggle, Hugging Face Datasets)\n"
             "• **Репозитории** (GitHub Trending)\n"
-            "• **Научные статьи** (ArXiv, Papers with Code)\n\n"
-            "О чем вы хотите узнать?"
+            "• **Научные статьи** (ArXiv, Papers with Code)"
         )
+    user_topics = []
+    for m in history_turns:
+        if m.get("role") == "user":
+            txt = m.get("content", "").strip()
+            if not _is_greeting(txt) and not _is_smalltalk(txt) and not _is_context_query(txt):
+                if txt.lower() in ("нлп", "nlp"):
+                    user_topics.append("NLP (обработка естественного языка)")
+                elif "машинн" in txt.lower() or "обучен" in txt.lower():
+                    user_topics.append("машинное обучение")
+                else:
+                    user_topics.append(txt)
 
-    state = _analyze_dialogue_state(history_turns)
-    main_domain = state["main_domain"]
-    domains = state["all_domains"]
-    cats = state["categories_history"]
-    topics = _extract_conversation_topics(history_turns)
-
-    cat_names_map = {
-        "репозиторий": "репозитории с исходным кодом",
-        "модель": "актуальные модели и веса",
-        "датасет": "профильные датасеты",
-        "статья": "исследовательские статьи",
-    }
-    cat_phrases = [cat_names_map.get(c, c) for c in cats]
-
-    summary_parts = []
     unique_topics = []
-    for t in topics:
+    for t in user_topics:
         if t not in unique_topics:
             unique_topics.append(t)
 
-    if unique_topics:
-        topic_highlight = ", ".join(unique_topics[:3])
-        if domains and main_domain.lower() not in topic_highlight.lower():
-            summary_parts.append(
-                f"В этом диалоге мы исследовали задачи по направлению **{topic_highlight}** "
-                f"в рамках темы **{main_domain}**."
-            )
-        else:
-            summary_parts.append(
-                f"В этом диалоге мы исследовали задачи по теме **{topic_highlight}**."
-            )
-    elif domains:
-        domains_str = " и ".join(domains[:2])
-        summary_parts.append(
-            f"В этом диалоге мы исследовали направление **{domains_str}**."
-        )
-    else:
-        summary_parts.append(
-            f"В этом диалоге мы сфокусировались на теме **{main_domain}**."
-        )
-
-    if cat_phrases:
-        if len(cat_phrases) == 1:
-            summary_parts.append(f"В процессе мы подобрали и проанализировали **{cat_phrases[0]}**.")
-        else:
-            first_cats = ", ".join(cat_phrases[:-1])
-            summary_parts.append(f"В процессе мы сначала подобрали **{first_cats}**, а затем рассмотрели **{cat_phrases[-1]}**.")
-    else:
-        summary_parts.append("Мы изучили наиболее востребованные материалы каталога по этому направлению.")
-
-    summary_text = " ".join(summary_parts)
-
+    topic_str = ", ".join(unique_topics) if unique_topics else "машинное обучение"
     return (
         f"**Краткая выжимка нашего диалога:**\n\n"
-        f"{summary_text}\n\n"
-        f"Все найденные карточки зафиксированы в этой вкладке чата. "
-        f"Вы можете продолжить эту тему, углубиться в конкретные параметры или перейти к новому вопросу!"
+        f"В этом диалоге мы исследовали задачи и подбирали материалы по темам: **{topic_str}**.\n\n"
+        f"Все найденные карточки зафиксированы в этой вкладке чата. Вы можете продолжить эту тему или задать новый вопрос!"
     )
 
 
-# --- СИСТЕМНАЯ ИНСТРУКЦИЯ (GEMINI-ПОДОБНЫЙ ЭКСПЕРТ РАДАРА) ---
-RADAR_AI_SYSTEM_INSTRUCTION = """Ты — интеллектуальный персональный AI-ассистент сервиса AI/ML Radar Scout, созданный на базе передовых моделей уровня Gemini.
-Ты обладаешь глубокими экспертными знаниями во ВСЕХ сферах современного искусственного интеллекта и анализа данных:
-- Компьютерное зрение (Computer Vision): сегментация, детекция объектов, медицинская визуализация (МРТ, КТ, рентген), генерация изображений.
-- Медицина и биоинформатика: анализ снимков, патологии, клинические датасеты, генетика.
-- Аудио и речь (Speech & Audio): распознавание речи (ASR, Whisper), синтез речи (TTS), аудиоанализ.
-- Табличные данные и классический ML: градиентный бустинг (CatBoost, XGBoost), скоринг, регрессия, временные ряды.
-- Робототехника и обучение с подкреплением (RL): управление, навигация, автономные системы.
-- Большие языковые модели (LLM) и NLP: обработка текста, токенизация (ТОЛЬКО если пользователь явно спрашивает про текст/NLP).
-- MLOps и инфраструктура: vLLM, TensorRT, квантование (GGUF, AWQ, FP8), мониторинг.
-
-КАТЕГОРИЧЕСКИЙ ЗАПРЕТ НА НАВЯЗЫВАНИЕ NLP:
-- Каталог Radar Scout охватывает все направления ИИ, а НЕ только NLP!
-- НИКОГДА не своди ответ пользователя к NLP или языковым моделям, если пользователь явно не попросил именно NLP/текст!
-- Если пользователь спрашивает про «медицину» — отвечай строго в контексте медицины (анализ снимков, МРТ/КТ, гистология, клинические датасеты). Категорически запрещено писать фразы вроде «Если ваша цель — медицинский NLP...»! Медицинский AI — это прежде всего анализ медицинских изображений и клинических данных!
-- Если пользователь спрашивает про «компьютерное зрение» — отвечай строго про CV.
-- Если пользователь спрашивает про «звук / речь» — отвечай строго про аудио.
-
-ПРАВИЛА ДИАЛОГА И КОНТЕКСТА:
-1. ПОЛНАЯ ПАМЯТЬ ДИАЛОГА:
-   - Всегда помни весь контекст беседы. Если пользователь развивает тему или пишет короткое уточнение («модели», «репо», «датасеты»), отвечай строго в рамках текущей обсуждаемой темы.
-   - НИКОГДА не здоровайся повторно («Привет!», «Здравствуйте!»), если беседа уже идет.
-   - Если пользователь спрашивает, о чем говорили ранее, дай естественную выжимку в 2-3 предложениях без списков и номеров.
-
-2. РАБОТА С КАТАЛОГОМ И РЕКОМЕНДАЦИЯМИ:
-   - Когда в запросе предоставлены найденные карточки каталога, детально используй их в ответе: объясняй, чем они хороши, под какие сценарии подходят, сравнивай их.
-   - Для КАЖДОЙ рекомендуемой карточки обязательно делай кликабельную Markdown-ссылку в формате [Название карточки](url).
-   - Если точных готовых моделей по теме нет, но есть профильные датасеты или научные статьи из каталога — порекомендуй их и объясни, как они помогают решить задачу.
-
-3. ОФОРМЛЕНИЕ И ЗАВЕРШЕННОСТЬ:
-   - Никогда не обрывай ответ на полуслове.
-   - Форматируй ответ в красивом GitHub Markdown: заголовки ##, жирный шрифт, списки, таблицы и блоки кода."""
-
-
-def _call_gemini(messages: list[dict[str, str]], system_instruction: str, max_tokens: int = 3500) -> str | None:
-    """Вызов Gemini API через официальный SDK google.genai (если ключ предоставлен)."""
-    if not config.GEMINI_API_KEY:
-        return None
-    try:
-        from google import genai
-        from google.genai import types
-
-        client = genai.Client(api_key=config.GEMINI_API_KEY)
-
-        contents = []
-        for m in messages:
-            role = "user" if m.get("role") == "user" else "model"
-            text_part = m.get("content", "").strip()
-            if text_part:
-                contents.append(types.Content(role=role, parts=[types.Part.from_text(text=text_part)]))
-
-        if not contents:
-            return None
-
-        cfg = types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            temperature=0.3,
-            max_output_tokens=max_tokens,
-        )
-
-        resp = client.models.generate_content(
-            model=config.GEMINI_MODEL_NAME,
-            contents=contents,
-            config=cfg,
-        )
-        return resp.text
-    except Exception as e:
-        logger.debug(f"Gemini API не используется или не настроен ({e})")
-        return None
-
-
-def _call_openai_or_vllm(messages: list[dict[str, str]], system_instruction: str, max_tokens: int = 3500) -> str | None:
-    """Вызов OpenAI или локального vLLM-сервера (если настроен)."""
-    if config.OPENAI_API_KEY:
-        try:
-            client = OpenAI(
-                api_key=config.OPENAI_API_KEY,
-                base_url=config.OPENAI_BASE_URL or None,
-            )
-            chat_messages = [{"role": "system", "content": system_instruction}] + messages
-            completion = client.chat.completions.create(
-                model=config.OPENAI_MODEL_NAME,
-                messages=chat_messages,
-                temperature=0.3,
-                max_tokens=max_tokens,
-            )
-            return completion.choices[0].message.content
-        except Exception as e:
-            logger.debug(f"OpenAI API не используется ({e})")
-
-    if config.VLLM_BASE_URL:
-        try:
-            timeout_cfg = httpx.Timeout(connect=2.5, read=90.0, write=10.0, pool=10.0)
-            client = OpenAI(
-                base_url=config.VLLM_BASE_URL,
-                api_key=config.VLLM_API_KEY or "not-needed",
-                http_client=httpx.Client(timeout=timeout_cfg),
-            )
-            chat_messages = [{"role": "system", "content": system_instruction}] + messages
-            completion = client.chat.completions.create(
-                model=config.VLLM_MODEL_NAME,
-                messages=chat_messages,
-                temperature=0.3,
-                max_tokens=max_tokens,
-            )
-            return completion.choices[0].message.content
-        except Exception as e:
-            logger.debug(f"vLLM недоступен: {e}")
-
-    return None
-
-
-def _call_llm(messages: list[dict[str, str]], system_instruction: str, max_tokens: int = 3500) -> str | None:
-    """Универсальный вызов опционального внешнего LLM-провайдера."""
-    ans = _call_gemini(messages, system_instruction, max_tokens)
-    if ans:
-        return ans
-    return _call_openai_or_vllm(messages, system_instruction, max_tokens)
-
-
-def _build_local_expert_response(
-    search_query: str,
-    dialogue_state: dict[str, Any],
-    results: list[dict[str, Any]],
-    is_follow_up: bool = False,
-) -> str:
+def _local_fallback_dialogue(
+    history: list[dict[str, str]],
+    category_filter: str = "all",
+    max_sources: int = 5,
+) -> dict[str, Any]:
     """
-    Генерирует интеллектуальный, связный, экспертный ответ в стиле Gemini
-    на основе найденных материалов каталога Radar Scout, без необходимости во внешних нейросетях.
+    Резервный локальный обработчик (срабатывает, если vLLM временно выключен).
     """
-    if not results:
-        return (
-            f"По направлению **«{search_query}»** точных совпадений в базе знаний пока не найдено.\n\n"
-            "💡 **Рекомендация:**\n"
-            "- Попробуйте сформулировать запрос шире (например, *«компьютерное зрение»*, *«медицинские датасеты»*, *«аудиомодели»* или *«классификатор табличных данных»*)\n"
-            "- Либо сбросьте фильтр категорий на **«Все типы»** для поиска по всей экосистеме сервиса."
+    last_user_msg = history[-1]["content"].strip()
+    prior_history = history[:-1]
+
+    if _is_context_query(last_user_msg):
+        return {
+            "role": "assistant",
+            "content": _format_context_summary(prior_history),
+            "action": "chat",
+            "search_query": None,
+            "cards": [],
+            "error": None,
+        }
+
+    if _is_smalltalk(last_user_msg):
+        return {
+            "role": "assistant",
+            "content": "Спасибо, всё отлично! Я на связи и готов помочь с подбором моделей, датасетов и статей в Radar Scout. Какую задачу решаем?",
+            "action": "chat",
+            "search_query": None,
+            "cards": [],
+            "error": None,
+        }
+
+    if _is_greeting(last_user_msg):
+        return {
+            "role": "assistant",
+            "content": "Привет! 👋 Я ассистент каталога AI/ML Radar Scout. Готов найти нужные модели, датасеты, репозитории и статьи. О чем вы хотите узнать?",
+            "action": "chat",
+            "search_query": None,
+            "cards": [],
+            "error": None,
+        }
+
+    # Определение категории и поискового запроса для фоллбэка
+    search_cat = category_filter
+    search_query = last_user_msg
+    last_clean = re.sub(r"[^\w\s]", "", last_user_msg.lower()).strip()
+
+    for kw, cat in CATEGORY_KEYWORDS.items():
+        if last_clean == kw or last_clean == f"а {kw}" or last_clean == f"покажи {kw}":
+            search_cat = cat
+            for m in reversed(prior_history):
+                if m.get("role") == "user":
+                    prev_text = m.get("content", "").strip()
+                    if not _is_greeting(prev_text) and not _is_smalltalk(prev_text):
+                        search_query = f"{prev_text} {cat}"
+                        break
+            break
+
+    results = rag_service.search_cards(
+        query=search_query,
+        category=search_cat,
+        top_k=max_sources,
+        min_score=0.15,
+    )
+    if not results and search_cat != "all":
+        results = rag_service.search_cards(
+            query=search_query,
+            category="all",
+            top_k=max_sources,
+            min_score=0.15,
         )
 
-    main_domain = dialogue_state["main_domain"]
-    domain_desc = dialogue_state["domain_description"]
-
-    # Иконки для доменов
-    domain_icons = {
-        "Медицина и Healthcare AI": "🏥",
-        "Клиническая медицина и здравоохранение": "🩺",
-        "Медицинская диагностика и визуализация": "🔬",
-        "Медицинская диагностика": "💊",
-        "Медицинская визуализация (МРТ/КТ)": "🔬",
-        "Биомедицина и биоинформатика": "🧬",
-        "NLP (обработка естественного языка)": "🧠",
-        "NLP и анализ текста": "📝",
-        "Большие языковые модели (LLM)": "🤖",
-        "Компьютерное зрение (Computer Vision)": "👁",
-        "Аудио и речевые технологии (Speech & Audio)": "🎙",
-        "Машинное обучение (Machine Learning)": "⚙️",
-        "Машинное и глубокое обучение": "🔬",
-        "MLOps и инференс": "⚡",
-        "Кибербезопасность и анализ угроз": "🛡",
-        "Табличные данные и классический ML": "📊",
-        "Финансы и Финтех AI": "📈",
-        "Робототехника и автономные системы": "🤖",
-    }
-    icon = domain_icons.get(main_domain, "🚀")
-
-    # Определяем, какие категории реально найдены в результатах
-    found_categories = set(r["card"].get("category", "") for r in results)
-
-    heading = f"### {icon} {main_domain}"
-
-    if len(found_categories) == 1:
-        single_cat = list(found_categories)[0]
-        if single_cat == "статья":
-            intro = f"По направлению **{main_domain}** в каталоге сервиса подобраны ключевые научные статьи и исследования:"
-        elif single_cat == "модель":
-            intro = f"По направлению **{main_domain}** в каталоге сервиса подобраны актуальные предобученные модели и веса:"
-        elif single_cat == "репозиторий":
-            intro = f"Для разработки и реализации задач по направлению **{main_domain}** рекомендую следующие открытые библиотеки и инструменты:"
-        elif single_cat == "датасет":
-            intro = f"Для обучения и валидации решений по направлению **{main_domain}** в каталоге найдены следующие размеченные датасеты:"
-        else:
-            intro = f"В каталоге сервиса по теме **{main_domain}** найдены следующие материалы:"
-    else:
-        intro = f"По направлению **{main_domain}** в каталоге сервиса собраны проверенные материалы, охватывающие модели, исходный код и исследования:"
-
-    # Детальное представление карточек
-    cards_md = []
-    sample_model_id = None
-    sample_repo_url = None
-    sample_dataset_title = None
-
+    cards = []
+    card_blocks = []
     for i, r in enumerate(results, start=1):
-        c = r["card"]
-        score_pct = int(r["score"] * 100)
-        raw_title = c.get("title", f"Материал #{i}").strip()
+        c = dict(r["card"])
+        clean_title = _clean_card_title(c.get("title", f"Материал #{i}"))
+        c["title"] = clean_title
+        cards.append(c)
+
         url = c.get("url", "#")
         c_type = c.get("category", "материал").upper()
-        metrics = c.get("metrics") or {}
-        summary = (c.get("summary") or "").strip()
-        tags = c.get("tags") or []
+        summary = (c.get("summary") or "")[:350].strip()
+        score_pct = int(r.get("score", 0.0) * 100)
 
-        # Очистка названия от двойных скобок типа [[PwC] Title]
-        clean_title = re.sub(r"^\[(.*?)\]\s*", r"\1: ", raw_title)
-        clean_title = clean_title.replace("[", "(").replace("]", ")")
-        clean_title = re.sub(r"\s+", " ", clean_title).strip()
-
-        if not sample_model_id and c.get("category") == "модель":
-            sample_model_id = clean_title
-        if not sample_repo_url and c.get("category") == "репозиторий":
-            sample_repo_url = url
-        if not sample_dataset_title and c.get("category") == "датасет":
-            sample_dataset_title = clean_title
-
-        # Метрики
-        badges = [f"📂 **{c_type}**", f"🎯 **{score_pct}% релевантность**"]
-        if metrics.get("stars"):
-            badges.append(f"⭐ **{metrics['stars']}** звёзд")
-        if metrics.get("downloads"):
-            badges.append(f"📥 **{metrics['downloads']}** скачиваний")
-        badges_str = " · ".join(badges)
-
-        # Теги
-        tags_str = " ".join([f"`#{t}`" for t in tags[:5]]) if tags else ""
-
-        # Аккуратная выжимка без обрыва слов
-        desc_clean = _clean_summary(summary, max_len=350)
-
-        card_block = (
+        card_blocks.append(
             f"#### {i}. [{clean_title}]({url})\n\n"
-            f"{badges_str}\n\n"
-            f"{desc_clean}\n"
-        )
-        if tags_str:
-            card_block += f"\n🏷 **Теги:** {tags_str}\n"
-
-        cards_md.append(card_block)
-
-    cards_section = "\n---\n".join(cards_md)
-
-    # Инженерный блок быстрого старта (Quickstart Snippet)
-    snippet_section = ""
-    domain_lower = main_domain.lower()
-    if "модель" in found_categories and sample_model_id:
-        if any(w in domain_lower for w in ["cv", "зрени", "картинк", "изображен"]):
-            snippet_section = (
-                f"\n\n```python\n"
-                f"# Загрузка визуальной модели через Hugging Face Transformers\n"
-                f"from transformers import AutoImageProcessor, AutoModelForImageClassification\n"
-                f"from PIL import Image\n\n"
-                f"processor = AutoImageProcessor.from_pretrained(\"{sample_model_id}\")\n"
-                f"model = AutoModelForImageClassification.from_pretrained(\"{sample_model_id}\")\n"
-                f"```\n"
-            )
-        elif any(w in domain_lower for w in ["аудио", "реч", "whisper", "звук"]):
-            snippet_section = (
-                f"\n\n```python\n"
-                f"# Запуск аудиомодели через Transformers\n"
-                f"from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq\n\n"
-                f"processor = AutoProcessor.from_pretrained(\"{sample_model_id}\")\n"
-                f"model = AutoModelForSpeechSeq2Seq.from_pretrained(\"{sample_model_id}\")\n"
-                f"```\n"
-            )
-        elif any(w in domain_lower for w in ["табличн", "бустинг", "классификатор"]):
-            snippet_section = (
-                f"\n\n```python\n"
-                f"# Загрузка классификатора табличных данных\n"
-                f"import joblib\n"
-                f"model = joblib.load(\"model.joblib\")\n"
-                f"predictions = model.predict(X_test)\n"
-                f"```\n"
-            )
-        elif any(w in domain_lower for w in ["медицин", "диагност"]):
-            snippet_section = (
-                f"\n\n```python\n"
-                f"# Пайплайн обработки медицинских снимков\n"
-                f"import torch\n"
-                f"from transformers import AutoProcessor, AutoModel\n\n"
-                f"processor = AutoProcessor.from_pretrained(\"{sample_model_id}\")\n"
-                f"model = AutoModel.from_pretrained(\"{sample_model_id}\")\n"
-                f"```\n"
-            )
-        elif any(w in domain_lower for w in ["nlp", "нлп", "текст", "llm", "язык"]):
-            snippet_section = (
-                f"\n\n```python\n"
-                f"# Инференс языковой модели через Hugging Face Transformers\n"
-                f"from transformers import AutoModelForCausalLM, AutoTokenizer\n"
-                f"import torch\n\n"
-                f"model_name = \"{sample_model_id}\"\n"
-                f"tokenizer = AutoTokenizer.from_pretrained(model_name)\n"
-                f"model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16, device_map=\"auto\")\n"
-                f"```\n"
-            )
-        else:
-            snippet_section = (
-                f"\n\n```python\n"
-                f"# Быстрый запуск модели из каталога\n"
-                f"from transformers import AutoModel\n\n"
-                f"model = AutoModel.from_pretrained(\"{sample_model_id}\")\n"
-                f"```\n"
-            )
-    elif "репозиторий" in found_categories and sample_repo_url and sample_repo_url != "#":
-        snippet_section = (
-            f"\n\n```bash\n"
-            f"# Установка и запуск окружения репозитория\n"
-            f"git clone {sample_repo_url}\n"
-            f"cd $(basename {sample_repo_url} .git)\n"
-            f"pip install -r requirements.txt\n"
-            f"```\n"
-        )
-    elif "датасет" in found_categories and sample_dataset_title:
-        snippet_section = (
-            f"\n\n```python\n"
-            f"# Загрузка датасета через библиотеку Datasets\n"
-            f"from datasets import load_dataset\n\n"
-            f"dataset = load_dataset(\"{sample_dataset_title}\")\n"
-            f"print(dataset[\"train\"][0])\n"
-            f"```\n"
+            f"📂 **{c_type}** · 🎯 **{score_pct}% релевантность**\n\n"
+            f"{summary}\n"
         )
 
-    # Дальнейшие шаги оформлены стандартным Markdown-списком с пустыми строками
-    next_steps = (
-        "\n\n💡 **Что мы можем сделать дальше?**\n\n"
-        "- **Углубиться в архитектуру:** могу подробнее разобрать устройство и бенчмарки любой из этих карточек\n"
-        "- **Подобрать смежные данные:** найти подходящие датасеты для дообучения или открытый код инференса\n"
-        "- **Написать пайплайн:** составить готовый скрипт под вашу конкретную прикладную задачу\n\n"
-        "Просто напишите, куда двигаемся дальше!"
+    if not results:
+        return {
+            "role": "assistant",
+            "content": f"По направлению **«{search_query}»** в каталоге пока ничего не найдено. Попробуйте сформулировать запрос иначе.",
+            "action": "search",
+            "search_query": search_query,
+            "cards": [],
+            "error": None,
+        }
+
+    text_resp = (
+        f"### Материалы по направлению «{search_query}»\n\n"
+        f"В каталоге Radar Scout найдены следующие материалы:\n\n"
+        + "\n---\n".join(card_blocks)
+        + "\n\n💡 Могу подробнее рассказать о любой из этих карточек или подобрать код запуска!"
     )
 
-    full_response = f"{heading}\n\n{intro}\n\n{cards_section}{snippet_section}{next_steps}"
-    return full_response
+    return {
+        "role": "assistant",
+        "content": text_resp,
+        "action": "search",
+        "search_query": search_query,
+        "cards": cards,
+        "error": None,
+    }
 
+
+# --- ГЛАВНАЯ ТОЧКА ВХОДА ДИАЛОГА ---
 
 def process_dialogue(
     history: list[dict[str, str]],
@@ -685,21 +431,10 @@ def process_dialogue(
     top_k: int | None = None,
 ) -> dict[str, Any]:
     """
-    Основной метод обработки одного шага диалога в стиле Gemini с заземлением на данные Radar.
-
-    :param history: список сообщений [{'role': 'user'|'assistant', 'content': '...'}, ...]
-    :param category_filter: фильтр категории ('all', 'датасет', 'модель', и т.д.)
-    :param max_sources: количество источников для поиска в базе
-    :param top_k: обратная совместимость (alias для max_sources)
-    :return: dict со структурой:
-        {
-            "role": "assistant",
-            "content": str,
-            "action": "chat" | "clarify" | "search",
-            "search_query": str | None,
-            "cards": list[dict],
-            "error": str | None
-        }
+    Основной метод обработки одного шага диалога:
+    - Задействует автономного PydanticAI-агента на Qwen 3.6 27B с Function Calling.
+    - Агент самостоятельно принимает решение о необходимости поиска по базе знаний.
+    - В случае недоступности vLLM мгновенно переключается на чистый локальный резерв.
     """
     effective_limit = top_k if top_k is not None else max_sources
 
@@ -714,187 +449,46 @@ def process_dialogue(
         }
 
     last_user_msg = history[-1]["content"].strip()
-    prior_history = history[:-1]
 
-    # --- 1. Проверка вопроса о контексте диалога ---
-    if _is_context_query(last_user_msg):
-        return {
-            "role": "assistant",
-            "content": _format_context_summary(prior_history),
-            "action": "chat",
-            "search_query": None,
-            "cards": [],
-            "error": None,
-        }
+    # 1. Если vLLM онлайн — отдаем управление умному агенту PydanticAI с Qwen 3.6 27B
+    if _is_vllm_online():
+        try:
+            deps = RagAgentDeps(category=category_filter, limit=effective_limit)
+            agent = _create_rag_agent()
 
-    # --- 2. Повседневное общение (смолл-ток) ---
-    if _is_smalltalk(last_user_msg):
-        return {
-            "role": "assistant",
-            "content": "Спасибо, всё отлично! Я на связи и готов помочь с анализом и подбором материалов в каталоге Radar Scout. Ищете модели, датасеты, открытые репозитории или статьи по конкретной задаче?",
-            "action": "chat",
-            "search_query": None,
-            "cards": [],
-            "error": None,
-        }
+            model_history: list[ModelMessage] = []
+            for m in history[:-1]:
+                role = m.get("role", "")
+                cnt = m.get("content", "").strip()
+                if not cnt:
+                    continue
+                if role == "user":
+                    model_history.append(ModelRequest(parts=[UserPromptPart(content=cnt)]))
+                elif role == "assistant":
+                    model_history.append(ModelResponse(parts=[TextPart(content=cnt)]))
 
-    # --- 3. Приветствия и благодарности ---
-    if _is_greeting(last_user_msg):
-        if len(history) <= 2:
-            return {
-                "role": "assistant",
-                "content": (
-                    "Привет! 👋 Я интеллектуальный AI-ассистент сервиса AI/ML Radar Scout.\n\n"
-                    "Я работаю как современная экспертная модель и глубоко интегрирован с актуальной базой знаний:\n"
-                    "• **Лидерборд LMSYS Arena** (рейтинги лучших LLM)\n"
-                    "• **Модели Hugging Face** (трендовые релизы и RU-сегмент)\n"
-                    "• **Датасеты** (Kaggle, Hugging Face Datasets)\n"
-                    "• **Репозитории** (GitHub Trending)\n"
-                    "• **Препринты и статьи** (ArXiv, Papers with Code)\n\n"
-                    "Вы можете задать мне любой вопрос по машинному обучению или описать задачу "
-                    "(например: *«подбери датасеты для сегментации медицинских снимков»*, *«какие открытые модели сейчас лидируют в CV и зрении?»* или *«найди репозитории по MLOps и vLLM»*) — и я помогу!"
-                ),
-                "action": "chat",
-                "search_query": None,
-                "cards": [],
-                "error": None,
-            }
-        else:
-            return {
-                "role": "assistant",
-                "content": "Привет! Чем могу помочь? Ищете модели, датасеты, открытые репозитории или статьи по конкретной теме?",
-                "action": "chat",
-                "search_query": None,
-                "cards": [],
-                "error": None,
-            }
-
-    if _is_thanks(last_user_msg):
-        return {
-            "role": "assistant",
-            "content": "Рад помочь! Если появятся новые вопросы или понадобятся сравнения моделей и датасетов — обращайтесь! 🚀",
-            "action": "chat",
-            "search_query": None,
-            "cards": [],
-            "error": None,
-        }
-
-    # --- 4. Определение контекста, домена и поискового запроса ---
-    state = _analyze_dialogue_state(history)
-    last_clean = re.sub(r"[^\w\s]", "", last_user_msg.lower()).strip()
-
-    detected_cat = None
-    for kw, cat in CATEGORY_KEYWORDS.items():
-        if last_clean == kw or last_clean == f"а {kw}" or last_clean == f"покажи {kw}":
-            detected_cat = cat
-            break
-
-    search_query = last_user_msg
-    search_cat = category_filter if category_filter != "all" else state["active_category"]
-
-    # Проверяем, является ли запрос уточнением предыдущей темы (follow-up)
-    continuation_markers = {"а", "еще", "ещё", "также", "тоже", "для", "под", "легковесные", "русские", "ru", "сравни", "покажи", "найди"}
-    first_word = last_clean.split()[0] if last_clean.split() else ""
-    is_continuation_phrase = first_word in continuation_markers and len(last_user_msg.split()) <= 4
-
-    if detected_cat:
-        search_cat = detected_cat
-        state["active_category"] = detected_cat
-        prev_topics = _extract_conversation_topics(prior_history)
-        if prev_topics:
-            search_query = f"{' '.join(prev_topics[-2:])} {detected_cat}"
-        else:
-            search_query = f"{state['main_domain']} {detected_cat}"
-        logger.info(f"Follow-up refinement: cat={search_cat}, query={search_query}")
-    elif is_continuation_phrase:
-        prev_topics = _extract_conversation_topics(prior_history)
-        if prev_topics:
-            search_query = f"{' '.join(prev_topics[-2:])} {last_user_msg}"
-    else:
-        # Самостоятельный содержательный запрос (например, «медицина», «yolo», «компьютерное зрение»)
-        search_query = last_user_msg
-
-    # --- 5. Векторный поиск по каталогу Radar ---
-    results = rag_service.search_cards(
-        query=search_query,
-        category=search_cat,
-        top_k=effective_limit,
-        min_score=0.15,
-    )
-    # Если в узкой категории ничего не нашлось, автоматически ищем по всей базе (all)
-    if not results and search_cat != "all":
-        results = rag_service.search_cards(
-            query=search_query,
-            category="all",
-            top_k=effective_limit,
-            min_score=0.15,
-        )
-    cards = [r["card"] for r in results]
-
-    # --- 6. Попытка вызова опционального внешнего LLM (если настроен) ---
-    llm_answer = None
-    if config.GEMINI_API_KEY or config.OPENAI_API_KEY or config.VLLM_BASE_URL:
-        cards_context_blocks = []
-        for i, r in enumerate(results, start=1):
-            c = r["card"]
-            score_pct = int(r["score"] * 100)
-            tags_str = ", ".join(c.get("tags", []))
-            summary_short = (c.get("summary") or "")[:450]
-            cards_context_blocks.append(
-                f"[{i}] {c.get('title')} (Категория: {c.get('category').upper()})\n"
-                f"Релевантность: {score_pct}%\n"
-                f"URL: {c.get('url')}\n"
-                f"Теги: {tags_str}\n"
-                f"Описание: {summary_short}\n"
+            res = _safe_run_agent(
+                agent,
+                last_user_msg,
+                deps=deps,
+                message_history=model_history,
             )
 
-        window = history[-24:]
-        llm_messages = [{"role": m["role"], "content": m["content"]} for m in window[:-1]]
-        augmented_user_message = last_user_msg
-        if cards_context_blocks:
-            augmented_user_message += (
-                "\n\n[МАТЕРИАЛЫ ИЗ КАТАЛОГА RADAR SCOUT ДЛЯ ОТВЕТА]:\n"
-                + "\n---\n".join(cards_context_blocks)
-                + "\n\nИспользуй эти материалы, дай развернутый ответ, сравни их и обязательно оформи кликабельные ссылки [Название](url). Не здоровайся повторно."
-            )
-        llm_messages.append({"role": "user", "content": augmented_user_message})
+            final_text = str(res.output).strip()
+            cards = deps.retrieved_cards
+            search_query = deps.search_query
+            action = "search" if cards or deps.used_leaderboard else "chat"
 
-        llm_answer = _call_llm(
-            messages=llm_messages,
-            system_instruction=RADAR_AI_SYSTEM_INSTRUCTION,
-            max_tokens=3500,
-        )
+            return {
+                "role": "assistant",
+                "content": final_text,
+                "action": action,
+                "search_query": search_query,
+                "cards": cards,
+                "error": None,
+            }
+        except Exception as e:
+            logger.debug(f"Ошибка вызова агента vLLM/Qwen ({type(e).__name__}: {e}). Переключение на локальный резерв.")
 
-    if llm_answer and llm_answer.strip():
-        final_text = llm_answer.strip()
-        if len(history) > 2:
-            final_text = _strip_repeated_greetings(final_text)
-
-        return {
-            "role": "assistant",
-            "content": final_text,
-            "action": "search",
-            "search_query": search_query,
-            "cards": cards,
-            "error": None,
-        }
-
-    # --- 7. Автономная локальная генерация ответа в стиле Gemini (без внешних нейросетей) ---
-    local_expert_answer = _build_local_expert_response(
-        search_query=search_query,
-        dialogue_state=state,
-        results=results,
-        is_follow_up=bool(prior_history),
-    )
-
-    if len(history) > 2:
-        local_expert_answer = _strip_repeated_greetings(local_expert_answer)
-
-    return {
-        "role": "assistant",
-        "content": local_expert_answer,
-        "action": "search",
-        "search_query": search_query,
-        "cards": cards,
-        "error": None,
-    }
+    # 2. Локальный резерв (когда vLLM оффлайн или во время unit-тестов)
+    return _local_fallback_dialogue(history, category_filter, effective_limit)

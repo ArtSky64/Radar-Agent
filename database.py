@@ -251,6 +251,32 @@ def init_db():
             cursor.execute("ALTER TABLE leaderboard ADD COLUMN vote_count INTEGER NOT NULL DEFAULT 0")
         if 'summary' not in lb_cols:
             cursor.execute("ALTER TABLE leaderboard ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
+
+        # Миграция существующих записей с пустым summary (гарантирует описание у всех моделей)
+        try:
+            cursor.execute("SELECT rowid, category, model_name, rating, organization, license, vote_count FROM leaderboard WHERE summary IS NULL OR TRIM(summary) = '' OR summary LIKE '• %'")
+            empty_rows = cursor.fetchall()
+            if empty_rows:
+                from arena_scraper import generate_model_breakdown
+                for erow in empty_rows:
+                    r_id = erow['rowid']
+                    cat_name = erow['category']
+                    m_name = erow['model_name']
+                    r_val = erow['rating']
+                    r_org = erow['organization'] or ''
+                    r_lic = erow['license'] or ''
+                    r_votes = erow['vote_count'] or 0
+                    auto_summary = generate_model_breakdown(
+                        name=m_name,
+                        org=r_org,
+                        category=cat_name,
+                        rating=float(r_val) if r_val is not None else 1000.0,
+                        license_str=r_lic,
+                        vote_count=int(r_votes)
+                    )
+                    cursor.execute("UPDATE leaderboard SET summary = ? WHERE rowid = ?", (auto_summary, r_id))
+        except Exception as e:
+            logger.debug(f"Миграция пустых summary в leaderboard пропущена: {e}")
         cursor.execute('''CREATE TABLE IF NOT EXISTS leaderboard_analysis (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             fetched_at TEXT NOT NULL,
@@ -522,6 +548,13 @@ def clear_articles() -> None:
         conn.execute('DELETE FROM articles')
 
 
+def clear_leaderboard() -> None:
+    """Полностью очищает таблицы лидерборда Arena и ИИ-анализа."""
+    with get_connection() as conn:
+        conn.execute('DELETE FROM leaderboard')
+        conn.execute('DELETE FROM leaderboard_analysis')
+
+
 def delete_old_vectors(days: int = 14) -> None:
     cutoff_date = (datetime.utcnow() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
     with get_connection() as conn:
@@ -539,15 +572,38 @@ def save_leaderboard_data(data: dict) -> None:
     # 1. Разворачиваем структуру categories в плоский список записей с расширенными метаданными
     for category, models in data['categories'].items():
         for model in models:
+            m_name = (model.get('name') or model.get('model_name') or '').strip()
+            if not m_name:
+                continue
+            m_rating = model.get('rating')
+            m_org = (model.get('organization') or '').strip()
+            m_lic = (model.get('license') or '').strip()
+            m_votes = int(model.get('vote_count', 0) or 0)
+            m_summary = (model.get('summary') or '').strip()
+
+            if not m_summary:
+                try:
+                    from arena_scraper import generate_model_breakdown
+                    m_summary = generate_model_breakdown(
+                        name=m_name,
+                        org=m_org,
+                        category=category,
+                        rating=float(m_rating) if m_rating is not None else 1000.0,
+                        license_str=m_lic,
+                        vote_count=m_votes
+                    )
+                except Exception:
+                    m_summary = f"Модель {m_name} от {m_org or 'ведущей AI-лаборатории'} для глубоких аналитических рассуждений и решения профильных задач."
+
             records_to_insert.append((
                 category,
-                model['name'],
-                model['rating'],
+                m_name,
+                m_rating,
                 fetched_at,
-                model.get('organization', '') or '',
-                model.get('license', '') or '',
-                int(model.get('vote_count', 0) or 0),
-                model.get('summary', '') or '',
+                m_org,
+                m_lic,
+                m_votes,
+                m_summary,
             ))
 
     with get_connection() as conn:
@@ -573,6 +629,32 @@ def save_leaderboard_data(data: dict) -> None:
             cursor.execute("ALTER TABLE leaderboard ADD COLUMN vote_count INTEGER NOT NULL DEFAULT 0")
         if 'summary' not in lb_cols:
             cursor.execute("ALTER TABLE leaderboard ADD COLUMN summary TEXT NOT NULL DEFAULT ''")
+
+        # Миграция существующих записей с пустым summary (гарантирует описание у всех моделей)
+        try:
+            cursor.execute("SELECT rowid, category, model_name, rating, organization, license, vote_count FROM leaderboard WHERE summary IS NULL OR TRIM(summary) = '' OR summary LIKE '• %'")
+            empty_rows = cursor.fetchall()
+            if empty_rows:
+                from arena_scraper import generate_model_breakdown
+                for erow in empty_rows:
+                    r_id = erow['rowid']
+                    cat_name = erow['category']
+                    m_name = erow['model_name']
+                    r_val = erow['rating']
+                    r_org = erow['organization'] or ''
+                    r_lic = erow['license'] or ''
+                    r_votes = erow['vote_count'] or 0
+                    auto_summary = generate_model_breakdown(
+                        name=m_name,
+                        org=r_org,
+                        category=cat_name,
+                        rating=float(r_val) if r_val is not None else 1000.0,
+                        license_str=r_lic,
+                        vote_count=int(r_votes)
+                    )
+                    cursor.execute("UPDATE leaderboard SET summary = ? WHERE rowid = ?", (auto_summary, r_id))
+        except Exception as e:
+            logger.debug(f"Миграция пустых summary в leaderboard пропущена: {e}")
 
         # 3. Проверка текущего объема (ищем уникальные даты)
         cursor = conn.execute('SELECT DISTINCT fetched_at FROM leaderboard ORDER BY fetched_at DESC')
@@ -802,13 +884,41 @@ def get_all_leaderboard_snapshots() -> list[dict]:
             snapshots_map[f_at]["categories"][cat] = []
 
         keys = row.keys() if hasattr(row, 'keys') else []
+        m_name = row['model_name']
+        m_rating = row['rating']
+        m_org = row['organization'] if 'organization' in keys else ''
+        m_lic = row['license'] if 'license' in keys else ''
+        m_votes = row['vote_count'] if 'vote_count' in keys else 0
+        m_summary = (row['summary'] if 'summary' in keys else '') or ''
+
+        if not m_summary.strip() or m_summary.strip().startswith('•'):
+            try:
+                from arena_scraper import generate_model_breakdown
+                m_summary = generate_model_breakdown(
+                    name=m_name,
+                    org=m_org,
+                    category=cat,
+                    rating=float(m_rating) if m_rating is not None else 1000.0,
+                    license_str=m_lic,
+                    vote_count=int(m_votes or 0)
+                )
+            except Exception:
+                m_summary = f"Модель {m_name} от {m_org or 'ведущей AI-лаборатории'} для глубоких аналитических рассуждений и решения профильных задач."
+
+        try:
+            from leaderboard_view import get_model_url
+            m_url = get_model_url(m_name, m_org, m_lic)
+        except Exception:
+            m_url = ""
+
         snapshots_map[f_at]["categories"][cat].append({
-            "name": row['model_name'],
-            "rating": row['rating'],
-            "organization": row['organization'] if 'organization' in keys else '',
-            "license": row['license'] if 'license' in keys else '',
-            "vote_count": row['vote_count'] if 'vote_count' in keys else 0,
-            "summary": row['summary'] if 'summary' in keys else '',
+            "name": m_name,
+            "rating": m_rating,
+            "organization": m_org,
+            "license": m_lic,
+            "vote_count": m_votes,
+            "summary": m_summary,
+            "model_url": m_url,
         })
 
     return list(snapshots_map.values())

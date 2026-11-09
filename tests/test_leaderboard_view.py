@@ -1,4 +1,12 @@
-import pytest
+try:
+    import pytest
+except ImportError:
+    class _MockPytest:
+        class mark:
+            @staticmethod
+            def parametrize(*args, **kwargs):
+                return lambda fn: fn
+    pytest = _MockPytest()
 
 from leaderboard_view import (
     aggregate_all_categories,
@@ -87,3 +95,21 @@ def test_category_count_label(n, expected):
 def test_format_rating():
     assert format_rating(1234.0) == "1234"
     assert format_rating(1403.666) == "1403.7"
+
+
+def test_summary_is_generated_when_missing():
+    s = snap("2026-07-01", text=[("Claude Opus 5.5", 1800)])
+    records = build_latest_records([s])
+    assert len(records) == 1
+    assert "Anthropic" in records[0]["summary"]
+    assert len(records[0]["summary"]) > 20
+    assert "•" not in records[0]["summary"]
+
+
+def test_aggregate_summary_is_preserved_or_generated():
+    s = snap("2026-07-01", text=[("DeepSeek-V3", 1400)])
+    records = build_latest_records([s])
+    agg = aggregate_all_categories(records)
+    assert len(agg) == 1
+    assert "DeepSeek" in agg[0]["summary"]
+    assert "•" not in agg[0]["summary"]

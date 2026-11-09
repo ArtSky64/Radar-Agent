@@ -29,7 +29,7 @@ _LOCK = threading.Lock()
 _INDEX_CARDS: list[dict[str, Any]] = []
 _INDEX_VECTORS: np.ndarray | None = None
 _LAST_BUILD_TS = 0.0
-_REBUILD_INTERVAL_SEC = 300  # автоматическое обновление индекса раз в 5 минут
+_REBUILD_INTERVAL_SEC = 600  # обновление индекса раз в 10 минут
 
 
 def _clean_tags(raw_tags: Any) -> list[str]:
@@ -111,7 +111,8 @@ def _load_all_cards_from_db() -> list[dict[str, Any]]:
                     "metrics": {
                         "downloads": r["downloads"] or 0,
                         "likes": r["likes"] or 0,
-                        "pipeline_tag": p_tag,
+                        "rank_global": r["rank_global"],
+                        "rank_ru": r["rank_ru"],
                     },
                     "added_at": "",
                 })
@@ -121,14 +122,18 @@ def _load_all_cards_from_db() -> list[dict[str, Any]]:
         # 3. Таблица github_trending (репозитории)
         try:
             rows = cursor.execute("""
-                SELECT rowid, repo_name, source_url, summary, tags, stars
+                SELECT rowid, repo_name, description, summary, url,
+                       tags, stars, language, period
                 FROM github_trending
             """).fetchall()
             for r in rows:
                 tags = _clean_tags(r["tags"])
                 title = (r["repo_name"] or "Без названия").strip()
-                summary = (r["summary"] or "").strip()
-                url = (r["source_url"] or "").strip()
+                summary = (r["summary"] or r["description"] or "").strip()
+                url = (r["url"] or f"https://github.com/{title}").strip()
+                lang = (r["language"] or "").strip()
+                if lang and lang not in tags:
+                    tags.append(lang)
 
                 cards.append({
                     "id": f"gh_{r['rowid']}",
@@ -139,6 +144,8 @@ def _load_all_cards_from_db() -> list[dict[str, Any]]:
                     "tags": tags,
                     "metrics": {
                         "stars": r["stars"] or 0,
+                        "language": lang,
+                        "period": r["period"] or "",
                     },
                     "added_at": "",
                 })
@@ -166,7 +173,7 @@ def _make_search_text(card: dict[str, Any]) -> str:
 
 def build_index(force: bool = False) -> int:
     """
-    Строит / обновляет векторный индекс карточек в памяти.
+    Строит / обновляет векторный индекс карточек в памяти пакетом (векторизация батчами).
     Возвращает количество проиндексированных карточек.
     """
     global _INDEX_CARDS, _INDEX_VECTORS, _LAST_BUILD_TS
@@ -183,20 +190,16 @@ def build_index(force: bool = False) -> int:
             _LAST_BUILD_TS = now
             return 0
 
-        vectors = []
-        valid_cards = []
+        texts = [_make_search_text(c) for c in cards]
+        raw_vectors = dedup.batch_texts_to_vectors(texts)
 
-        for c in cards:
-            text = _make_search_text(c)
-            try:
-                vec = dedup.text_to_vector(text)
-                norm = np.linalg.norm(vec)
-                if norm > 0:
-                    vec = vec / norm
-                vectors.append(vec)
+        valid_cards = []
+        vectors = []
+        for c, vec in zip(cards, raw_vectors):
+            norm = np.linalg.norm(vec)
+            if norm > 0:
+                vectors.append((vec / norm).astype(np.float32))
                 valid_cards.append(c)
-            except Exception as e:
-                logger.error(f"Ошибка векторизации карточки '{c.get('title')}': {e}")
 
         if vectors:
             _INDEX_VECTORS = np.vstack(vectors).astype(np.float32)
@@ -219,6 +222,7 @@ def search_cards(
 ) -> list[dict[str, Any]]:
     """
     Выполняет косинусный поиск карточек по текстовому запросу.
+    Сверхбыстрый поиск по готовой матрице векторов в памяти (доли миллисекунды).
 
     :param query: Поисковый запрос (например: 'медицинские датасеты снимков МРТ')
     :param category: Фильтр по категории ('all', 'датасет', 'модель', 'репозиторий', 'статья')
@@ -228,7 +232,15 @@ def search_cards(
     :return: Список словарей [{'card': card_data, 'score': float}, ...]
     """
     limit = max_sources if max_sources is not None else top_k
-    build_index()
+
+    # Если индекс еще не построен — строим
+    if _INDEX_VECTORS is None or len(_INDEX_VECTORS) == 0:
+        build_index()
+    else:
+        # Фоновое фоновое обновление при устаревании (не блокируя текущий поиск)
+        now = time.monotonic()
+        if now - _LAST_BUILD_TS > _REBUILD_INTERVAL_SEC:
+            threading.Thread(target=build_index, daemon=True).start()
 
     if not _INDEX_CARDS or _INDEX_VECTORS is None or len(_INDEX_VECTORS) == 0:
         return []
@@ -240,7 +252,7 @@ def search_cards(
         return []
     query_vec = (query_vec / q_norm).astype(np.float32)
 
-    # Скалярное произведение нормализованных векторов = косинусное сходство
+    # Скалярное произведение нормализованных векторов = косинусное сходство (мгновенно на BLAS/numpy)
     scores = np.dot(_INDEX_VECTORS, query_vec)
 
     # Фильтрация по категории и порогу сходства
@@ -248,19 +260,18 @@ def search_cards(
     results = []
 
     for idx, score in enumerate(scores):
+        if score < min_score:
+            continue
         card = _INDEX_CARDS[idx]
-        card_cat = card.get("category", "").lower()
+        c_cat = card.get("category", "").lower()
 
-        if category_filter != "all":
-            # Разрешаем частичное совпадение (например "модели" -> "модель", "датасеты" -> "датасет")
-            if not (category_filter in card_cat or card_cat in category_filter):
-                continue
+        if category_filter != "all" and c_cat != category_filter:
+            continue
 
-        if score >= min_score:
-            results.append({
-                "score": round(float(score), 4),
-                "card": card,
-            })
+        results.append({
+            "card": card,
+            "score": float(score),
+        })
 
     # Сортировка по убыванию релевантности
     results.sort(key=lambda x: x["score"], reverse=True)
@@ -268,19 +279,23 @@ def search_cards(
 
 
 def get_catalog_stats() -> dict[str, int]:
-    """Возвращает статистику по карточкам в индексе."""
+    """Возвращает агрегированную статистику проиндексированных карточек."""
     build_index()
-    stats: dict[str, int] = {
+    stats = {
         "всего": len(_INDEX_CARDS),
-        "датасет": 0,
-        "модель": 0,
-        "репозиторий": 0,
-        "статья": 0,
+        "модели": 0,
+        "датасеты": 0,
+        "репозитории": 0,
+        "статьи": 0,
     }
     for c in _INDEX_CARDS:
-        cat = c.get("category", "")
-        if cat in stats:
-            stats[cat] += 1
+        cat = c.get("category", "").lower()
+        if cat == "модель":
+            stats["модели"] += 1
+        elif cat == "датасет":
+            stats["датасеты"] += 1
+        elif cat == "репозиторий":
+            stats["репозитории"] += 1
         else:
-            stats[cat] = 1
+            stats["статьи"] += 1
     return stats

@@ -77,16 +77,13 @@ def _save_cache(cache: dict) -> None:
     tmp_file = None
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
-        # Объединяем с текущим состоянием на диске, чтобы не затереть ключи от других параллельных процессов
         disk_data = _load_cache()
         merged = {**disk_data, **cache}
 
-        # Уникальное имя временного файла исключает коллизии между процессами
         tmp_file = CACHE_DIR / f"cache_{os.getpid()}_{uuid.uuid4().hex[:8]}.tmp"
         with open(tmp_file, "w", encoding="utf-8") as f:
             json.dump(merged, f)
 
-        # Атомарная замена целевого файла
         tmp_file.replace(CACHE_FILE)
     except Exception as e:
         logger.warning(f"Не удалось сохранить кэш эмбеддингов: {e}")
@@ -119,8 +116,6 @@ def text_to_vector(text: str) -> np.ndarray:
             return np.array(_cache[key], dtype=np.float32)
 
     model = _get_model()
-    # fastembed.embed() принимает список текстов и возвращает генератор
-    # numpy-векторов — берём единственный элемент для одного текста.
     vector = next(model.embed([text]))
 
     with _CACHE_LOCK:
@@ -128,6 +123,52 @@ def text_to_vector(text: str) -> np.ndarray:
         _save_cache(_cache)
 
     return vector
+
+
+def batch_texts_to_vectors(texts: list[str]) -> list[np.ndarray]:
+    """
+    Высокопроизводительная пакетная векторизация списка текстов:
+    - Проверяет кэш в памяти.
+    - Для отсутствующих текстов выполняет model.embed(..., batch_size=64) в ОДИН проход.
+    - Сохраняет кэш на диск ОДИН раз за весь пакет, а не на каждом элементе.
+    """
+    if not texts:
+        return []
+
+    global _cache
+    with _CACHE_LOCK:
+        if _cache is None:
+            _cache = _load_cache()
+
+    keys = [hashlib.sha256(t.encode("utf-8")).hexdigest() for t in texts]
+    results: list[np.ndarray | None] = [None] * len(texts)
+    uncached_indices: list[int] = []
+    uncached_texts: list[str] = []
+
+    with _CACHE_LOCK:
+        for idx, (t, k) in enumerate(zip(texts, keys)):
+            if k in _cache:
+                results[idx] = np.array(_cache[k], dtype=np.float32)
+            else:
+                uncached_indices.append(idx)
+                uncached_texts.append(t)
+
+    if uncached_texts:
+        model = _get_model()
+        vectors_gen = model.embed(uncached_texts, batch_size=64)
+        new_entries: dict[str, list[float]] = {}
+
+        for idx, vec in zip(uncached_indices, vectors_gen):
+            vec_f32 = np.array(vec, dtype=np.float32)
+            results[idx] = vec_f32
+            new_entries[keys[idx]] = vec_f32.tolist()
+
+        with _CACHE_LOCK:
+            _cache.update(new_entries)
+            _save_cache(_cache)
+
+    dim = config.VECTOR_DIM
+    return [r if r is not None else np.zeros(dim, dtype=np.float32) for r in results]
 
 
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:

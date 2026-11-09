@@ -14,6 +14,7 @@ interface LeaderboardSectionProps {
   latestAnalysis?: AnalysisRecord | null;
   onRefresh: () => void;
   isRefreshing?: boolean;
+  onAskAssistant?: (prompt: string) => void;
 }
 
 export const LeaderboardSection: React.FC<LeaderboardSectionProps> = ({
@@ -22,6 +23,7 @@ export const LeaderboardSection: React.FC<LeaderboardSectionProps> = ({
   latestAnalysis,
   onRefresh,
   isRefreshing = false,
+  onAskAssistant,
 }) => {
   const [selectedCat, setSelectedCat] = useState<string>(ALL_CATEGORIES);
   const [aggMethod, setAggMethod] = useState<'avg' | 'max'>('avg');
@@ -190,12 +192,22 @@ export const LeaderboardSection: React.FC<LeaderboardSectionProps> = ({
                       <span className="w-6 h-6 rounded-lg bg-purple-950/80 border border-purple-700/60 flex items-center justify-center font-bold text-purple-300 text-[11px] shrink-0">
                         #{idx + 1}
                       </span>
-                      <h3 className="text-sm font-bold text-white hover:text-purple-300 transition-colors">
-                        <a href={hfSearchUrl} target="_blank" rel="noreferrer" className="flex items-center gap-1.5">
-                          {rec.model_name}
-                          <ExternalLink className="w-3.5 h-3.5 opacity-50" />
-                        </a>
-                      </h3>
+                      <div className="flex items-center gap-3">
+                        <h3 className="text-sm font-bold text-white hover:text-purple-300 transition-colors">
+                          <a href={hfSearchUrl} target="_blank" rel="noreferrer" className="flex items-center gap-1.5">
+                            {rec.model_name}
+                            <ExternalLink className="w-3.5 h-3.5 opacity-50" />
+                          </a>
+                        </h3>
+                        <button
+                          onClick={() => onAskAssistant?.(`Расскажи подробно про модель ${rec.model_name} из рейтинга LMSYS Arena: её Elo-рейтинг, архитектура, лицензия и сравнение с конкурентами`)}
+                          className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-purple-600/20 hover:bg-purple-600/40 text-purple-300 hover:text-white border border-purple-500/30 text-[10px] font-medium transition-colors cursor-pointer shadow-sm"
+                          title="Спросить у AI Ассистента"
+                        >
+                          <Sparkles className="w-3 h-3 text-purple-400" />
+                          <span>Спросить ассистента</span>
+                        </button>
+                      </div>
                       {rec.organization && (
                         <span className="text-[10px] px-2 py-0.5 rounded bg-zinc-800 text-zinc-300 border border-zinc-700">
                           {rec.organization}
@@ -231,7 +243,7 @@ export const LeaderboardSection: React.FC<LeaderboardSectionProps> = ({
 
                 {/* Описание / summary */}
                 {rec.summary && (
-                  <p className="text-zinc-400 mt-2 text-[11px] leading-relaxed line-clamp-2">
+                  <p className="text-zinc-300 mt-2 text-xs leading-relaxed whitespace-pre-line">
                     {rec.summary}
                   </p>
                 )}

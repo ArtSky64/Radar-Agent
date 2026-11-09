@@ -109,6 +109,14 @@ export default function App() {
     }
   }, [activeSessionId]);
 
+  // Буфер сообщения для передачи в чат ассистента при клике по карточке
+  const [pendingPrompt, setPendingPrompt] = useState<string | null>(null);
+
+  const handleAskAssistant = (promptText: string) => {
+    setIsAssistantOpen(true);
+    setPendingPrompt(promptText);
+  };
+
   // Стейт открытия боковой панели ассистента
   const [isAssistantOpen, setIsAssistantOpen] = useState<boolean>(() => {
     if (typeof window !== 'undefined') {
@@ -443,6 +451,7 @@ export default function App() {
                 latestAnalysis={latestAnalysis}
                 onRefresh={handleRefreshArena}
                 isRefreshing={isLeaderboardRefreshing}
+                onAskAssistant={handleAskAssistant}
               />
             )}
 
@@ -453,6 +462,7 @@ export default function App() {
                 lastFetchedAt={hfLastFetchedAt}
                 onRefresh={handleRefreshHf}
                 isRefreshing={isHfRefreshing}
+                onAskAssistant={handleAskAssistant}
               />
             )}
 
@@ -463,6 +473,7 @@ export default function App() {
                 lastFetchedAt={hfLastFetchedAt}
                 onRefresh={handleRefreshHf}
                 isRefreshing={isHfRefreshing}
+                onAskAssistant={handleAskAssistant}
               />
             )}
 
@@ -471,6 +482,7 @@ export default function App() {
                 articles={articles}
                 onRefresh={handleRefreshPapers}
                 isRefreshing={isPapersRefreshing}
+                onAskAssistant={handleAskAssistant}
               />
             )}
 
@@ -479,6 +491,7 @@ export default function App() {
                 articles={articles}
                 onRefresh={handleRefreshDatasets}
                 isRefreshing={isDatasetsRefreshing}
+                onAskAssistant={handleAskAssistant}
               />
             )}
 
@@ -488,6 +501,7 @@ export default function App() {
                 lastFetchedAt={githubLastFetchedAt}
                 onRefresh={handleRefreshGithub}
                 isRefreshing={isGithubRefreshing}
+                onAskAssistant={handleAskAssistant}
               />
             )}
 
@@ -498,6 +512,8 @@ export default function App() {
                 activeSessionId={activeSessionId}
                 setActiveSessionId={setActiveSessionId}
                 isSidePanel={false}
+                pendingPrompt={pendingPrompt}
+                onClearPendingPrompt={() => setPendingPrompt(null)}
               />
             )}
           </div>
@@ -516,6 +532,8 @@ export default function App() {
             setActiveSessionId={setActiveSessionId}
             isSidePanel={true}
             onClose={() => setIsAssistantOpen(false)}
+            pendingPrompt={pendingPrompt}
+            onClearPendingPrompt={() => setPendingPrompt(null)}
           />
         </aside>
       </div>

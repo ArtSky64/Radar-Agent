@@ -25,6 +25,8 @@ app.add_middleware(
 @app.on_event("startup")
 def on_startup():
     init_db()
+    import threading
+    threading.Thread(target=rag_service.build_index, daemon=True).start()
 
 
 # Внутренняя функция бэкенда, которая соединяет оригинальный скрапер и базу данных

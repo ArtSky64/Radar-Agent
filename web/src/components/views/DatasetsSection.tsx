@@ -21,6 +21,7 @@ interface DatasetsSectionProps {
   articles: ArticleItem[];
   onRefresh?: () => Promise<void>;
   isRefreshing?: boolean;
+  onAskAssistant?: (prompt: string) => void;
 }
 
 type DatasetTab = 'ru' | 'global' | 'kaggle' | 'all';
@@ -30,6 +31,7 @@ export const DatasetsSection: React.FC<DatasetsSectionProps> = ({
   articles,
   onRefresh,
   isRefreshing = false,
+  onAskAssistant,
 }) => {
   const [activeTab, setActiveTab] = useState<DatasetTab>('ru');
   const [searchQuery, setSearchQuery] = useState('');
@@ -580,7 +582,7 @@ export const DatasetsSection: React.FC<DatasetsSectionProps> = ({
 
                 {/* Описание / summary */}
                 {d.summary && (
-                  <p className="text-sm text-zinc-300 mt-2 leading-relaxed whitespace-pre-line line-clamp-4">
+                  <p className="text-sm text-zinc-300 mt-2 leading-relaxed whitespace-pre-line">
                     {d.summary}
                   </p>
                 )}
@@ -687,9 +689,18 @@ export const DatasetsSection: React.FC<DatasetsSectionProps> = ({
                   </div>
                 )}
 
-                {/* Прямая ссылка на источник */}
-                {sourceUrl && (
-                  <div className="mt-3 pt-2 text-xs">
+                {/* Прямая ссылка на источник и кнопка ассистента */}
+                <div className="mt-3 pt-2 text-xs flex items-center justify-between">
+                  <button
+                    onClick={() => onAskAssistant?.(`Сделай подробный обзор датасета "${cleanTitle}": структура данных, задачи и какие модели на нём обучают`)}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-purple-600/20 hover:bg-purple-600/40 text-purple-300 hover:text-white border border-purple-500/30 text-[11px] font-semibold transition-all cursor-pointer shadow-sm"
+                    title="Спросить у AI Ассистента"
+                  >
+                    <Sparkles className="w-3 h-3 text-purple-400" />
+                    <span>Спросить ассистента</span>
+                  </button>
+
+                  {sourceUrl && (
                     <a
                       href={sourceUrl}
                       target="_blank"
@@ -698,8 +709,8 @@ export const DatasetsSection: React.FC<DatasetsSectionProps> = ({
                     >
                       Открыть на {platformName} →
                     </a>
-                  </div>
-                )}
+                  )}
+                </div>
               </div>
             );
           })

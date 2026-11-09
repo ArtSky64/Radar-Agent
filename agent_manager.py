@@ -197,7 +197,7 @@ def _mock_leaderboard_analysis(current_snapshot: dict, previous_snapshot: dict |
     categories = current_snapshot.get("categories", {}) if current_snapshot else {}
 
     text_cat = categories.get("text", [])
-    text_leader = text_cat[0]["name"] if text_cat else "Gemini 4 Argon (High)"
+    text_leader = text_cat[0]["name"] if text_cat else "Флагманская языковая модель"
     text_rating = text_cat[0]["rating"] if text_cat else 1525.7
 
     webdev_cat = categories.get("webdev", [])
@@ -209,7 +209,7 @@ def _mock_leaderboard_analysis(current_snapshot: dict, previous_snapshot: dict |
     vision_rating = vision_cat[0]["rating"] if vision_cat else 1324.9
 
     video_cat = categories.get("text-to-video", [])
-    video_leader = video_cat[0]["name"] if video_cat else "gemini-omni-1.1-flash"
+    video_leader = video_cat[0]["name"] if video_cat else "Флагманская видео-модель"
 
     agent_cat = categories.get("agent", [])
     agent_leader = agent_cat[0]["name"] if agent_cat else "Claude Opus 5.5 (Max)"
@@ -233,7 +233,7 @@ def _mock_leaderboard_analysis(current_snapshot: dict, previous_snapshot: dict |
         f"👁️ Для визуального анализа и документов (Vision & Document): Лидер — {vision_leader} ({vision_rating} Elo). Максимальная точность распознавания плотных PDF, таблиц, финансовых отчетов и инженерных схем.",
         f"🎬 Для медиагенерации (Video & Image): Лидеры — {video_leader} (видео) и {image_leader} (изображения). Кинематографическая детализация, стабильная физика движения и точное следование композиции.",
         "⚡ Открытые веса для локального инференса (Open-Weights): Семейства MiMo-V2.6-Pro, GLM-4.7 и DeepSeek-V4 показывают уровень ведущих коммерческих моделей и готовы для автономного развертывания через vLLM/Ollama без передачи данных в сторонние облака.",
-        "💡 Практическая рекомендация: Для разработки и продакшен-кода оптимальна связка Claude Opus / GPT, для аналитики и гигантских контекстов — семейство Gemini, а для приватных контуров предприятия — открытые веса MiMo/GLM."
+        "💡 Практическая рекомендация: Для разработки и продакшен-кода оптимальна связка Claude Opus / GPT, для аналитики и глубоких рассуждений — передовые reasoning-модели, а для приватных контуров предприятия — открытые веса MiMo/GLM/DeepSeek."
     ]
 
     return LeaderboardAnalysis(summary=summary, trends=trends)
@@ -262,6 +262,30 @@ def analyze_leaderboard(
     except Exception as e:
         logger.warning(f"vLLM недоступен для анализа лидерборда ({e}). Применяем автоматический аналитический фоллбэк.")
         return _mock_leaderboard_analysis(current_snapshot, previous_snapshot)
+
+
+def generate_arena_model_summary(
+    name: str,
+    org: str = "",
+    category: str = "",
+    rating: float = 0.0,
+    license_str: str = "",
+    vote_count: int = 0
+) -> str:
+    """Генерирует структурированное описание (breakdown) модели лидерборда Arena."""
+    try:
+        from arena_scraper import generate_model_breakdown
+        return generate_model_breakdown(
+            name=name,
+            org=org,
+            category=category,
+            rating=rating,
+            license_str=license_str,
+            vote_count=vote_count
+        )
+    except Exception:
+        org_title = org or "ведущей AI-лаборатории"
+        return f"Модель от {org_title} для глубоких логических рассуждений, анализа сложного контекста и прикладных задач."
 
 
 class TrendingModelSummary(BaseModel):

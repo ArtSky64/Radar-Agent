@@ -1,5 +1,6 @@
 import React, { useState, useMemo } from 'react';
 import {
+  Sparkles,
   RotateCw,
   Search,
   ExternalLink,
@@ -17,12 +18,14 @@ interface PapersSectionProps {
   articles: ArticleItem[];
   onRefresh: () => void;
   isRefreshing?: boolean;
+  onAskAssistant?: (prompt: string) => void;
 }
 
 export const PapersSection: React.FC<PapersSectionProps> = ({
   articles,
   onRefresh,
   isRefreshing = false,
+  onAskAssistant,
 }) => {
   const [activeSubTab, setActiveSubTab] = useState<'week' | 'month'>('week');
   const [searchQuery, setSearchQuery] = useState('');
@@ -397,7 +400,7 @@ export const PapersSection: React.FC<PapersSectionProps> = ({
 
                 {/* Резюме / summary */}
                 {paper.summary && (
-                  <p className="text-zinc-300 mt-1.5 text-[11px] leading-relaxed line-clamp-3">
+                  <p className="text-zinc-300 mt-2 text-xs leading-relaxed whitespace-pre-line">
                     {paper.summary}
                   </p>
                 )}
@@ -433,8 +436,17 @@ export const PapersSection: React.FC<PapersSectionProps> = ({
                   </div>
                 )}
 
-                {/* Ссылка на источник */}
-                <div className="mt-2.5 pt-1 flex justify-end">
+                {/* Ссылка на источник и кнопка ассистента */}
+                <div className="mt-2.5 pt-1 flex items-center justify-between">
+                  <button
+                    onClick={() => onAskAssistant?.(`Сделай научный разбор статьи "${cleanTitle}": основная гипотеза, предложенный метод, результаты тестов и выводы`)}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-purple-600/20 hover:bg-purple-600/40 text-purple-300 hover:text-white border border-purple-500/30 text-[11px] font-semibold transition-all cursor-pointer shadow-sm"
+                    title="Спросить у AI Ассистента"
+                  >
+                    <Sparkles className="w-3 h-3 text-purple-400" />
+                    <span>Спросить ассистента</span>
+                  </button>
+
                   <a
                     href={sourceUrl}
                     target="_blank"

@@ -51,57 +51,169 @@ HF_DATASET_NAME = "lmarena-ai/leaderboard-dataset"
 HF_API_BASE = "https://datasets-server.huggingface.co/rows"
 
 
-def generate_model_breakdown(name: str, org: str, category: str, rating: float, license_str: str, vote_count: int) -> str:
-    """Генерирует развернутую карточку модели: назначение (для чего), архитектура и результаты в Arena."""
-    org_title = org.title() if org else "Ведущая AI-лаборатория"
+def generate_model_breakdown(
+    name: str,
+    org: str = "",
+    category: str = "",
+    rating: float = 0.0,
+    license_str: str = "",
+    vote_count: int = 0
+) -> str:
+    """Генерирует лаконичное, информативное описание модели (1-2 предложения),
+    идеально помещающееся в блок карточки лидерборда без перегрузки интерфейса."""
     cat_lower = (category or "").lower()
     name_lower = (name or "").lower()
+    lic_lower = (license_str or "").lower()
+    is_open = bool(lic_lower and lic_lower not in ("proprietary", "commercial", "closed", "unknown", "none", ""))
 
-    if any(k in cat_lower for k in ("webdev", "code", "coding")) or "coder" in name_lower:
-        purpose = "Сложная веб-разработка, сквозное написание и аудит кода (фронтенд/бэкенд), проектирование архитектуры ПО, рефакторинг и дебаггинг кодовых баз."
-        stack_info = "Оптимизирована для работы с AST-деревьями, синтаксисом современных фреймворков и длинными контекстами проектов."
-    elif "agent" in cat_lower or "agent" in name_lower:
-        purpose = "Автономные ИИ-агенты, мультиагентные сценарии, планирование цепочек действий, надежный вызов инструментов (Tool/Function Calling) и структурированный вывод."
-        stack_info = "Обладает высокой устойчивостью к сбоям в цикле рассуждений (reflection/re-planning) и точным следованием системным инструкциям."
-    elif any(k in cat_lower for k in ("vision", "document", "search")) or "vision" in name_lower or "ocr" in name_lower:
-        purpose = "Мультимодальный анализ, распознавание схем, таблиц, графиков, обработка отсканированных документов высокой плотности (OCR) и фактологический поиск."
-        stack_info = "Включает сбалансированные визуально-текстовые энкодеры для кросс-модальных рассуждений без потери детализации."
-    elif any(k in cat_lower for k in ("video", "text-to-video", "image-to-video")):
-        purpose = "Генерация динамических видеороликов, интерполяция кадров, преобразование статических изображений в видео и анимация со стабильной физикой движения."
-        stack_info = "Современная диффузионная или авторегрессионная видео-архитектура с пространственно-временным вниманием (Spatiotemporal Attention)."
-    elif any(k in cat_lower for k in ("image", "text-to-image", "image-edit")):
-        purpose = "Фотореалистичная и художественная генерация изображений, точное редактирование по маске, композиция сцен и сохранение стиля."
-        stack_info = "Высокое разрешение генерации, улучшенная анатомия и точное следование комплексным текстовым промптам."
-    else:
-        purpose = "Глубокие логические и математические рассуждения (reasoning), аналитика сложных текстов, научные изыскания, экспертные диалоги и синтез информации."
-        stack_info = "Флагманский уровень языкового интеллекта с развитой способностью к пошаговому логическому выводу (chain-of-thought)."
+    # Распознаем организацию / вендора с нормализацией регистра
+    norm_orgs = {
+        'openai': 'OpenAI', 'google': 'Google', 'anthropic': 'Anthropic', 'meta': 'Meta',
+        'deepseek': 'DeepSeek', 'alibaba': 'Alibaba Cloud', 'alibaba cloud': 'Alibaba Cloud',
+        'xiaomi': 'Xiaomi', 'mistral': 'Mistral AI', 'mistral ai': 'Mistral AI', 'xai': 'xAI',
+        'zhipu': 'Zhipu AI', 'zhipu ai': 'Zhipu AI', 'microsoft': 'Microsoft', 'minimax': 'MiniMax',
+        'wanx': 'WanX', 'kuaishou': 'Kuaishou', 'black forest labs': 'Black Forest Labs',
+        'midjourney': 'Midjourney', 'cohere': 'Cohere', 'stability': 'Stability AI',
+        'bytedance': 'ByteDance', 'runway': 'Runway',
+    }
+    org_clean = (org or '').strip()
+    detected_org = norm_orgs.get(org_clean.lower(), org_clean)
+    if not detected_org:
+        if any(k in name_lower for k in ("gemini", "gemma")):
+            detected_org = "Google"
+        elif "claude" in name_lower:
+            detected_org = "Anthropic"
+        elif any(k in name_lower for k in ("gpt", "o1", "o3", "chatgpt", "sora")):
+            detected_org = "OpenAI"
+        elif "deepseek" in name_lower:
+            detected_org = "DeepSeek"
+        elif "qwen" in name_lower:
+            detected_org = "Alibaba Cloud"
+        elif "mimo" in name_lower:
+            detected_org = "Xiaomi"
+        elif "llama" in name_lower:
+            detected_org = "Meta"
+        elif any(k in name_lower for k in ("mistral", "mixtral", "codestral")):
+            detected_org = "Mistral AI"
+        elif "grok" in name_lower:
+            detected_org = "xAI"
+        elif "glm" in name_lower:
+            detected_org = "Zhipu AI"
+        elif "phi" in name_lower:
+            detected_org = "Microsoft"
+        elif "minimax" in name_lower:
+            detected_org = "MiniMax"
+        elif "wan" in name_lower:
+            detected_org = "WanX"
+        elif "kling" in name_lower:
+            detected_org = "Kuaishou"
+        elif any(k in name_lower for k in ("flux", "black-forest")):
+            detected_org = "Black Forest Labs"
+        elif "midjourney" in name_lower:
+            detected_org = "Midjourney"
 
-    is_open = license_str and license_str.lower() not in ("proprietary", "commercial", "closed", "unknown", "")
-    if is_open:
-        lic_desc = f"открытые веса ({license_str}), подходит для локального развертывания (vLLM, Ollama, SGLang)"
-    else:
-        lic_desc = f"коммерческое облачное API ({license_str or 'Proprietary'})"
+    is_code = any(k in cat_lower for k in ("webdev", "code", "coding")) or any(k in name_lower for k in ("coder", "coding", "codestral", "dev"))
+    is_agent = "agent" in cat_lower or "agent" in name_lower
+    is_vision = any(k in cat_lower for k in ("vision", "document", "search")) or any(k in name_lower for k in ("vision", "vl", "ocr"))
+    is_video = any(k in cat_lower for k in ("video", "text-to-video", "image-to-video")) or any(k in name_lower for k in ("sora", "kling", "wan", "t2v", "i2v"))
+    is_image = any(k in cat_lower for k in ("image", "text-to-image", "image-edit")) or any(k in name_lower for k in ("flux", "midjourney", "dall-e", "sdxl"))
+    is_reasoning = any(k in cat_lower for k in ("reason", "math", "hard")) or any(k in name_lower for k in ("o1", "o3", "r1", "reasoning", "think"))
 
-    special_note = ""
+    # Семейство Claude
+    if "claude" in name_lower:
+        if is_code:
+            return "Передовая модель от Anthropic для сложной веб-разработки, написания программного кода, проектирования архитектуры и безопасного аудита репозиториев."
+        if is_agent:
+            return "Агентная флагманская модель от Anthropic, оптимизированная для многоэтапного планирования, надёжного вызова инструментов и следования инструкциям."
+        return "Флагманская языковая модель от Anthropic, отличающаяся глубоким логическим мышлением, безопасностью и высокой связностью рассуждений."
+
+    # Семейство Gemini / Gemma
     if "gemini" in name_lower:
-        special_note = " Нативно поддерживает длинный контекст до 2M токенов и мультимодальный ввод."
-    elif "claude" in name_lower:
-        special_note = " Выделяется эталонной безопасностью, качеством генерации кода и аккуратным следованием системному промпту."
-    elif "gpt" in name_lower or "o1" in name_lower or "o3" in name_lower:
-        special_note = " Продвинутые возможности рассуждения с генерацией внутренних цепочек мысли перед ответом."
-    elif "mimo" in name_lower:
-        special_note = " Высокая энергоэффективность и оптимальный баланс скорости инференса к качеству."
-    elif "deepseek" in name_lower:
-        special_note = " MoE-архитектура с эффективной активацией экспертов и низкой стоимостью токена."
-    elif "qwen" in name_lower:
-        special_note = " Сильная мультиязычность, поддержка математики и кодинга на открытых весах."
+        if is_code:
+            return "Мультимодальная модель от Google с контекстом до 2M токенов, оптимизированная для сложного анализа кодовых баз и сквозной разработки."
+        return "Флагманская мультимодальная модель от Google со сверхдлинным контекстом до 2M токенов для глубокого анализа данных и рассуждений."
 
-    votes_str = f" на основе {vote_count:,} слепых матчей" if vote_count > 0 else ""
-    return (
-        f"• Назначение (для чего): {purpose}\n"
-        f"• Архитектура и стек: Разработка {org_title} ({lic_desc}). {stack_info}{special_note}\n"
-        f"• Результаты в Arena: {rating} Elo в категории «{category.upper()}»{votes_str}."
-    )
+    if "gemma" in name_lower:
+        return "Компактная открытая модель от Google на базе технологий Gemini, оптимизированная для эффективного локального инференса."
+
+    # Семейство OpenAI (o1, o3, GPT-4)
+    if any(k in name_lower for k in ("o1", "o3")):
+        return "Передовая модель рассуждений от OpenAI с внутренними цепочками мысли для решения сложных математических, научных и алгоритмических задач."
+
+    if any(k in name_lower for k in ("gpt-4", "gpt 4", "chatgpt")):
+        if is_code:
+            return "Универсальная модель от OpenAI для программирования, генерации архитектурных решений, рефакторинга и дебаггинга."
+        return "Флагманская мультимодальная модель от OpenAI для решения широкого спектра интеллектуальных задач и комплексной аналитики."
+
+    # Семейство DeepSeek
+    if "deepseek" in name_lower:
+        if is_reasoning or "r1" in name_lower:
+            return "Открытая модель рассуждений от DeepSeek с цепочками мыслей для математических доказательств, логики и сложных алгоритмов."
+        if is_code:
+            return "Высокоэффективная MoE-модель от DeepSeek с открытыми весами, оптимизированная для генерации кода и технической разработки."
+        return "Высокопроизводительная MoE-модель от DeepSeek с открытыми весами для эффективного решения сложных языковых и аналитических задач."
+
+    # Семейство Qwen
+    if "qwen" in name_lower:
+        if is_code:
+            return "Мощная модель с открытыми весами от Alibaba Cloud для программирования, работы с современными фреймворками и дебаггинга."
+        if is_vision:
+            return "Мультимодальная модель от Alibaba Cloud для распознавания визуальных данных, плотных документов и диаграмм."
+        return "Флагманская открытая модель от Alibaba Cloud с сильными способностями к многоязычным рассуждениям и математике."
+
+    # Семейство Llama
+    if "llama" in name_lower:
+        if is_code:
+            return "Открытая базовая модель от Meta, дообученная для генерации, анализа и документирования программного кода."
+        return "Ведущая открытая модель от Meta для широкого спектра задач обработки естественного языка и локального развертывания."
+
+    # Семейство Mistral
+    if any(k in name_lower for k in ("mistral", "mixtral", "codestral")):
+        if is_code or "codestral" in name_lower:
+            return "Специализированная европейская модель от Mistral AI для быстрого написания, автодополнения и рефакторинга кода."
+        return "Высокопроизводительная модель от Mistral AI с открытыми весами для быстрого инференса и аналитических задач."
+
+    # Другие узнаваемые модели
+    if "mimo" in name_lower:
+        return "Энергоэффективная открытая модель от Xiaomi с низким временем отклика и сбалансированным качеством рассуждений."
+
+    if "grok" in name_lower:
+        return "Высокопроизводительная языковая модель от xAI с глубокими логическими способностями и актуальным пониманием контекста."
+
+    if "glm" in name_lower:
+        return "Передовая двуязычная модель от Zhipu AI для комплексного языкового анализа и решения прикладных задач."
+
+    if "phi" in name_lower:
+        return "Компактная высокоинтеллектуальная SLM-модель от Microsoft, обученная на синтетических данных эталонного качества."
+
+    if "minimax" in name_lower:
+        return "Флагманская языковая модель от MiniMax с поддержкой сверхдлинного контекста и уверенным следованием сложным инструкциям."
+
+    if "flux" in name_lower:
+        return "Генеративная диффузионная модель нового поколения от Black Forest Labs для создания фотореалистичных изображений."
+
+    if "midjourney" in name_lower:
+        return "Ведущая нейросеть для художественной генерации изображений с высокой эстетикой, кинематографичным светом и детализацией."
+
+    if "sora" in name_lower or "kling" in name_lower or "wan" in name_lower:
+        ven = norm_orgs.get((detected_org or "").lower(), detected_org) or "AI-лаборатории"
+        return f"Генеративная модель от {ven} для создания видео высокой четкости со стабильной физикой и динамикой движения."
+
+    # Общий фоллбэк с учетом вендора и домена задачи
+    v_prefix = f"Разработка {detected_org}" if detected_org else ("Открытая модель" if is_open else "Нейросетевая модель")
+    if is_code:
+        return f"{v_prefix}, оптимизированная для сложной веб-разработки, написания программного кода и дебаггинга."
+    if is_agent:
+        return f"{v_prefix}, предназначенная для автономных агентных сценариев, вызова инструментов и пошагового планирования."
+    if is_vision:
+        return f"{v_prefix}, ориентированная на мультимодальный анализ, распознавание документов и визуальную аналитику."
+    if is_video:
+        return f"{v_prefix}, разработанная для динамической генерации видео со стабильной физикой и анимацией."
+    if is_image:
+        return f"{v_prefix}, созданная для фотореалистичной генерации и стилизации изображений по текстовому описанию."
+    if is_reasoning:
+        return f"{v_prefix}, ориентированная на пошаговые логические рассуждения, математику и решение сложных задач."
+    return f"{v_prefix} для глубоких аналитических рассуждений, работы со сложным контекстом и прикладных ИИ-задач."
 
 
 def fetch_category_from_hf(config_name: str, limit: int = 25) -> list[dict]:
@@ -165,7 +277,7 @@ def fetch_category_from_hf(config_name: str, limit: int = 25) -> list[dict]:
     return results
 
 
-def parse_browser_page(page) -> list[dict]:
+def parse_browser_page(page, category: str = "") -> list[dict]:
     """Резервный парсер HTML-страницы через Playwright (если HF недоступен)."""
     table = page.locator("table").first
     table.locator("tbody tr").first.wait_for(timeout=10000)
@@ -210,7 +322,23 @@ def parse_browser_page(page) -> list[dict]:
 
             if clean_name and clean_name not in seen_names:
                 seen_names.add(clean_name)
-                parsed_data.append({"name": clean_name, "rating": clean_rating})
+                rating_num = clean_rating if isinstance(clean_rating, (int, float)) else 1000.0
+                summary = generate_model_breakdown(
+                    name=clean_name,
+                    org="",
+                    category=category,
+                    rating=rating_num,
+                    license_str="",
+                    vote_count=0
+                )
+                parsed_data.append({
+                    "name": clean_name,
+                    "rating": clean_rating,
+                    "organization": "",
+                    "license": "",
+                    "vote_count": 0,
+                    "summary": summary,
+                })
         except Exception:
             continue
 
@@ -257,7 +385,7 @@ def collect_all_categories(category_urls=None, limit: int = 25) -> dict:
                         page = ctx.new_page()
                         page.goto(url, wait_until="domcontentloaded", timeout=25000)
                         page.wait_for_selector("table", timeout=15000)
-                        p = parse_browser_page(page)
+                        p = parse_browser_page(page, category=cat)
                         if p:
                             all_data[cat] = p
                         ctx.close()
@@ -341,11 +469,31 @@ def aggregate_all_categories(records: list[dict], method: str = "avg") -> list[d
             chosen_rating = round(sum(valid_ratings) / len(valid_ratings), 1)
 
         cats = sorted({r.get("category", "") for r in rows if r.get("category")})
+        first_row = rows[0]
+        summary = next((r["summary"] for r in rows if r.get("summary")), "")
+        org = first_row.get("organization") or ""
+        lic = first_row.get("license") or ""
+        votes = sum(int(r.get("vote_count", 0) or 0) for r in rows)
+
+        if not summary:
+            summary = generate_model_breakdown(
+                name=name,
+                org=org,
+                category="Все категории",
+                rating=chosen_rating,
+                license_str=lic,
+                vote_count=votes,
+            )
+
         aggregated.append({
             "model_name": name,
             "rating": chosen_rating,
             "categories": cats,
             "category": f"{len(cats)} {format_cat_plural(len(cats))}",
+            "organization": org,
+            "license": lic,
+            "vote_count": votes,
+            "summary": summary,
             "is_aggregated": True,
         })
 

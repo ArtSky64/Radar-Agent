@@ -49,6 +49,8 @@ export interface RAGSectionProps {
   setActiveSessionId?: (id: string) => void;
   isSidePanel?: boolean;
   onClose?: () => void;
+  pendingPrompt?: string | null;
+  onClearPendingPrompt?: () => void;
 }
 
 export const RAGSection: React.FC<RAGSectionProps> = ({
@@ -58,6 +60,8 @@ export const RAGSection: React.FC<RAGSectionProps> = ({
   setActiveSessionId: externalSetActiveId,
   isSidePanel = false,
   onClose,
+  pendingPrompt,
+  onClearPendingPrompt,
 }) => {
   // Локальный фолбек для сессий, если не переданы извне
   const [internalSessions, setInternalSessions] = useState<ChatSession[]>(() => [
@@ -106,6 +110,13 @@ export const RAGSection: React.FC<RAGSectionProps> = ({
   useEffect(() => {
     scrollToBottom();
   }, [messages, isLoading, activeSessionId]);
+
+  useEffect(() => {
+    if (pendingPrompt && pendingPrompt.trim()) {
+      sendMessage(pendingPrompt.trim());
+      onClearPendingPrompt?.();
+    }
+  }, [pendingPrompt]);
 
   useEffect(() => {
     fetchStats();
@@ -534,11 +545,16 @@ export const RAGSection: React.FC<RAGSectionProps> = ({
                                   href={card.url}
                                   target="_blank"
                                   rel="noreferrer"
-                                  className="text-[11px] font-semibold text-white hover:text-purple-300 flex items-center gap-1 line-clamp-1"
+                                  className="text-[11px] font-semibold text-white hover:text-purple-300 flex items-center gap-1"
                                 >
                                   {card.title}
                                   <ExternalLink className="w-2.5 h-2.5 opacity-70 shrink-0" />
                                 </a>
+                                {card.summary && (
+                                  <p className="text-[10px] text-zinc-300 mt-1 leading-relaxed whitespace-pre-line">
+                                    {card.summary}
+                                  </p>
+                                )}
                               </div>
                             );
                           })}
@@ -896,7 +912,7 @@ export const RAGSection: React.FC<RAGSectionProps> = ({
                                   <ExternalLink className="w-3 h-3 opacity-70 shrink-0" />
                                 </a>
                                 {card.summary && (
-                                  <p className="text-[11px] text-zinc-400 mt-1 line-clamp-2 leading-relaxed">
+                                  <p className="text-[11px] text-zinc-300 mt-1.5 leading-relaxed whitespace-pre-line">
                                     {card.summary}
                                   </p>
                                 )}

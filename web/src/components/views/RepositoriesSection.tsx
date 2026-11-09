@@ -2,7 +2,6 @@ import React, { useState, useMemo } from 'react';
 import {
   GitFork,
   Search,
-  Filter,
   ExternalLink,
   RefreshCw,
   Star,
@@ -12,6 +11,7 @@ import {
   Target,
   Clock,
   Code2,
+  Calendar,
 } from 'lucide-react';
 import type { RepoItem, ArticleItem } from '../../types/domain';
 import { GITHUB_DIRECTIONS, GITHUB_TASK_TYPES } from '../../types/domain';
@@ -22,6 +22,7 @@ interface RepositoriesSectionProps {
   lastFetchedAt?: string | null;
   onRefresh?: () => Promise<void>;
   isRefreshing?: boolean;
+  onAskAssistant?: (prompt: string) => void;
 }
 
 export const RepositoriesSection: React.FC<RepositoriesSectionProps> = ({
@@ -29,9 +30,11 @@ export const RepositoriesSection: React.FC<RepositoriesSectionProps> = ({
   lastFetchedAt,
   onRefresh,
   isRefreshing = false,
+  onAskAssistant,
 }) => {
   const [searchQuery, setSearchQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<'all' | 'new' | 'existing'>('all');
+  const [periodFilter, setPeriodFilter] = useState<'all' | 'weekly' | 'monthly'>('all');
   const [selectedDirections, setSelectedDirections] = useState<string[]>([]);
   const [selectedTaskTypes, setSelectedTaskTypes] = useState<string[]>([]);
   const [sortBy, setSortBy] = useState<'stars' | 'newest' | 'name'>('stars');
@@ -53,6 +56,7 @@ export const RepositoriesSection: React.FC<RepositoriesSectionProps> = ({
         ? r.tags.split(',')
         : [];
       const language = (r.language || '').trim();
+      const period = (r.period || '').trim().toLowerCase();
 
       return {
         ...r,
@@ -65,9 +69,25 @@ export const RepositoriesSection: React.FC<RepositoriesSectionProps> = ({
         task_types: taskTypes,
         tags,
         language,
+        period,
       };
     });
   }, [repositories]);
+
+  // Подсчёт по периодам для вкладок
+  const weeklyCount = useMemo(() => {
+    return repoList.filter((r) => {
+      const p = r.period;
+      return p === 'weekly' || p === 'week';
+    }).length;
+  }, [repoList]);
+
+  const monthlyCount = useMemo(() => {
+    return repoList.filter((r) => {
+      const p = r.period;
+      return p === 'monthly' || p === 'month';
+    }).length;
+  }, [repoList]);
 
   // Фильтрация
   const filteredRepos = useMemo(() => {
@@ -80,9 +100,28 @@ export const RepositoriesSection: React.FC<RepositoriesSectionProps> = ({
         if (!name.includes(q) && !sum.includes(q)) return false;
       }
 
-      // Статус
+      // Статус в тренде
       if (statusFilter === 'new' && !repo.is_new) return false;
       if (statusFilter === 'existing' && repo.is_new) return false;
+
+      // Период (weekly / monthly)
+      if (periodFilter === 'weekly') {
+        const p = repo.period;
+        // Если указан weekly или week
+        if (p) {
+          if (p !== 'weekly' && p !== 'week') return false;
+        } else if (weeklyCount > 0) {
+          // Если у других элементов период размечен, а тут пусто — отсекаем
+          return false;
+        }
+      } else if (periodFilter === 'monthly') {
+        const p = repo.period;
+        if (p) {
+          if (p !== 'monthly' && p !== 'month') return false;
+        } else if (monthlyCount > 0) {
+          return false;
+        }
+      }
 
       // Направления (0-4)
       if (selectedDirections.length > 0) {
@@ -98,7 +137,7 @@ export const RepositoriesSection: React.FC<RepositoriesSectionProps> = ({
 
       return true;
     });
-  }, [repoList, searchQuery, statusFilter, selectedDirections, selectedTaskTypes]);
+  }, [repoList, searchQuery, statusFilter, periodFilter, selectedDirections, selectedTaskTypes, weeklyCount, monthlyCount]);
 
   // Сортировка
   const sortedRepos = useMemo(() => {
@@ -200,9 +239,54 @@ export const RepositoriesSection: React.FC<RepositoriesSectionProps> = ({
         </div>
       )}
 
+      {/* Вкладки периодов трендов */}
+      <div className="flex items-center gap-2 border-b border-border/80 pb-1">
+        <button
+          onClick={() => setPeriodFilter('all')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-t-lg text-sm font-medium transition-all ${
+            periodFilter === 'all'
+              ? 'bg-sky-950/40 text-sky-400 border-b-2 border-sky-400 font-semibold'
+              : 'text-muted-foreground hover:text-white hover:bg-secondary/40'
+          }`}
+        >
+          <span>🌐 Все периоды</span>
+          <span className="text-xs px-2 py-0.5 rounded-full bg-sky-900/50 text-sky-300">
+            {repoList.length}
+          </span>
+        </button>
+
+        <button
+          onClick={() => setPeriodFilter('weekly')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-t-lg text-sm font-medium transition-all ${
+            periodFilter === 'weekly'
+              ? 'bg-sky-950/40 text-sky-400 border-b-2 border-sky-400 font-semibold'
+              : 'text-muted-foreground hover:text-white hover:bg-secondary/40'
+          }`}
+        >
+          <span>🔥 Тренды за неделю</span>
+          <span className="text-xs px-2 py-0.5 rounded-full bg-sky-900/50 text-sky-300">
+            {weeklyCount}
+          </span>
+        </button>
+
+        <button
+          onClick={() => setPeriodFilter('monthly')}
+          className={`flex items-center gap-2 px-4 py-2 rounded-t-lg text-sm font-medium transition-all ${
+            periodFilter === 'monthly'
+              ? 'bg-sky-950/40 text-sky-400 border-b-2 border-sky-400 font-semibold'
+              : 'text-muted-foreground hover:text-white hover:bg-secondary/40'
+          }`}
+        >
+          <span>📅 Тренды за месяц</span>
+          <span className="text-xs px-2 py-0.5 rounded-full bg-sky-900/50 text-sky-300">
+            {monthlyCount}
+          </span>
+        </button>
+      </div>
+
       {/* Панель фильтров */}
       <div className="p-4 rounded-xl bg-[#12121A] border border-[#2D1B4E] space-y-4 shadow-sm">
-        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3">
           {/* Поиск */}
           <div className="relative">
             <Search className="w-4 h-4 absolute left-3 top-3 text-muted-foreground" />
@@ -213,6 +297,19 @@ export const RepositoriesSection: React.FC<RepositoriesSectionProps> = ({
               onChange={(e) => setSearchQuery(e.target.value)}
               className="w-full pl-9 pr-4 py-2 text-sm rounded-lg bg-[#0A0A0F] border border-[#2D1B4E] focus:border-purple-500 focus:outline-none text-white placeholder-muted-foreground"
             />
+          </div>
+
+          {/* Фильтр по периоду */}
+          <div>
+            <select
+              value={periodFilter}
+              onChange={(e) => setPeriodFilter(e.target.value as any)}
+              className="w-full px-3 py-2 text-sm rounded-lg bg-[#0A0A0F] border border-[#2D1B4E] text-white focus:border-purple-500 focus:outline-none"
+            >
+              <option value="all">Все периоды (Weekly + Monthly)</option>
+              <option value="weekly">🔥 Тренды за неделю (Weekly)</option>
+              <option value="monthly">📅 Тренды за месяц (Monthly)</option>
+            </select>
           </div>
 
           {/* Фильтр по статусу */}
@@ -297,6 +394,7 @@ export const RepositoriesSection: React.FC<RepositoriesSectionProps> = ({
         {/* Кнопка сброса */}
         {(searchQuery ||
           statusFilter !== 'all' ||
+          periodFilter !== 'all' ||
           selectedDirections.length > 0 ||
           selectedTaskTypes.length > 0) && (
           <div className="pt-2 border-t border-[#2D1B4E]/60 flex justify-end">
@@ -304,6 +402,7 @@ export const RepositoriesSection: React.FC<RepositoriesSectionProps> = ({
               onClick={() => {
                 setSearchQuery('');
                 setStatusFilter('all');
+                setPeriodFilter('all');
                 setSelectedDirections([]);
                 setSelectedTaskTypes([]);
               }}
@@ -349,6 +448,18 @@ export const RepositoriesSection: React.FC<RepositoriesSectionProps> = ({
                     <span className="text-[11px] font-bold px-2.5 py-0.5 rounded-md bg-purple-950/80 text-purple-300 border border-purple-500/50 flex items-center gap-1">
                       <Flame className="w-3 h-3 text-purple-400" />
                       🔥 В ТРЕНДЕ
+                    </span>
+                  )}
+
+                  {/* Период тренда */}
+                  {repo.period && (
+                    <span className="text-[11px] font-bold px-2.5 py-0.5 rounded-md bg-sky-950/80 text-sky-300 border border-sky-600/50 flex items-center gap-1">
+                      <Calendar className="w-3 h-3 text-sky-400" />
+                      {repo.period === 'weekly' || repo.period === 'week'
+                        ? 'НЕДЕЛЯ'
+                        : repo.period === 'monthly' || repo.period === 'month'
+                        ? 'МЕСЯЦ'
+                        : repo.period.toUpperCase()}
                     </span>
                   )}
 
@@ -412,15 +523,24 @@ export const RepositoriesSection: React.FC<RepositoriesSectionProps> = ({
                   </a>
                 </h3>
 
-                {/* Описание */}
+                {/* Описание — полный размер без обрезки */}
                 {repo.summary && (
-                  <p className="text-sm text-zinc-300 mt-2 leading-relaxed whitespace-pre-line line-clamp-3">
+                  <p className="text-sm text-zinc-300 mt-2 leading-relaxed whitespace-pre-line">
                     {repo.summary}
                   </p>
                 )}
 
-                {/* Прямая ссылка */}
-                <div className="mt-3 pt-2 text-xs">
+                {/* Прямая ссылка и кнопка ассистента */}
+                <div className="mt-3 pt-2 text-xs flex items-center justify-between">
+                  <button
+                    onClick={() => onAskAssistant?.(`Расскажи подробно про репозиторий "${repo.repo_name}": стек технологий, архитектура, ключевые возможности и как развернуть проект`)}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-purple-600/20 hover:bg-purple-600/40 text-purple-300 hover:text-white border border-purple-500/30 text-[11px] font-semibold transition-all cursor-pointer shadow-sm"
+                    title="Спросить у AI Ассистента"
+                  >
+                    <Sparkles className="w-3 h-3 text-purple-400" />
+                    <span>Спросить ассистента</span>
+                  </button>
+
                   <a
                     href={repo.url}
                     target="_blank"
