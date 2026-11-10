@@ -315,17 +315,43 @@ export const PapersSection: React.FC<PapersSectionProps> = ({
         ) : (
           displayedPapers.map((paper, idx) => {
             const rawTitle = paper.title || 'Untitled Paper';
-            const cleanTitle = rawTitle.replace(/^\[(HF|PwC)\]\s*/i, '');
-            const sourceUrl = paper.source_url || paper.url || '#';
+            const cleanTitle = rawTitle.replace(/^\[(HF|PwC|HF\/PwC)\]\s*/i, '');
+            const rawSourceUrl = paper.source_url || paper.url || '#';
             const isPwC =
-              rawTitle.includes('PwC') || sourceUrl.includes('paperswithcode');
+              rawTitle.includes('PwC') || rawSourceUrl.includes('paperswithcode');
             const isHF =
-              rawTitle.startsWith('[HF') || sourceUrl.includes('huggingface.co');
-            const platformName = isPwC ? 'Papers with Code' : isHF ? 'Hugging Face' : 'ArXiv';
+              rawTitle.startsWith('[HF') || rawSourceUrl.includes('huggingface.co');
+            const platformName = isPwC ? 'Papers with Code' : isHF ? 'Hugging Face' : 'Hugging Face';
 
-            const relLinks: RelatedLink[] = Array.isArray(paper.related_links)
+            // Извлекаем arxiv_id из любого формата URL (arxiv, huggingface, paperswithcode)
+            const arxivMatch =
+              rawSourceUrl.match(/(?:arxiv\.org\/(?:abs|pdf)\/|paperswithcode\.com\/paper\/|huggingface\.co\/papers\/)([0-9]{4}\.[0-9]{4,5}(?:v[0-9]+)?)/i) ||
+              rawSourceUrl.match(/([0-9]{4}\.[0-9]{4,5})/);
+            const arxivId = arxivMatch ? arxivMatch[1].replace(/v\d+$/, '') : '';
+
+            // Все статьи (и HF, и PwC) ведем напрямую на конкретную страницу статьи в Hugging Face Papers.
+            // Сервер paperswithcode.com/paper/{arxiv_id} слепо редиректит на общие тренды /papers/trending,
+            // в то время как huggingface.co/papers/{arxivId} открывает именно конкретную работу со всем кодом и обсуждением.
+            let readUrl = rawSourceUrl;
+            if (arxivId) {
+              readUrl = `https://huggingface.co/papers/${arxivId}`;
+            } else if (rawSourceUrl.includes('arxiv.org') || rawSourceUrl.includes('paperswithcode.com')) {
+              readUrl = 'https://huggingface.co/papers';
+            }
+
+            const rawRelLinks: RelatedLink[] = Array.isArray(paper.related_links)
               ? paper.related_links
               : [];
+            const relLinks: RelatedLink[] = [...rawRelLinks];
+
+            // Сохраняем ссылку на arXiv как дополнительный материал в карточке (для желающих открыть сырой препринт/PDF)
+            if (arxivId && !relLinks.some((r) => (r.url || '').includes('arxiv.org') || r.type === 'arxiv')) {
+              relLinks.push({
+                type: 'arxiv',
+                name: `arXiv: ${arxivId}`,
+                url: `https://arxiv.org/abs/${arxivId}`,
+              });
+            }
 
             const hasCode =
               Boolean(paper.has_code) ||
@@ -336,13 +362,13 @@ export const PapersSection: React.FC<PapersSectionProps> = ({
                   (r.url && r.url.includes('github.com'))
               ) ||
               (paper.summary || '').includes('github.com/') ||
-              sourceUrl.includes('github.com/');
+              rawSourceUrl.includes('github.com/');
 
             const upvotes = paper.stars || paper.upvotes || 0;
 
             return (
               <div
-                key={paper.rowid || `${sourceUrl}-${idx}`}
+                key={paper.rowid || `${readUrl}-${idx}`}
                 className="p-4 rounded-xl bg-gradient-to-b from-[#1A0E2B] to-[#160A25] border border-[#6D28D9]/70 hover:border-[#A855F7] transition-all duration-200 text-xs shadow-md"
               >
                 {/* Бэйджи */}
@@ -390,9 +416,9 @@ export const PapersSection: React.FC<PapersSectionProps> = ({
                   )}
                 </div>
 
-                {/* Название статьи */}
+                {/* Название статьи со ссылкой на первоисточник (HF / PwC) */}
                 <h3 className="text-sm font-bold text-white hover:text-purple-300 transition-colors">
-                  <a href={sourceUrl} target="_blank" rel="noreferrer" className="flex items-center gap-1.5">
+                  <a href={readUrl} target="_blank" rel="noreferrer" className="flex items-center gap-1.5">
                     {cleanTitle}
                     <ExternalLink className="w-3.5 h-3.5 opacity-50" />
                   </a>
@@ -405,7 +431,7 @@ export const PapersSection: React.FC<PapersSectionProps> = ({
                   </p>
                 )}
 
-                {/* Связанные материалы: код, статья, демо */}
+                {/* Связанные материалы: код, препринт arxiv, демо */}
                 {relLinks.length > 0 && (
                   <div className="flex flex-wrap items-center gap-2 mt-2.5 pt-2 border-t border-[#2D1B4E]/60">
                     {relLinks.map((rel, rIdx) => {
@@ -415,6 +441,7 @@ export const PapersSection: React.FC<PapersSectionProps> = ({
                         rel.type === 'github' ||
                         rel.type === 'code' ||
                         rUrl.includes('github.com');
+                      const isArxiv = rel.type === 'arxiv' || rUrl.includes('arxiv.org');
 
                       return (
                         <a
@@ -425,11 +452,13 @@ export const PapersSection: React.FC<PapersSectionProps> = ({
                           className={`inline-flex items-center gap-1 text-[11px] px-2 py-0.5 rounded border transition-colors ${
                             isGit
                               ? 'bg-emerald-950/70 text-emerald-300 border-emerald-700/60 hover:bg-emerald-900/80'
+                              : isArxiv
+                              ? 'bg-amber-950/40 text-amber-300 border-amber-700/50 hover:bg-amber-900/60'
                               : 'bg-zinc-900 text-zinc-300 border-zinc-700 hover:bg-zinc-800'
                           }`}
                         >
-                          {isGit ? <Code className="w-3 h-3" /> : <LinkIcon className="w-3 h-3" />}
-                          {isGit ? `Репозиторий кода ↗` : rName}
+                          {isGit ? <Code className="w-3 h-3" /> : isArxiv ? <FileText className="w-3 h-3" /> : <LinkIcon className="w-3 h-3" />}
+                          {isGit ? `Репозиторий кода ↗` : isArxiv ? `${rName} ↗` : rName}
                         </a>
                       );
                     })}
@@ -448,7 +477,7 @@ export const PapersSection: React.FC<PapersSectionProps> = ({
                   </button>
 
                   <a
-                    href={sourceUrl}
+                    href={readUrl}
                     target="_blank"
                     rel="noreferrer"
                     className="text-purple-400 hover:text-purple-300 underline font-medium text-[11px]"

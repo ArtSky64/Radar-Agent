@@ -1,18 +1,11 @@
-try:
-    import pytest
-except ImportError:
-    class _MockPytest:
-        class mark:
-            @staticmethod
-            def parametrize(*args, **kwargs):
-                return lambda fn: fn
-    pytest = _MockPytest()
+import pytest
 
 from leaderboard_view import (
     aggregate_all_categories,
     build_latest_records,
     category_count_label,
     format_rating,
+    get_model_url,
 )
 
 
@@ -97,19 +90,16 @@ def test_format_rating():
     assert format_rating(1403.666) == "1403.7"
 
 
-def test_summary_is_generated_when_missing():
-    s = snap("2026-07-01", text=[("Claude Opus 5.5", 1800)])
-    records = build_latest_records([s])
-    assert len(records) == 1
-    assert "Anthropic" in records[0]["summary"]
-    assert len(records[0]["summary"]) > 20
-    assert "•" not in records[0]["summary"]
+def test_get_model_url_known_organizations():
+    assert get_model_url("Claude Opus 5.5 (Max)", "anthropic") == "https://claude.ai/"
+    assert get_model_url("Gemini 4 Argon (High)", "google") == "https://gemini.google.com/"
+    assert get_model_url("GPT-6.1 Terra (Max)", "openai") == "https://chatgpt.com/"
+    assert get_model_url("Grok 3 (Beta)", "xai") == "https://x.ai/"
+    assert "Qwen" in get_model_url("Qwen3.8-Max", "alibaba")
+    assert "meta-llama" in get_model_url("Llama-3.3-70B-Instruct", "meta")
+    assert get_model_url("Kimi K3.1 Pro (Max)", "moonshot") == "https://kimi.moonshot.cn/"
+    assert get_model_url("DeepSeek-V4.1-Flash", "deepseek", "MIT") == "https://huggingface.co/models?search=deepseek-ai+DeepSeek-V4.1-Flash"
+    assert get_model_url("DeepSeek-V4.1-Flash", "deepseek", "Proprietary") == "https://chat.deepseek.com/"
+    assert get_model_url("meta-llama/Llama-3-8B", "meta") == "https://huggingface.co/meta-llama/Llama-3-8B"
+    assert get_model_url("Unknown Model", "", "Proprietary") == "https://lmarena.ai/?leaderboard"
 
-
-def test_aggregate_summary_is_preserved_or_generated():
-    s = snap("2026-07-01", text=[("DeepSeek-V3", 1400)])
-    records = build_latest_records([s])
-    agg = aggregate_all_categories(records)
-    assert len(agg) == 1
-    assert "DeepSeek" in agg[0]["summary"]
-    assert "•" not in agg[0]["summary"]

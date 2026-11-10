@@ -56,7 +56,7 @@ def _is_vllm_online() -> bool:
     if _VLLM_STATUS["online"] is not None and (now - _VLLM_STATUS["checked_at"] < 15.0):
         return _VLLM_STATUS["online"]
 
-    base_url = config.VLLM_BASE_URL or "http://127.0.0.1:2233/v1"
+    base_url = config.VLLM_BASE_URL or "http://192.168.10.65:8901/v1"
     models_url = f"{base_url.rstrip('/')}/models"
     try:
         with httpx.Client(timeout=0.3) as client:
@@ -77,7 +77,7 @@ def get_rag_model() -> OpenAIChatModel:
     Возвращает модель OpenAI-совместимого провайдера (vLLM Qwen 3.6 27B).
     Параметры берутся из config.py / .env.
     """
-    base_url = config.VLLM_BASE_URL or "http://127.0.0.1:2233/v1"
+    base_url = config.VLLM_BASE_URL or "http://192.168.10.65:8901/v1"
     model_name = config.VLLM_MODEL_NAME or "Qwen/Qwen3.6-27B"
     api_key = config.VLLM_API_KEY or "not-needed"
 

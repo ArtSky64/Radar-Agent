@@ -40,6 +40,7 @@ export function buildLatestRecords(snapshots: any[]): LeaderboardRecord[] {
           license: m.license || '',
           vote_count: Number(m.vote_count) || 0,
           summary: m.summary || '',
+          url: m.url || '',
         });
       }
     }
@@ -123,4 +124,151 @@ export function formatTimestampRu(tsStr: string | null | undefined): string {
   } catch {
     return String(tsStr);
   }
+}
+
+/**
+ * Формирует прямую валидную ссылку на модель или платформу разработчика.
+ * Устраняет проблему битых ссылок при слепом поиске на Hugging Face для проприетарных
+ * и коммерческих моделей LMSYS Arena (Gemini, Claude, GPT, Grok и др.).
+ */
+export function getLeaderboardModelUrl(rec: {
+  model_name: string;
+  organization?: string;
+  license?: string;
+  category?: string;
+  url?: string;
+  source_url?: string;
+}): string {
+  if (rec.url && rec.url.startsWith('http')) {
+    return rec.url;
+  }
+  if (rec.source_url && rec.source_url.startsWith('http')) {
+    return rec.source_url;
+  }
+
+  const name = (rec.model_name || '').trim();
+  const org = (rec.organization || '').toLowerCase().trim();
+  const lic = (rec.license || '').toLowerCase().trim();
+  const nameLower = name.toLowerCase();
+
+  // Если имя модели уже содержит репозиторий "org/repo"
+  if (name.includes('/') && !name.includes(' ')) {
+    return `https://huggingface.co/${name}`;
+  }
+
+  // Очищенное базовое имя без суффиксов тегов бенчмарка в скобках:
+  // "Claude Opus 5.5 (Max)" -> "Claude Opus 5.5"
+  // "Gemini 4 Argon (High)" -> "Gemini 4 Argon"
+  // "DeepSeek-V4.1-Flash-20261017 (Max)" -> "DeepSeek-V4.1-Flash"
+  const cleanName = name
+    .replace(/\s*\([^)]*\)/g, '')
+    .replace(/-\d{8}$/, '')
+    .trim();
+
+  // 1. По популярным организациям и семействам моделей
+  if (org === 'anthropic' || nameLower.startsWith('claude')) {
+    return 'https://claude.ai/';
+  }
+  if (
+    org === 'openai' ||
+    nameLower.startsWith('gpt') ||
+    nameLower.startsWith('o1') ||
+    nameLower.startsWith('o3') ||
+    nameLower.startsWith('chatgpt')
+  ) {
+    return 'https://chatgpt.com/';
+  }
+  if (org === 'google' || nameLower.startsWith('gemini')) {
+    if (nameLower.startsWith('gemma')) {
+      return `https://huggingface.co/google/${encodeURIComponent(cleanName.toLowerCase())}`;
+    }
+    return 'https://gemini.google.com/';
+  }
+  if (org === 'xai' || nameLower.startsWith('grok')) {
+    return 'https://x.ai/';
+  }
+  if (org === 'deepseek' || nameLower.includes('deepseek')) {
+    if (lic.includes('mit') || lic.includes('apache') || lic.includes('open')) {
+      return `https://huggingface.co/models?search=deepseek-ai+${encodeURIComponent(cleanName)}`;
+    }
+    return 'https://chat.deepseek.com/';
+  }
+  if (org === 'alibaba' || nameLower.startsWith('qwen')) {
+    return `https://huggingface.co/models?search=Qwen+${encodeURIComponent(cleanName)}`;
+  }
+  if (org === 'meta' || nameLower.startsWith('llama')) {
+    if (nameLower.startsWith('llama')) {
+      return `https://huggingface.co/models?search=meta-llama+${encodeURIComponent(cleanName)}`;
+    }
+    return 'https://about.meta.com/';
+  }
+  if (
+    org === 'mistral' ||
+    nameLower.includes('mistral') ||
+    nameLower.includes('mixtral') ||
+    nameLower.includes('codestral') ||
+    nameLower.includes('pixtral')
+  ) {
+    return `https://huggingface.co/models?search=mistralai+${encodeURIComponent(cleanName)}`;
+  }
+  if (org === 'bfl' || nameLower.startsWith('flux')) {
+    return `https://huggingface.co/models?search=black-forest-labs+${encodeURIComponent(cleanName)}`;
+  }
+  if (org === 'moonshot' || nameLower.startsWith('kimi')) {
+    return 'https://kimi.moonshot.cn/';
+  }
+  if (org === 'minimax') {
+    return 'https://www.minimax.io/';
+  }
+  if (org === 'bytedance' || nameLower.startsWith('doubao') || nameLower.startsWith('seed')) {
+    return 'https://www.doubao.com/';
+  }
+  if (org === 'stepfun') {
+    return 'https://www.stepfun.com/';
+  }
+  if (org === 'kling') {
+    return 'https://klingai.com/';
+  }
+  if (org === 'runway') {
+    return 'https://runwayml.com/';
+  }
+  if (org === 'luma-ai' || org === 'luma') {
+    return 'https://lumalabs.ai/';
+  }
+  if (org === 'ideogram') {
+    return 'https://ideogram.ai/';
+  }
+  if (org === 'recraft') {
+    return 'https://www.recraft.ai/';
+  }
+  if (org === 'pika') {
+    return 'https://pika.art/';
+  }
+  if (org === 'baidu' || nameLower.startsWith('ernie')) {
+    return 'https://yiyan.baidu.com/';
+  }
+  if (org === 'tencent' || nameLower.startsWith('hy') || nameLower.startsWith('hunyuan')) {
+    return 'https://hunyuan.tencent.com/';
+  }
+  if (org === 'nvidia') {
+    return `https://huggingface.co/models?search=nvidia+${encodeURIComponent(cleanName)}`;
+  }
+  if (org === 'microsoft-ai' || org === 'microsoft' || nameLower.startsWith('phi')) {
+    return `https://huggingface.co/models?search=microsoft+${encodeURIComponent(cleanName)}`;
+  }
+  if (org === 'perplexity') {
+    return 'https://www.perplexity.ai/';
+  }
+  if (org === 'zai' || org === 'zhipu' || nameLower.startsWith('glm')) {
+    return 'https://chatglm.cn/';
+  }
+
+  // 2. Если модель имеет открытую лицензию
+  const isOpen = lic && !['proprietary', 'commercial', 'closed', 'unknown', ''].includes(lic);
+  if (isOpen) {
+    return `https://huggingface.co/models?search=${encodeURIComponent(cleanName)}`;
+  }
+
+  // 3. Fallback: официальный лидерборд LMSYS Chatbot Arena
+  return 'https://lmarena.ai/?leaderboard';
 }

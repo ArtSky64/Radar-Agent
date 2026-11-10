@@ -6,6 +6,7 @@ import {
   aggregateAllCategories,
   formatRating,
   formatTimestampRu,
+  getLeaderboardModelUrl,
 } from '../../utils/leaderboard';
 
 interface LeaderboardSectionProps {
@@ -174,9 +175,7 @@ export const LeaderboardSection: React.FC<LeaderboardSectionProps> = ({
           </div>
         ) : (
           filtered.map((rec, idx) => {
-            const hfSearchUrl = `https://huggingface.co/models?search=${encodeURIComponent(
-              rec.model_name
-            )}`;
+            const modelUrl = getLeaderboardModelUrl(rec);
             const catsToShow = isAggregate
               ? rec.categories || [rec.category]
               : [selectedCat];
@@ -194,7 +193,13 @@ export const LeaderboardSection: React.FC<LeaderboardSectionProps> = ({
                       </span>
                       <div className="flex items-center gap-3">
                         <h3 className="text-sm font-bold text-white hover:text-purple-300 transition-colors">
-                          <a href={hfSearchUrl} target="_blank" rel="noreferrer" className="flex items-center gap-1.5">
+                          <a
+                            href={modelUrl}
+                            target="_blank"
+                            rel="noreferrer"
+                            className="flex items-center gap-1.5"
+                            title={`Открыть страницу ${rec.model_name}`}
+                          >
                             {rec.model_name}
                             <ExternalLink className="w-3.5 h-3.5 opacity-50" />
                           </a>

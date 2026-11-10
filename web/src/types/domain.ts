@@ -17,6 +17,8 @@ export interface LeaderboardRecord {
   license?: string;
   vote_count?: number;
   summary?: string;
+  url?: string;
+  source_url?: string;
 }
 
 export interface HFModelItem {

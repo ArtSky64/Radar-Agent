@@ -122,18 +122,15 @@ def _load_all_cards_from_db() -> list[dict[str, Any]]:
         # 3. Таблица github_trending (репозитории)
         try:
             rows = cursor.execute("""
-                SELECT rowid, repo_name, description, summary, url,
-                       tags, stars, language, period
+                SELECT rowid, repo_name, source_url, summary,
+                       tags, directions, task_types, stars, period
                 FROM github_trending
             """).fetchall()
             for r in rows:
                 tags = _clean_tags(r["tags"])
                 title = (r["repo_name"] or "Без названия").strip()
-                summary = (r["summary"] or r["description"] or "").strip()
-                url = (r["url"] or f"https://github.com/{title}").strip()
-                lang = (r["language"] or "").strip()
-                if lang and lang not in tags:
-                    tags.append(lang)
+                summary = (r["summary"] or "").strip()
+                url = (r["source_url"] or f"https://github.com/{title}").strip()
 
                 cards.append({
                     "id": f"gh_{r['rowid']}",
@@ -144,7 +141,6 @@ def _load_all_cards_from_db() -> list[dict[str, Any]]:
                     "tags": tags,
                     "metrics": {
                         "stars": r["stars"] or 0,
-                        "language": lang,
                         "period": r["period"] or "",
                     },
                     "added_at": "",

@@ -247,12 +247,14 @@ async def fetch_hf_daily_papers_for_date(client: httpx.AsyncClient | None, date_
             if project_page:
                 rel_links.append({"type": "project", "name": "Project Page", "url": project_page})
 
+            rel_links.append({"type": "arxiv", "name": f"arXiv: {arxiv_id}", "url": f"https://arxiv.org/abs/{arxiv_id}"})
+
             papers.append({
                 "arxiv_id": arxiv_id,
                 "title": title,
                 "abstract": summary,
                 "upvotes": upvotes,
-                "url": f"https://arxiv.org/abs/{arxiv_id}",
+                "url": f"https://huggingface.co/papers/{arxiv_id}",
                 "source": "hf",
                 "published_at": published_at,
                 "period": period,
@@ -314,12 +316,14 @@ async def fetch_hf_official_trending(client: httpx.AsyncClient | None = None, li
             if project_page:
                 rel_links.append({"type": "project", "name": "Project Page", "url": project_page})
 
+            rel_links.append({"type": "arxiv", "name": f"arXiv: {arxiv_id}", "url": f"https://arxiv.org/abs/{arxiv_id}"})
+
             papers.append({
                 "arxiv_id": arxiv_id,
                 "title": title,
                 "abstract": summary,
                 "upvotes": upvotes,
-                "url": f"https://arxiv.org/abs/{arxiv_id}",
+                "url": f"https://huggingface.co/papers/{arxiv_id}",
                 "source": "hf",
                 "published_at": published_at,
                 "period": period,
@@ -509,7 +513,9 @@ async def _inspect_and_call_trending(session: ClientSession | None, days: int) -
         title = (item.get("title") or "").strip()
         abstract = (item.get("abstract") or item.get("summary") or "").strip()
         upvotes = int(item.get("upvotes") or item.get("stars") or item.get("favorites") or 0)
-        url = item.get("url") or f"https://arxiv.org/abs/{arxiv_id}"
+        # Канонический URL конкретной статьи: huggingface.co/papers/{arxiv_id}.
+        # Ссылки paperswithcode.com/paper/{arxiv_id} сервер PwC редиректит на общий /papers/trending.
+        url = f"https://huggingface.co/papers/{arxiv_id}"
 
         papers.append({
             "arxiv_id": arxiv_id,
@@ -628,7 +634,7 @@ async def _fetch_hf_papers_by_query(query: str, limit: int = 50) -> list[dict]:
                         "title": title,
                         "abstract": abstract,
                         "upvotes": upvotes,
-                        "url": f"https://arxiv.org/abs/{aid}",
+                        "url": f"https://huggingface.co/papers/{aid}",
                         "source": "pwc_topic",
                         "topic_tag": query,
                         "period": "weekly",
@@ -690,7 +696,8 @@ async def fetch_papers_by_topic(slug: str, session: ClientSession | None = None)
                 title = (item.get("title") or "").strip()
                 abstract = (item.get("abstract") or item.get("summary") or "").strip()
                 upvotes = int(item.get("upvotes") or item.get("stars") or 0)
-                url = item.get("url") or f"https://arxiv.org/abs/{arxiv_id}"
+                # Канонический прямой URL конкретной статьи в HF Papers
+                url = f"https://huggingface.co/papers/{arxiv_id}"
 
                 if not _is_valid_topic_paper(slug, title, abstract):
                     continue
@@ -739,7 +746,6 @@ def merge_papers(*lists_of_papers) -> list[dict]:
             upvotes = int(p.get("upvotes") or 0)
             title = p.get("title", "").strip()
             abstract = p.get("abstract", "").strip()
-            url = p.get("url") or f"https://arxiv.org/abs/{arxiv_id}"
             topic_tag = p.get("topic_tag", "")
 
             # Извлекаем список источников: поддерживаем и одиночный source, и уже сформированный список sources
@@ -750,6 +756,14 @@ def merge_papers(*lists_of_papers) -> list[dict]:
                 incoming_sources = [p["source"]]
             else:
                 incoming_sources = ["unknown"]
+
+            # Первоисточник статьи: прямой URL конкретной статьи в Hugging Face Papers.
+            # PwC переехал в HF, а ссылки paperswithcode.com/paper/... редиректят на общий /papers/trending.
+            raw_url = p.get("url") or ""
+            if not raw_url or "arxiv.org" in raw_url or "paperswithcode.com/paper/" in raw_url:
+                url = f"https://huggingface.co/papers/{arxiv_id}"
+            else:
+                url = raw_url
 
             period = p.get("period", "")
             has_code = p.get("has_code", 0)
@@ -775,6 +789,10 @@ def merge_papers(*lists_of_papers) -> list[dict]:
                     existing["title"] = title
                 if not existing["abstract"] and abstract:
                     existing["abstract"] = abstract
+                if not existing["url"] or "arxiv.org" in existing["url"] or "paperswithcode.com/paper/" in existing["url"]:
+                    existing["url"] = f"https://huggingface.co/papers/{arxiv_id}"
+                elif url and "arxiv.org" not in url and "paperswithcode.com/paper/" not in url:
+                    existing["url"] = url
                 for s in incoming_sources:
                     if s not in existing["sources"] and s != "unknown":
                         existing["sources"].append(s)
@@ -959,6 +977,10 @@ async def _enrich_related_links(papers: list[dict], session: ClientSession | Non
                     related_links.append({"type": "github", "url": gh_url, "name": clean_repo.split("/")[-1]})
 
             has_code = 1 if any(l.get("type") in ("github", "code") for l in related_links) else 0
+            # Сохраняем ссылку на arXiv как дополнительный материал, если пользователь захочет скачать PDF
+            if aid and not any(l.get("type") == "arxiv" or "arxiv.org" in (l.get("url") or "") for l in related_links):
+                related_links.append({"type": "arxiv", "url": f"https://arxiv.org/abs/{aid}", "name": f"arXiv: {aid}"})
+
             p["has_code"] = has_code
             p["related_links"] = related_links
             p["related_materials"] = related_materials
