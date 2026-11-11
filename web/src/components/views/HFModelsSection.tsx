@@ -12,7 +12,7 @@ import {
   Target,
   Globe2,
 } from 'lucide-react';
-import type { HFModelItem } from '../../types/domain';
+import type { HFModelItem, CardContext } from '../../types/domain';
 import { HF_DIRECTIONS, HF_TASK_TYPES } from '../../types/domain';
 import { formatTimestampRu } from '../../utils/leaderboard';
 
@@ -22,7 +22,7 @@ interface HFModelsSectionProps {
   lastFetchedAt?: string | null;
   onRefresh: () => void;
   isRefreshing?: boolean;
-  onAskAssistant?: (prompt: string) => void;
+  onAskAssistant?: (prompt: string, cardContext?: CardContext) => void;
 }
 
 export const HFModelsSection: React.FC<HFModelsSectionProps> = ({
@@ -398,7 +398,33 @@ export const HFModelsSection: React.FC<HFModelsSectionProps> = ({
 
                   <div className="ml-auto flex items-center gap-3">
                     <button
-                      onClick={() => onAskAssistant?.(`Расскажи подробно про модель ${modelName}: архитектура, назначение, сильные стороны и как её запустить`)}
+                      onClick={() =>
+                        onAskAssistant?.(
+                          `Расскажи подробно про модель ${modelName}: архитектура, назначение, сильные стороны и как её запустить`,
+                          {
+                            id: `hf_${m.model_name}`,
+                            title: modelName,
+                            category: 'модель',
+                            url: modelUrl,
+                            summary: m.summary,
+                            full_description: m.card_description || m.summary,
+                            tags: Array.isArray(m.tags) ? m.tags : m.tags ? [String(m.tags)] : [],
+                            metrics: {
+                              downloads: m.downloads,
+                              likes: m.likes,
+                              rank_global: m.rank_global,
+                              rank_ru: m.rank_ru,
+                            },
+                            details: {
+                              parameters: m.parameters,
+                              pipeline_tag: m.pipeline_tag,
+                              license: m.license,
+                              language: m.language,
+                              variant: m.variant,
+                            },
+                          }
+                        )
+                      }
                       className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-purple-600/20 hover:bg-purple-600/40 text-purple-300 hover:text-white border border-purple-500/30 text-[11px] font-semibold transition-all cursor-pointer shadow-sm"
                       title="Спросить у AI Ассистента"
                     >

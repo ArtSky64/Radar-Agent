@@ -109,12 +109,31 @@ export interface RAGCard {
   url: string;
   category: 'датасет' | 'модель' | 'репозиторий' | 'статья' | string;
   summary?: string;
+  full_description?: string;
   tags?: string[];
   metrics?: {
     stars?: number;
     downloads?: number;
     likes?: number;
+    rating?: number;
+    vote_count?: number;
+    rank_global?: number;
+    rank_ru?: number;
+    forks?: number;
   };
+  details?: Record<string, any>;
+}
+
+export interface CardContext {
+  id?: string;
+  title: string;
+  category: 'датасет' | 'модель' | 'репозиторий' | 'статья' | string;
+  url?: string;
+  summary?: string;
+  full_description?: string;
+  tags?: string[];
+  metrics?: Record<string, any>;
+  details?: Record<string, any>;
 }
 
 // Словари направлений и типов задач из config.py

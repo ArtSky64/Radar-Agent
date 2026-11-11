@@ -29,6 +29,7 @@ import type {
   ArticleItem,
   RepoItem,
   AnalysisRecord,
+  CardContext,
 } from './types/domain';
 import type { RadarTelemetry } from './types/intel';
 import { buildLatestRecords } from './utils/leaderboard';
@@ -110,11 +111,14 @@ export default function App() {
   }, [activeSessionId]);
 
   // Буфер сообщения для передачи в чат ассистента при клике по карточке
-  const [pendingPrompt, setPendingPrompt] = useState<string | null>(null);
+  const [pendingPrompt, setPendingPrompt] = useState<{
+    text: string;
+    cardContext?: CardContext;
+  } | null>(null);
 
-  const handleAskAssistant = (promptText: string) => {
+  const handleAskAssistant = (promptText: string, cardContext?: CardContext) => {
     setIsAssistantOpen(true);
-    setPendingPrompt(promptText);
+    setPendingPrompt({ text: promptText, cardContext });
   };
 
   // Стейт открытия боковой панели ассистента

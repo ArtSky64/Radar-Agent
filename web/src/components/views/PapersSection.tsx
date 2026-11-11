@@ -12,13 +12,13 @@ import {
   XCircle,
   Link as LinkIcon,
 } from 'lucide-react';
-import type { ArticleItem, RelatedLink } from '../../types/domain';
+import type { ArticleItem, RelatedLink, CardContext } from '../../types/domain';
 
 interface PapersSectionProps {
   articles: ArticleItem[];
   onRefresh: () => void;
   isRefreshing?: boolean;
-  onAskAssistant?: (prompt: string) => void;
+  onAskAssistant?: (prompt: string, cardContext?: CardContext) => void;
 }
 
 export const PapersSection: React.FC<PapersSectionProps> = ({
@@ -468,7 +468,29 @@ export const PapersSection: React.FC<PapersSectionProps> = ({
                 {/* Ссылка на источник и кнопка ассистента */}
                 <div className="mt-2.5 pt-1 flex items-center justify-between">
                   <button
-                    onClick={() => onAskAssistant?.(`Сделай научный разбор статьи "${cleanTitle}": основная гипотеза, предложенный метод, результаты тестов и выводы`)}
+                    onClick={() =>
+                      onAskAssistant?.(
+                        `Сделай научный разбор статьи "${cleanTitle}": основная гипотеза, предложенный метод, результаты тестов и выводы`,
+                        {
+                          id: `art_${paper.rowid || cleanTitle}`,
+                          title: cleanTitle,
+                          category: 'статья',
+                          url: readUrl || paper.source_url,
+                          summary: paper.summary,
+                          full_description: paper.summary,
+                          tags: Array.isArray(paper.tags) ? paper.tags : paper.tags ? [String(paper.tags)] : [],
+                          metrics: {
+                            stars: paper.stars || 0,
+                          },
+                          details: {
+                            directions: paper.directions,
+                            task_types: paper.task_types,
+                            related_links: paper.related_links,
+                            platform: platformName,
+                          },
+                        }
+                      )
+                    }
                     className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-purple-600/20 hover:bg-purple-600/40 text-purple-300 hover:text-white border border-purple-500/30 text-[11px] font-semibold transition-all cursor-pointer shadow-sm"
                     title="Спросить у AI Ассистента"
                   >

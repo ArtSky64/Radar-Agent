@@ -238,6 +238,7 @@ class RagChatRequest(BaseModel):
     category: str = Field(default="all", description="Категория: all, датасет, модель, репозиторий, статья")
     max_sources: int = Field(default=5, ge=1, le=20, description="Количество карточек в рекомендации")
     top_k: int | None = Field(default=None, ge=1, le=20, description="Алиас для обратной совместимости")
+    card_context: dict | None = Field(default=None, description="Контекст конкретной карточки при вызове из интерфейса")
 
 
 @app.post("/rag/chat")
@@ -252,6 +253,7 @@ def rag_chat_endpoint(req: RagChatRequest):
             history=req.messages,
             category_filter=req.category,
             max_sources=limit,
+            card_context=req.card_context,
         )
         return {"status": "success", "data": res}
     except Exception as e:
@@ -283,6 +285,7 @@ class IntelQueryRequest(BaseModel):
     category: str = "all"
     max_sources: int = 5
     top_k: int | None = None
+    card_context: dict | None = None
 
 
 @app.post("/api/v1/rag/query")
@@ -294,6 +297,7 @@ def api_v1_rag_query(req: IntelQueryRequest):
             history=[{"role": "user", "content": req.prompt}],
             category_filter=req.category,
             max_sources=limit,
+            card_context=req.card_context,
         )
         cards = res.get("cards", [])
         sources = [

@@ -13,7 +13,7 @@ import {
   Code2,
   Calendar,
 } from 'lucide-react';
-import type { RepoItem, ArticleItem } from '../../types/domain';
+import type { RepoItem, ArticleItem, CardContext } from '../../types/domain';
 import { GITHUB_DIRECTIONS, GITHUB_TASK_TYPES } from '../../types/domain';
 import { formatTimestampRu } from '../../utils/leaderboard';
 
@@ -22,7 +22,7 @@ interface RepositoriesSectionProps {
   lastFetchedAt?: string | null;
   onRefresh?: () => Promise<void>;
   isRefreshing?: boolean;
-  onAskAssistant?: (prompt: string) => void;
+  onAskAssistant?: (prompt: string, cardContext?: CardContext) => void;
 }
 
 export const RepositoriesSection: React.FC<RepositoriesSectionProps> = ({
@@ -533,7 +533,30 @@ export const RepositoriesSection: React.FC<RepositoriesSectionProps> = ({
                 {/* Прямая ссылка и кнопка ассистента */}
                 <div className="mt-3 pt-2 text-xs flex items-center justify-between">
                   <button
-                    onClick={() => onAskAssistant?.(`Расскажи подробно про репозиторий "${repo.repo_name}": стек технологий, архитектура, ключевые возможности и как развернуть проект`)}
+                    onClick={() =>
+                      onAskAssistant?.(
+                        `Расскажи подробно про репозиторий "${repo.repo_name}": стек технологий, архитектура, ключевые возможности и как развернуть проект`,
+                        {
+                          id: `gh_${repo.repo_name}`,
+                          title: repo.repo_name,
+                          category: 'репозиторий',
+                          url: repo.url,
+                          summary: repo.summary,
+                          full_description: repo.summary,
+                          tags: Array.isArray(repo.tags) ? repo.tags : repo.tags ? [String(repo.tags)] : [],
+                          metrics: {
+                            stars: repo.stars,
+                            forks: repo.forks,
+                          },
+                          details: {
+                            directions: repo.directions,
+                            task_types: repo.task_types,
+                            language: repo.language,
+                            period: repo.period,
+                          },
+                        }
+                      )
+                    }
                     className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-purple-600/20 hover:bg-purple-600/40 text-purple-300 hover:text-white border border-purple-500/30 text-[11px] font-semibold transition-all cursor-pointer shadow-sm"
                     title="Спросить у AI Ассистента"
                   >

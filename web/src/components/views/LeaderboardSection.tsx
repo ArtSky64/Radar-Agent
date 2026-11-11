@@ -1,6 +1,6 @@
 import React, { useState, useMemo } from 'react';
 import { RotateCw, ChevronDown, ChevronUp, ExternalLink, Flame, Sparkles, HelpCircle } from 'lucide-react';
-import type { LeaderboardRecord, AnalysisRecord } from '../../types/domain';
+import type { LeaderboardRecord, AnalysisRecord, CardContext } from '../../types/domain';
 import {
   ALL_CATEGORIES,
   aggregateAllCategories,
@@ -15,7 +15,7 @@ interface LeaderboardSectionProps {
   latestAnalysis?: AnalysisRecord | null;
   onRefresh: () => void;
   isRefreshing?: boolean;
-  onAskAssistant?: (prompt: string) => void;
+  onAskAssistant?: (prompt: string, cardContext?: CardContext) => void;
 }
 
 export const LeaderboardSection: React.FC<LeaderboardSectionProps> = ({
@@ -205,7 +205,29 @@ export const LeaderboardSection: React.FC<LeaderboardSectionProps> = ({
                           </a>
                         </h3>
                         <button
-                          onClick={() => onAskAssistant?.(`Расскажи подробно про модель ${rec.model_name} из рейтинга LMSYS Arena: её Elo-рейтинг, архитектура, лицензия и сравнение с конкурентами`)}
+                          onClick={() =>
+                            onAskAssistant?.(
+                              `Расскажи подробно про модель ${rec.model_name} из рейтинга LMSYS Arena: её Elo-рейтинг, архитектура, лицензия и сравнение с конкурентами`,
+                              {
+                                id: `lb_${rec.model_name}`,
+                                title: rec.model_name,
+                                category: 'модель',
+                                url: modelUrl,
+                                summary: rec.summary,
+                                full_description: rec.summary,
+                                tags: rec.category ? [rec.category] : [],
+                                metrics: {
+                                  rating: rec.rating,
+                                  vote_count: rec.vote_count,
+                                },
+                                details: {
+                                  organization: rec.organization,
+                                  license: rec.license,
+                                  arena_category: rec.category,
+                                },
+                              }
+                            )
+                          }
                           className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded-md bg-purple-600/20 hover:bg-purple-600/40 text-purple-300 hover:text-white border border-purple-500/30 text-[10px] font-medium transition-colors cursor-pointer shadow-sm"
                           title="Спросить у AI Ассистента"
                         >

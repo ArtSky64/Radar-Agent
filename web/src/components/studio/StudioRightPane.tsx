@@ -24,13 +24,14 @@ import { IntelligenceOrb } from '../ui/IntelligenceOrb';
 import { TypewriterText } from '../ui/TypewriterText';
 import { MarkdownRenderer } from '../ui/MarkdownRenderer';
 import type { IntelItem, ChatMessage } from '../../types/intel';
+import type { CardContext } from '../../types/domain';
 import { getItemGrammar } from '../../utils/intelItemLabels';
 
 interface StudioRightPaneProps {
   mode?: 'center' | 'docked';
   selectedItem: IntelItem | null;
   onClearSelectedItem: () => void;
-  onAskAssistant?: (prompt: string) => void;
+  onAskAssistant?: (prompt: string, cardContext?: CardContext) => void;
   onCollapse: () => void;
   onTransitionToHub?: () => void;
   onTransitionToCenter?: () => void;
@@ -39,7 +40,7 @@ interface StudioRightPaneProps {
   injectedPrompt?: string;
   onClearInjectedPrompt?: () => void;
   messages?: ChatMessage[];
-  onSendMessage?: (text: string) => Promise<void> | void;
+  onSendMessage?: (text: string, cardContext?: CardContext) => Promise<void> | void;
   isLoading?: boolean;
 }
 
@@ -140,7 +141,7 @@ export const StudioRightPane: React.FC<StudioRightPaneProps> = ({
     }
   }, [injectedPrompt]);
 
-  const handleSend = async (text: string) => {
+  const handleSend = async (text: string, cardContext?: CardContext) => {
     const q = text.trim();
     if (!q || isLoading) return;
 
@@ -151,7 +152,7 @@ export const StudioRightPane: React.FC<StudioRightPaneProps> = ({
 
     if (externalSendMessage) {
       setInput('');
-      await externalSendMessage(q);
+      await externalSendMessage(q, cardContext);
       return;
     }
 
@@ -173,7 +174,7 @@ export const StudioRightPane: React.FC<StudioRightPaneProps> = ({
       const res = await fetch('/api/v1/rag/query', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: q }),
+        body: JSON.stringify({ prompt: q, card_context: cardContext || null }),
       });
       const data = await res.json();
 
@@ -433,10 +434,10 @@ export const StudioRightPane: React.FC<StudioRightPaneProps> = ({
                   key={m.id}
                   className={`flex flex-col ${
                     m.role === 'user' ? 'items-end' : 'items-start'
-                  } space-y-1`}
+                  } space-y-1 min-w-0 max-w-full`}
                 >
                   <div
-                    className={`max-w-[92%] text-xs leading-relaxed rounded-2xl p-3.5 shadow-sm ${
+                    className={`max-w-[92%] min-w-0 text-xs leading-relaxed rounded-2xl p-3.5 shadow-sm break-words [overflow-wrap:anywhere] ${
                       m.role === 'user'
                         ? 'bg-gradient-to-r from-blue-600 to-indigo-600 text-white font-medium shadow-indigo-600/20'
                         : 'bg-white/[0.04] text-zinc-200 border border-white/[0.07] shadow-[inset_0_1px_0_0_rgba(255,255,255,0.05)]'
@@ -444,29 +445,31 @@ export const StudioRightPane: React.FC<StudioRightPaneProps> = ({
                   >
                     {m.thinking && (
                       <div className="mb-2 pb-1.5 text-[11px] font-mono text-indigo-300 border-b border-indigo-500/20 flex items-center gap-1.5">
-                        <Sparkles className="w-3 h-3 text-indigo-400" />
-                        <span>{m.thinking}</span>
+                        <Sparkles className="w-3 h-3 text-indigo-400 shrink-0" />
+                        <span className="break-words">{m.thinking}</span>
                       </div>
                     )}
 
                     {m.role === 'user' ? (
-                      <p className="whitespace-pre-wrap">{m.content}</p>
+                      <p className="whitespace-pre-wrap break-words [overflow-wrap:anywhere]">{m.content}</p>
                     ) : (
-                      <MarkdownRenderer content={m.content} />
+                      <div className="min-w-0 max-w-full overflow-hidden">
+                        <MarkdownRenderer content={m.content} />
+                      </div>
                     )}
 
                     {m.sources && m.sources.length > 0 && (
-                      <div className="mt-3 pt-2.5 border-t border-white/[0.08] flex flex-wrap gap-1.5">
+                      <div className="mt-3 pt-2.5 border-t border-white/[0.08] flex flex-wrap gap-1.5 min-w-0 max-w-full">
                         {m.sources.map((s, idx) => (
                           <a
                             key={idx}
                             href={s.url}
                             target="_blank"
                             rel="noreferrer"
-                            className="inline-flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded-md bg-indigo-500/15 text-indigo-300 border border-indigo-500/25 hover:border-indigo-400 transition-colors"
+                            className="inline-flex items-center gap-1 text-[10px] font-mono px-2 py-0.5 rounded-md bg-indigo-500/15 text-indigo-300 border border-indigo-500/25 hover:border-indigo-400 transition-colors break-all [overflow-wrap:anywhere]"
                           >
-                            <span>{s.title}</span>
-                            <ExternalLink className="w-2.5 h-2.5 opacity-80" />
+                            <span className="break-words">{s.title}</span>
+                            <ExternalLink className="w-2.5 h-2.5 opacity-80 shrink-0" />
                           </a>
                         ))}
                       </div>
@@ -644,8 +647,38 @@ export const StudioRightPane: React.FC<StudioRightPaneProps> = ({
                   <div className="space-y-2 pt-2">
                     <button
                       onClick={() => {
-                        setActiveTab('assistant');
-                        handleSend(`Сделай глубокий анализ ${grammar.genitive} "${selectedItem.title}"`);
+                        const catMap: Record<string, string> = {
+                          'HuggingFace': 'модель',
+                          'GitHub': 'репозиторий',
+                          'ArXiv': 'статья',
+                          'LMSys Arena': 'модель',
+                        };
+                        const category = catMap[selectedItem.source] || selectedItem.category || 'материал';
+                        const cardCtx: CardContext = {
+                          id: selectedItem.id,
+                          title: selectedItem.title,
+                          category: category,
+                          url: selectedItem.url,
+                          summary: selectedItem.summary,
+                          full_description: selectedItem.summary,
+                          tags: [selectedItem.category, selectedItem.topic].filter(Boolean),
+                          metrics: {
+                            value: selectedItem.metricValue,
+                            label: selectedItem.metricLabel,
+                            arenaElo: selectedItem.arenaElo,
+                          },
+                          details: {
+                            organization: selectedItem.organization,
+                            license: selectedItem.license,
+                            architecture: selectedItem.architecture,
+                          },
+                        };
+                        if (onAskAssistant) {
+                          onAskAssistant(`Сделай глубокий анализ ${grammar.genitive} "${selectedItem.title}"`, cardCtx);
+                        } else {
+                          setActiveTab('assistant');
+                          handleSend(`Сделай глубокий анализ ${grammar.genitive} "${selectedItem.title}"`, cardCtx);
+                        }
                       }}
                       className="w-full flex items-center justify-center space-x-2 py-3 px-4 rounded-xl bg-gradient-to-r from-blue-600 via-indigo-600 to-violet-600 hover:from-blue-500 hover:to-violet-500 text-white font-semibold text-xs transition-all shadow-md shadow-indigo-600/25 cursor-pointer"
                     >

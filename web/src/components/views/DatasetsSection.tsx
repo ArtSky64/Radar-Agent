@@ -15,13 +15,13 @@ import {
   CheckCircle2,
   XCircle,
 } from 'lucide-react';
-import type { ArticleItem, RelatedLink } from '../../types/domain';
+import type { ArticleItem, RelatedLink, CardContext } from '../../types/domain';
 
 interface DatasetsSectionProps {
   articles: ArticleItem[];
   onRefresh?: () => Promise<void>;
   isRefreshing?: boolean;
-  onAskAssistant?: (prompt: string) => void;
+  onAskAssistant?: (prompt: string, cardContext?: CardContext) => void;
 }
 
 type DatasetTab = 'ru' | 'global' | 'kaggle' | 'all';
@@ -692,7 +692,29 @@ export const DatasetsSection: React.FC<DatasetsSectionProps> = ({
                 {/* Прямая ссылка на источник и кнопка ассистента */}
                 <div className="mt-3 pt-2 text-xs flex items-center justify-between">
                   <button
-                    onClick={() => onAskAssistant?.(`Сделай подробный обзор датасета "${cleanTitle}": структура данных, задачи и какие модели на нём обучают`)}
+                    onClick={() =>
+                      onAskAssistant?.(
+                        `Сделай подробный обзор датасета "${cleanTitle}": структура данных, задачи и какие модели на нём обучают`,
+                        {
+                          id: `art_${d.rowid || cleanTitle}`,
+                          title: cleanTitle,
+                          category: 'датасет',
+                          url: sourceUrl || d.source_url,
+                          summary: d.summary,
+                          full_description: d.summary,
+                          tags: Array.isArray(d.tags) ? d.tags : d.tags ? [String(d.tags)] : [],
+                          metrics: {
+                            stars: d.stars || d.upvotes || 0,
+                          },
+                          details: {
+                            directions: d.directions,
+                            task_types: d.task_types,
+                            related_links: d.related_links,
+                            platform: platformName,
+                          },
+                        }
+                      )
+                    }
                     className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-purple-600/20 hover:bg-purple-600/40 text-purple-300 hover:text-white border border-purple-500/30 text-[11px] font-semibold transition-all cursor-pointer shadow-sm"
                     title="Спросить у AI Ассистента"
                   >

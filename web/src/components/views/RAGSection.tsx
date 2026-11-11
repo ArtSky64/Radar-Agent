@@ -11,13 +11,14 @@ import {
   Sliders,
   Star,
   Download,
+  Heart,
   ShieldAlert,
   Palette,
   MessageSquare,
   Plus,
   X,
 } from 'lucide-react';
-import type { RAGCard } from '../../types/domain';
+import type { RAGCard, CardContext } from '../../types/domain';
 import { MarkdownRenderer } from '../ui/MarkdownRenderer';
 
 export interface RAGMessage {
@@ -32,6 +33,7 @@ export interface ChatSession {
   title: string;
   messages: RAGMessage[];
   createdAt: number;
+  activeCard?: CardContext;
 }
 
 interface CatalogStats {
@@ -49,7 +51,7 @@ export interface RAGSectionProps {
   setActiveSessionId?: (id: string) => void;
   isSidePanel?: boolean;
   onClose?: () => void;
-  pendingPrompt?: string | null;
+  pendingPrompt?: { text: string; cardContext?: CardContext } | string | null;
   onClearPendingPrompt?: () => void;
 }
 
@@ -112,9 +114,14 @@ export const RAGSection: React.FC<RAGSectionProps> = ({
   }, [messages, isLoading, activeSessionId]);
 
   useEffect(() => {
-    if (pendingPrompt && pendingPrompt.trim()) {
-      sendMessage(pendingPrompt.trim());
-      onClearPendingPrompt?.();
+    if (pendingPrompt) {
+      if (typeof pendingPrompt === 'string' && pendingPrompt.trim()) {
+        sendMessage(pendingPrompt.trim());
+        onClearPendingPrompt?.();
+      } else if (typeof pendingPrompt === 'object' && pendingPrompt.text && pendingPrompt.text.trim()) {
+        sendMessage(pendingPrompt.text.trim(), pendingPrompt.cardContext);
+        onClearPendingPrompt?.();
+      }
     }
   }, [pendingPrompt]);
 
@@ -193,12 +200,14 @@ export const RAGSection: React.FC<RAGSectionProps> = ({
   };
 
   // Отправка сообщения в текущую вкладку
-  const sendMessage = async (text: string) => {
+  const sendMessage = async (text: string, cardContext?: CardContext) => {
     if (!text.trim() || isLoading) return;
 
     const userMsg: RAGMessage = { role: 'user', content: text.trim() };
     const currentSessionId = activeSession.id;
     const updatedMessages = [...messages, userMsg];
+    const effectiveCardContext = cardContext || activeSession.activeCard;
+    const isInitialCardBreakdown = !!cardContext && messages.length === 0;
 
     // Обновляем состояние сообщений текущей вкладки и присваиваем ей осмысленное название
     setSessions((prev) =>
@@ -211,6 +220,7 @@ export const RAGSection: React.FC<RAGSectionProps> = ({
           return {
             ...s,
             title,
+            activeCard: cardContext || s.activeCard,
             messages: updatedMessages,
           };
         }
@@ -229,8 +239,9 @@ export const RAGSection: React.FC<RAGSectionProps> = ({
           // Передаем строго историю ТЕКУЩЕЙ вкладки!
           messages: updatedMessages.map((m) => ({ role: m.role, content: m.content })),
           category: selectedCategory,
-          max_sources: maxSources,
-          top_k: maxSources,
+          max_sources: isInitialCardBreakdown ? 1 : maxSources,
+          top_k: isInitialCardBreakdown ? 1 : maxSources,
+          card_context: effectiveCardContext || null,
         }),
       });
 
@@ -485,7 +496,7 @@ export const RAGSection: React.FC<RAGSectionProps> = ({
               return (
                 <div
                   key={idx}
-                  className={`flex gap-2.5 ${isUser ? 'justify-end' : 'justify-start'}`}
+                  className={`flex gap-2.5 ${isUser ? 'justify-end' : 'justify-start'} min-w-0 max-w-full`}
                 >
                   {!isUser && (
                     <div className="w-6 h-6 rounded-full bg-purple-950 border border-purple-600 flex items-center justify-center shrink-0 text-purple-400 mt-1">
@@ -494,64 +505,77 @@ export const RAGSection: React.FC<RAGSectionProps> = ({
                   )}
 
                   <div
-                    className={`max-w-[88%] rounded-2xl px-3.5 py-2.5 text-xs leading-relaxed ${
+                    className={`max-w-[88%] min-w-0 rounded-2xl px-3.5 py-2.5 text-xs leading-relaxed break-words [overflow-wrap:anywhere] ${
                       isUser
                         ? 'bg-purple-600 text-white shadow-md'
                         : 'bg-[#150D2E] text-zinc-200 border border-[#3B156E] shadow-sm'
                     }`}
                   >
                     {isUser ? (
-                      <div className="whitespace-pre-line">{msg.content}</div>
+                      <div className="whitespace-pre-line break-words [overflow-wrap:anywhere]">{msg.content}</div>
                     ) : (
-                      <MarkdownRenderer content={msg.content} />
+                      <div className="min-w-0 max-w-full overflow-hidden">
+                        <MarkdownRenderer content={msg.content} />
+                      </div>
                     )}
 
                     {/* Карточки найденных сущностей */}
                     {msg.cards && msg.cards.length > 0 && (
-                      <div className="mt-3 pt-2.5 border-t border-[#3B156E]/60 space-y-2">
+                      <div className="mt-3 pt-2.5 border-t border-[#3B156E]/60 space-y-2 min-w-0 max-w-full">
                         <div className="text-[11px] font-semibold text-purple-300 flex items-center gap-1">
-                          <Sparkles className="w-3 h-3" />
-                          Источники ({msg.cards.length}):
+                          <Sparkles className="w-3 h-3 shrink-0" />
+                          <span>{msg.cards.length === 1 ? 'Карточка материала:' : `Источники (${msg.cards.length}):`}</span>
                         </div>
 
-                        <div className="space-y-1.5">
+                        <div className="space-y-1.5 min-w-0 max-w-full">
                           {msg.cards.map((card, cIdx) => {
                             const badge = getCategoryBadge(card.category);
                             return (
                               <div
                                 key={cIdx}
-                                className="p-2 rounded-lg bg-[#0A0515] border border-[#4C1D95]/60 hover:border-purple-400 transition-colors"
+                                className="p-2.5 rounded-lg bg-[#0A0515] border border-[#4C1D95]/60 hover:border-purple-400 transition-colors min-w-0 max-w-full overflow-hidden"
                               >
-                                <div className="flex items-center gap-1.5 mb-1">
+                                <div className="flex items-center gap-1.5 mb-1 flex-wrap">
                                   <span
-                                    className={`text-[9px] font-bold px-1.5 py-0.5 rounded border ${badge.className}`}
+                                    className={`text-[9px] font-bold px-1.5 py-0.5 rounded border shrink-0 ${badge.className}`}
                                   >
                                     {badge.label}
                                   </span>
-                                  {card.metrics?.stars && (
-                                    <span className="text-[9px] text-amber-300 flex items-center gap-0.5">
+                                  {card.metrics?.stars ? (
+                                    <span className="text-[9px] text-amber-300 flex items-center gap-0.5 shrink-0">
                                       <Star className="w-2.5 h-2.5 fill-amber-400" />
                                       {card.metrics.stars.toLocaleString()}
                                     </span>
-                                  )}
-                                  {card.metrics?.downloads && (
-                                    <span className="text-[9px] text-sky-300 flex items-center gap-0.5">
+                                  ) : null}
+                                  {card.metrics?.downloads ? (
+                                    <span className="text-[9px] text-sky-300 flex items-center gap-0.5 shrink-0">
                                       <Download className="w-2.5 h-2.5" />
                                       {card.metrics.downloads.toLocaleString()}
                                     </span>
-                                  )}
+                                  ) : null}
+                                  {card.metrics?.likes ? (
+                                    <span className="text-[9px] text-rose-300 flex items-center gap-0.5 shrink-0">
+                                      <Heart className="w-2.5 h-2.5 fill-rose-400" />
+                                      {card.metrics.likes.toLocaleString()}
+                                    </span>
+                                  ) : null}
+                                  {card.metrics?.rating ? (
+                                    <span className="text-[9px] text-amber-300 font-mono flex items-center gap-0.5 shrink-0">
+                                      ★ Elo {card.metrics.rating}
+                                    </span>
+                                  ) : null}
                                 </div>
                                 <a
                                   href={card.url}
                                   target="_blank"
                                   rel="noreferrer"
-                                  className="text-[11px] font-semibold text-white hover:text-purple-300 flex items-center gap-1"
+                                  className="text-[11px] font-semibold text-white hover:text-purple-300 flex items-center gap-1 break-words [overflow-wrap:anywhere]"
                                 >
-                                  {card.title}
+                                  <span className="break-words">{card.title}</span>
                                   <ExternalLink className="w-2.5 h-2.5 opacity-70 shrink-0" />
                                 </a>
                                 {card.summary && (
-                                  <p className="text-[10px] text-zinc-300 mt-1 leading-relaxed whitespace-pre-line">
+                                  <p className="text-[10px] text-zinc-300 mt-1 leading-relaxed whitespace-pre-line break-words [overflow-wrap:anywhere]">
                                     {card.summary}
                                   </p>
                                 )}
@@ -846,7 +870,7 @@ export const RAGSection: React.FC<RAGSectionProps> = ({
               return (
                 <div
                   key={idx}
-                  className={`flex gap-3 ${isUser ? 'justify-end' : 'justify-start'}`}
+                  className={`flex gap-3 ${isUser ? 'justify-end' : 'justify-start'} min-w-0 max-w-full`}
                 >
                   {!isUser && (
                     <div className="w-8 h-8 rounded-full bg-purple-950 border border-purple-600 flex items-center justify-center shrink-0 text-purple-400 mt-1 shadow-sm">
@@ -855,64 +879,77 @@ export const RAGSection: React.FC<RAGSectionProps> = ({
                   )}
 
                   <div
-                    className={`max-w-[85%] rounded-2xl p-4 text-xs leading-relaxed ${
+                    className={`max-w-[85%] min-w-0 rounded-2xl p-4 text-xs leading-relaxed break-words [overflow-wrap:anywhere] ${
                       isUser
                         ? 'bg-purple-600 text-white shadow-md'
                         : 'bg-[#150D2E] text-zinc-200 border border-[#3B156E] shadow-sm'
                     }`}
                   >
                     {isUser ? (
-                      <div className="whitespace-pre-line text-sm">{msg.content}</div>
+                      <div className="whitespace-pre-line text-sm break-words [overflow-wrap:anywhere]">{msg.content}</div>
                     ) : (
-                      <MarkdownRenderer content={msg.content} />
+                      <div className="min-w-0 max-w-full overflow-hidden">
+                        <MarkdownRenderer content={msg.content} />
+                      </div>
                     )}
 
                     {/* Карточки найденных сущностей */}
                     {msg.cards && msg.cards.length > 0 && (
-                      <div className="mt-4 pt-3 border-t border-[#3B156E]/60 space-y-2">
+                      <div className="mt-4 pt-3 border-t border-[#3B156E]/60 space-y-2 min-w-0 max-w-full">
                         <div className="text-xs font-semibold text-purple-300 flex items-center gap-1.5">
-                          <Sparkles className="w-3.5 h-3.5" />
-                          Релевантные первоисточники ({msg.cards.length}):
+                          <Sparkles className="w-3.5 h-3.5 shrink-0" />
+                          <span>{msg.cards.length === 1 ? 'Карточка материала:' : `Релевантные первоисточники (${msg.cards.length}):`}</span>
                         </div>
 
-                        <div className="grid grid-cols-1 md:grid-cols-2 gap-2 mt-2">
+                        <div className="grid grid-cols-1 md:grid-cols-2 gap-2 mt-2 min-w-0 max-w-full">
                           {msg.cards.map((card, cIdx) => {
                             const badge = getCategoryBadge(card.category);
                             return (
                               <div
                                 key={cIdx}
-                                className="p-2.5 rounded-xl bg-[#0A0515] border border-[#4C1D95]/60 hover:border-purple-400 transition-colors"
+                                className="p-2.5 rounded-xl bg-[#0A0515] border border-[#4C1D95]/60 hover:border-purple-400 transition-colors min-w-0 max-w-full overflow-hidden"
                               >
-                                <div className="flex items-center gap-2 mb-1.5">
+                                <div className="flex items-center gap-2 mb-1.5 flex-wrap">
                                   <span
-                                    className={`text-[9px] font-bold px-1.5 py-0.5 rounded border ${badge.className}`}
+                                    className={`text-[9px] font-bold px-1.5 py-0.5 rounded border shrink-0 ${badge.className}`}
                                   >
                                     {badge.label}
                                   </span>
-                                  {card.metrics?.stars && (
-                                    <span className="text-[10px] text-amber-300 flex items-center gap-0.5">
+                                  {card.metrics?.stars ? (
+                                    <span className="text-[10px] text-amber-300 flex items-center gap-0.5 shrink-0">
                                       <Star className="w-2.5 h-2.5 fill-amber-400" />
                                       {card.metrics.stars.toLocaleString()}
                                     </span>
-                                  )}
-                                  {card.metrics?.downloads && (
-                                    <span className="text-[10px] text-sky-300 flex items-center gap-0.5">
+                                  ) : null}
+                                  {card.metrics?.downloads ? (
+                                    <span className="text-[10px] text-sky-300 flex items-center gap-0.5 shrink-0">
                                       <Download className="w-2.5 h-2.5" />
                                       {card.metrics.downloads.toLocaleString()}
                                     </span>
-                                  )}
+                                  ) : null}
+                                  {card.metrics?.likes ? (
+                                    <span className="text-[10px] text-rose-300 flex items-center gap-0.5 shrink-0">
+                                      <Heart className="w-2.5 h-2.5 fill-rose-400" />
+                                      {card.metrics.likes.toLocaleString()}
+                                    </span>
+                                  ) : null}
+                                  {card.metrics?.rating ? (
+                                    <span className="text-[10px] text-amber-300 font-mono flex items-center gap-0.5 shrink-0">
+                                      ★ Elo {card.metrics.rating}
+                                    </span>
+                                  ) : null}
                                 </div>
                                 <a
                                   href={card.url}
                                   target="_blank"
                                   rel="noreferrer"
-                                  className="text-xs font-semibold text-white hover:text-purple-300 flex items-center gap-1 line-clamp-1"
+                                  className="text-xs font-semibold text-white hover:text-purple-300 flex items-center gap-1 break-words [overflow-wrap:anywhere]"
                                 >
-                                  {card.title}
+                                  <span className="break-words">{card.title}</span>
                                   <ExternalLink className="w-3 h-3 opacity-70 shrink-0" />
                                 </a>
                                 {card.summary && (
-                                  <p className="text-[11px] text-zinc-300 mt-1.5 leading-relaxed whitespace-pre-line">
+                                  <p className="text-[11px] text-zinc-300 mt-1.5 leading-relaxed whitespace-pre-line break-words [overflow-wrap:anywhere]">
                                     {card.summary}
                                   </p>
                                 )}
@@ -946,6 +983,26 @@ export const RAGSection: React.FC<RAGSectionProps> = ({
 
         {/* Поле ввода сообщения */}
         <div className="p-4 border-t border-[#2D1B4E] bg-[#120B24]">
+          {activeSession.activeCard && (
+            <div className="flex items-center justify-between px-3 py-1.5 mb-2.5 rounded-xl bg-[#1B0F33] border border-purple-500/30 text-xs text-purple-200 shadow-sm animate-in fade-in duration-200">
+              <div className="flex items-center gap-1.5 min-w-0">
+                <Sparkles className="w-3.5 h-3.5 text-purple-400 shrink-0" />
+                <span className="text-zinc-400 shrink-0">Контекст карточки:</span>
+                <span className="font-medium text-white truncate">{activeSession.activeCard.title}</span>
+              </div>
+              <button
+                onClick={() => {
+                  setSessions((prev) =>
+                    prev.map((s) => (s.id === activeSession.id ? { ...s, activeCard: undefined } : s))
+                  );
+                }}
+                className="text-zinc-400 hover:text-white ml-2 text-[11px] px-1.5 py-0.5 rounded hover:bg-purple-900/40 shrink-0 transition-colors cursor-pointer"
+                title="Открепить контекст этой карточки"
+              >
+                ✕ Открепить
+              </button>
+            </div>
+          )}
           <div className="relative flex items-center">
             <textarea
               rows={3}
