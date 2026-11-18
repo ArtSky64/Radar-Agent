@@ -1,4 +1,5 @@
 import logging
+import os
 import re
 import threading
 import time
@@ -26,10 +27,14 @@ import threading
 
 _RATE_LIMIT_LOCK = threading.Lock()
 _last_call_ts = 0.0
-_MIN_INTERVAL_SEC = 1.05
+# Для локального/высокопроизводительного vLLM интервал минимален (по умолчанию 0.05с вместо 1.05с),
+# но может переопределяться через переменную окружения RATE_LIMIT_INTERVAL_SEC.
+_MIN_INTERVAL_SEC = float(os.getenv("RATE_LIMIT_INTERVAL_SEC", "0.05"))
 
 def _throttle() -> None:
     global _last_call_ts
+    if _MIN_INTERVAL_SEC <= 0:
+        return
     with _RATE_LIMIT_LOCK:
         now = time.monotonic()
         wait = _MIN_INTERVAL_SEC - (now - _last_call_ts)

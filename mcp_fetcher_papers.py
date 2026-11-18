@@ -1122,25 +1122,40 @@ def ingest_papers(
     Не запускает тяжелые скраперы арены (Playwright), GitHub и Kaggle.
     Позволяет обновить раздел 'Papers (Статьи)' за 1-2 минуты.
     """
-    import numpy as np
-    from database import init_db, get_all_vectors, save_vector, save_article, upsert_related_material
-    from dedup import text_to_vector, is_duplicate
+    from database import (
+        init_db,
+        get_all_vectors,
+        save_vector,
+        save_article,
+        upsert_related_material,
+        get_existing_article_urls,
+        is_vector_duplicate_db,
+    )
+    from dedup import text_to_vector, is_duplicate, flush_embeddings_cache
     from agent_manager import analyze_article, AnalysisError
 
     init_db()
     logger.info("=== Запуск автономного обновления раздела 'Papers (Статьи)' ===")
-    memory_vectors: list[np.ndarray] = [np.array(v, dtype=np.float32) for v in get_all_vectors()]
-    logger.info(f"Загружено существующих векторов из БД: {len(memory_vectors)}")
+    memory_vectors: list[list[float]] = list(get_all_vectors())
+    existing_urls: set[str] = get_existing_article_urls()
+    logger.info(f"Загружено векторов из БД: {len(memory_vectors)}, известных URL: {len(existing_urls)}")
 
     processed, skipped, failed = 0, 0, 0
     for article in stream_papers_articles(days=days, limit_hf=limit_hf, limit_pwc=limit_pwc):
         title = article["title"]
         text = article["text"]
-        source_url = article["source_url"]
+        source_url = str(article.get("source_url") or "").strip()
+        clean_url = source_url.rstrip("/")
+
+        # Мгновенная проверка на уже имеющуюся статью
+        if clean_url and (clean_url in existing_urls or f"{clean_url}/" in existing_urls):
+            logger.info(f"[EXISTS] Статья уже в базе: {title}")
+            skipped += 1
+            continue
 
         new_vector = text_to_vector(text)
 
-        if is_duplicate(new_vector, memory_vectors):
+        if is_vector_duplicate_db(new_vector) or is_duplicate(new_vector, memory_vectors):
             logger.info(f"[SKIP] Дубликат статьи: {title}")
             skipped += 1
             continue
@@ -1152,7 +1167,8 @@ def ingest_papers(
             failed += 1
             continue
 
-        save_vector(new_vector.tolist())
+        save_vector(new_vector)
+        memory_vectors.append(new_vector)
 
         payload = {
             "title": title,
@@ -1182,7 +1198,10 @@ def ingest_papers(
                 logger.warning(f"Не удалось сохранить связанный материал {material}: {upsert_err}")
 
         memory_vectors.append(new_vector)
+        existing_urls.add(clean_url)
+        existing_urls.add(f"{clean_url}/")
 
+    flush_embeddings_cache()
     logger.info(f"=== Готово! Обработано новых статей: {processed}, дублей: {skipped}, ошибок: {failed} ===")
     return {"processed": processed, "skipped": skipped, "failed": failed}
 

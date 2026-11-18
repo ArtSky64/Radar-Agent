@@ -1,11 +1,19 @@
 import logging
 
-import numpy as np
-
 import config
-from dedup import text_to_vector, is_duplicate
+from dedup import text_to_vector, is_duplicate, flush_embeddings_cache
 from agent_manager import analyze_article, analyze_dataset, DatasetCard, AnalysisError
-from database import init_db, get_all_vectors, save_vector, save_article, delete_old_vectors, save_trending_models, upsert_related_material
+from database import (
+    init_db,
+    get_all_vectors,
+    save_vector,
+    save_article,
+    delete_old_vectors,
+    save_trending_models,
+    upsert_related_material,
+    is_vector_duplicate_db,
+    get_existing_article_urls,
+)
 from FetcherHFDatasets import stream_hf_datasets_by_mode
 from mcp_fetcher_kaggle import stream_kaggle_articles
 from mcp_fetcher_papers import stream_papers_articles
@@ -75,38 +83,38 @@ def _tag_source_type(articles, source_type: str):
         yield article
 
 
-def stream_all_new_articles():
-    # Раньше тут был единственный статичный запрос "machine learning" — при
-    # повторных прогонах (раз в 3 дня, плюс ручные запуски) HF отдаёт почти
-    # одну и ту же топ-выдачу по этому запросу, и все кандидаты уходят в дедуп
-    # как уже виденные (см. лог: "Обработано: 0, дублей: 22"). Гоняем несколько
+def stream_all_new_articles(include_github: bool = False):
+    # Датасеты Hugging Face
     for mode in config.HF_DATASET_MODES:
         try:
             yield from _tag_source_type(stream_hf_datasets_by_mode(mode), "датасет")
         except Exception as e:
             logger.error(f"Источник Hugging Face (датасеты, режим='{mode}') недоступен: {e}")
 
+    # Научные статьи (HF Papers + Papers with Code)
     try:
         yield from _tag_source_type(stream_papers_articles(), "статья")
     except Exception as e:
         logger.error(f"Источник Papers (HF + PwC) недоступен: {e}")
 
-    #одно множество на все режимы гита, чтобы репо выбранное ллм в одном режиме не уходило в ллм повторно в другому
-    seen_github_ids: set[str] = set()
-
-    try:
-        yield from _tag_source_type(stream_github_articles_v2(seen_ids=seen_github_ids), "репозиторий")
-    except Exception as e:
-        logger.error(f"Источник GitHub(SearchAPI) недоступен: {e}")
-
-    for period in TRENDING_PERIODS:
+    # GitHub Trending уже полностью обновлён и проанализирован в _refresh_github_trending()
+    # отдельным этапом в main(), поэтому повторный медленный сбор по умолчанию не требуется.
+    if include_github:
+        seen_github_ids: set[str] = set()
         try:
-            yield from _tag_source_type(
-                stream_github_trending_page_articles(period, seen_ids=seen_github_ids), "репозиторий",)
+            yield from _tag_source_type(stream_github_articles_v2(seen_ids=seen_github_ids), "репозиторий")
         except Exception as e:
-            logger.error(f"Источник GitHub Trending ({period}) недоступен: {e}")
+            logger.error(f"Источник GitHub(SearchAPI) недоступен: {e}")
 
+        for period in TRENDING_PERIODS:
+            try:
+                yield from _tag_source_type(
+                    stream_github_trending_page_articles(period, seen_ids=seen_github_ids), "репозиторий",
+                )
+            except Exception as e:
+                logger.error(f"Источник GitHub Trending ({period}) недоступен: {e}")
 
+    # Датасеты Kaggle
     try:
         yield from _tag_source_type(stream_kaggle_articles(), "датасет")
     except Exception as e:
@@ -177,31 +185,64 @@ def process_articles_stream(articles_stream):
     # они должны копиться со всех прогонов, это база знаний, а не разовый снимок)
     delete_old_vectors(days=14)
 
-    # 1. ОДИН РАЗ выгружаем все векторы из БД в оперативную память.
-    memory_vectors: list[np.ndarray] = [np.array(v, dtype=np.float32) for v in get_all_vectors()]
-    logger.info(f"Загружено векторов из БД: {len(memory_vectors)}")
+    # 1. ОДИН РАЗ выгружаем все векторы и известные URL из БД в оперативную память.
+    memory_vectors: list[list[float]] = list(get_all_vectors())
+    existing_urls: set[str] = get_existing_article_urls()
+    logger.info(f"Загружено векторов из БД: {len(memory_vectors)}, известных URL: {len(existing_urls)}")
 
     processed, skipped, failed = 0, 0, 0
 
     # 2. Потоково получаем материалы
     for article in articles_stream:
-        title = article["title"]
-        text = article["text"]
-        source_url = article["source_url"]
-
-        # 3. Текст -> вектор (реальные эмбеддинги через fastembed, Sprint 3)
-        new_vector = text_to_vector(text)
-
+        title = article.get("title", "")
+        text = article.get("text", "")
+        source_url = str(article.get("source_url") or "").strip()
+        clean_url = source_url.rstrip("/")
         source_type = article.get("source_type", "статья")
 
-        # 4. Проверка на дубликат (статьи дедуплицируются по семантическому вектору;
+        # 3. МГНОВЕННЫЙ ПРЕ-ФИЛЬТР ПО URL:
+        # Если материал уже есть в базе, не тратим время на FastEmbed и LLM!
+        # Обновляем только актуальные метрики (лайки, звёзды, ранги).
+        if clean_url and (clean_url in existing_urls or f"{clean_url}/" in existing_urls):
+            logger.info(f"[EXISTS] Материал уже в базе ({source_type}): {title}")
+            try:
+                save_article({
+                    "title": title,
+                    "source_url": source_url,
+                    "stars": int(article.get("stars") or article.get("upvotes") or 0),
+                    "upvotes": int(article.get("upvotes") or article.get("stars") or 0),
+                    "source_type": source_type,
+                    "language": article.get("language", ""),
+                    "topic_tag": article.get("topic_tag", ""),
+                    "related_links": article.get("related_links", []),
+                    "source_article_url": article.get("source_article_url", ""),
+                    "period": article.get("period", ""),
+                    "has_code": article.get("has_code", 0),
+                    "has_spaces": article.get("has_spaces", 0),
+                    "rank_global": int(article.get("rank_global", 0) or 0),
+                    "rank_ru": int(article.get("rank_ru", 0) or 0),
+                })
+                for material in article.get("related_materials", []):
+                    try:
+                        upsert_related_material(material, source_article_url=source_url)
+                    except Exception:
+                        pass
+            except Exception as upd_err:
+                logger.debug(f"Не удалось обновить метрики {source_url}: {upd_err}")
+            skipped += 1
+            continue
+
+        # 4. Текст -> вектор (только для реально новых материалов)
+        new_vector = text_to_vector(text)
+
+        # 5. Проверка на дубликат (статьи дедуплицируются по семантическому вектору;
         # датасеты с уникальным source_url сохраняются, чтобы все трендовые датасеты с сайта попали в выдачу)
-        if source_type != "датасет" and is_duplicate(new_vector, memory_vectors):
+        if source_type != "датасет" and (is_vector_duplicate_db(new_vector) or is_duplicate(new_vector, memory_vectors)):
             logger.info(f"[SKIP] Дубликат: {title}")
             skipped += 1
             continue
 
-        # 5. Уникальный материал — отправляем в агента (PydanticAI)
+        # 6. Уникальный материал — отправляем в агента (PydanticAI)
         try:
             if source_type == "датасет":
                 existing_summary = article.get("summary")
@@ -219,8 +260,8 @@ def process_articles_stream(articles_stream):
             failed += 1
             continue  # материал не сохраняется, но цикл не падает
 
-        # 6. Сохраняем вектор ОТДЕЛЬНО от статьи — по контракту database.py
-        save_vector(new_vector.tolist())
+        # 7. Сохраняем вектор ОТДЕЛЬНО от статьи — по контракту database.py
+        save_vector(new_vector)
         memory_vectors.append(new_vector)
 
         # Объединяем сгенерированные теги LLM и теги, спарсенные с сайта (HF / Kaggle), без дублей
@@ -250,6 +291,8 @@ def process_articles_stream(articles_stream):
 
         save_article(payload)
         processed += 1
+        existing_urls.add(clean_url)
+        existing_urls.add(f"{clean_url}/")
 
         for material in article.get("related_materials", []):
             try:
@@ -261,6 +304,9 @@ def process_articles_stream(articles_stream):
         #    чтобы следующие материалы в этом же цикле сравнивались
         #    и с базой, и с только что спарсенными
         memory_vectors.append(new_vector)
+
+    # Сохраняем накопившийся кэш векторов
+    flush_embeddings_cache()
 
     logger.info(f"Готово. Обработано: {processed}, дублей: {skipped}, ошибок: {failed}")
     return processed, skipped, failed

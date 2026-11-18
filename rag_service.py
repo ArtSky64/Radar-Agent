@@ -17,8 +17,6 @@ import threading
 import time
 from typing import Any
 
-import numpy as np
-
 import config
 import database
 import dedup
@@ -28,7 +26,6 @@ logger = logging.getLogger("rag_service")
 # Кэш индекса в памяти
 _LOCK = threading.Lock()
 _INDEX_CARDS: list[dict[str, Any]] = []
-_INDEX_VECTORS: np.ndarray | None = None
 _LAST_BUILD_TS = 0.0
 _REBUILD_INTERVAL_SEC = 600  # обновление индекса раз в 10 минут
 
@@ -176,6 +173,27 @@ def _load_all_cards_from_db() -> list[dict[str, Any]]:
                 summary = (r["summary"] or "").strip()
                 url = (r["source_url"] or "").strip()
 
+                # Обогащаем теги направлениями (directions), типами задач (task_types) и топиком
+                for d in _clean_tags(r["directions"]):
+                    d_clean = d.strip().lower()
+                    if d_clean:
+                        tags.append(d_clean)
+                        if d_clean in config.GITHUB_DIRECTIONS:
+                            tags.append(config.GITHUB_DIRECTIONS[d_clean])
+
+                for tt in _clean_tags(r["task_types"]):
+                    tt_clean = tt.strip().lower()
+                    if tt_clean:
+                        tags.append(tt_clean)
+                        if tt_clean in config.GITHUB_TASK_TYPES:
+                            tags.append(config.GITHUB_TASK_TYPES[tt_clean])
+
+                topic = (r["topic_tag"] or "").strip()
+                if topic and topic not in tags:
+                    tags.append(topic)
+
+                tags = list(dict.fromkeys(tags))
+
                 cards.append({
                     "id": f"art_{r['rowid']}",
                     "title": title,
@@ -204,7 +222,7 @@ def _load_all_cards_from_db() -> list[dict[str, Any]]:
             rows = cursor.execute("""
                 SELECT rowid, model_name, summary, card_description, source_url,
                        tags, pipeline_tag, downloads, likes, rank_global, rank_ru,
-                       parameters, license, language, variant
+                       parameters, license, language, variant, directions, task_types
                 FROM hf_trending
             """).fetchall()
             for r in rows:
@@ -216,6 +234,22 @@ def _load_all_cards_from_db() -> list[dict[str, Any]]:
                 p_tag = (r["pipeline_tag"] or "").strip()
                 if p_tag and p_tag not in tags:
                     tags.append(p_tag)
+
+                for d in _clean_tags(r["directions"]):
+                    d_clean = d.strip().lower()
+                    if d_clean:
+                        tags.append(d_clean)
+                        if d_clean in config.GITHUB_DIRECTIONS:
+                            tags.append(config.GITHUB_DIRECTIONS[d_clean])
+
+                for tt in _clean_tags(r["task_types"]):
+                    tt_clean = tt.strip().lower()
+                    if tt_clean:
+                        tags.append(tt_clean)
+                        if tt_clean in config.GITHUB_TASK_TYPES:
+                            tags.append(config.GITHUB_TASK_TYPES[tt_clean])
+
+                tags = list(dict.fromkeys(tags))
 
                 meta, clean_text = parse_hf_metadata(card_desc)
 
@@ -278,6 +312,22 @@ def _load_all_cards_from_db() -> list[dict[str, Any]]:
                 summary = (r["summary"] or "").strip()
                 url = (r["source_url"] or f"https://github.com/{title}").strip()
 
+                for d in _clean_tags(r["directions"]):
+                    d_clean = d.strip().lower()
+                    if d_clean:
+                        tags.append(d_clean)
+                        if d_clean in config.GITHUB_DIRECTIONS:
+                            tags.append(config.GITHUB_DIRECTIONS[d_clean])
+
+                for tt in _clean_tags(r["task_types"]):
+                    tt_clean = tt.strip().lower()
+                    if tt_clean:
+                        tags.append(tt_clean)
+                        if tt_clean in config.GITHUB_TASK_TYPES:
+                            tags.append(config.GITHUB_TASK_TYPES[tt_clean])
+
+                tags = list(dict.fromkeys(tags))
+
                 cards.append({
                     "id": f"gh_{r['rowid']}",
                     "title": title,
@@ -301,26 +351,44 @@ def _load_all_cards_from_db() -> list[dict[str, Any]]:
         except Exception as e:
             logger.warning(f"Не удалось загрузить github_trending: {e}")
 
-        # 4. Таблица leaderboard (LMSYS Arena)
+        # 4. Таблица leaderboard (LMSYS Arena) — строго ПОСЛЕДНИЙ снимок и БЕЗ дублирования моделей
         try:
             rows = cursor.execute("""
                 SELECT rowid, model_name, category, rating, organization, license, vote_count, summary
                 FROM leaderboard
+                WHERE fetched_at = (SELECT MAX(fetched_at) FROM leaderboard)
             """).fetchall()
-            for r in rows:
-                title = (r["model_name"] or "Без названия").strip()
-                summary = (r["summary"] or "").strip()
-                cat_tag = (r["category"] or "").strip()
-                tags = [cat_tag] if cat_tag else []
 
-                cards.append({
+            seen_lb_models: dict[str, dict[str, Any]] = {}
+
+            for r in rows:
+                m_name = (r["model_name"] or "Без названия").strip()
+                if not m_name:
+                    continue
+                cat_tag = (r["category"] or "").strip().lower()
+                summary = (r["summary"] or "").strip()
+
+                if m_name in seen_lb_models:
+                    # Если модель уже представлена в снимке (например и в text, и в vision)
+                    existing = seen_lb_models[m_name]
+                    if cat_tag and cat_tag not in existing["tags"]:
+                        existing["tags"].append(cat_tag)
+                    continue
+
+                card_tags = ["lmsys arena", "бенчмарк"]
+                if cat_tag:
+                    card_tags.append(cat_tag)
+                if cat_tag in ("vision", "text-to-image", "image-edit"):
+                    card_tags.extend(["компьютерное зрение", "vision", "изображения", "мультимодальный"])
+
+                card = {
                     "id": f"lb_{r['rowid']}",
-                    "title": title,
+                    "title": m_name,
                     "category": "модель",
                     "summary": summary,
                     "full_description": summary,
-                    "url": f"https://huggingface.co/{title}",
-                    "tags": tags,
+                    "url": f"https://huggingface.co/{m_name}",
+                    "tags": card_tags,
                     "metrics": {
                         "rating": r["rating"] or 0,
                         "vote_count": r["vote_count"] or 0,
@@ -331,7 +399,9 @@ def _load_all_cards_from_db() -> list[dict[str, Any]]:
                         "arena_category": cat_tag,
                     },
                     "added_at": "",
-                })
+                }
+                seen_lb_models[m_name] = card
+                cards.append(card)
         except Exception as e:
             logger.warning(f"Не удалось загрузить leaderboard: {e}")
 
@@ -347,7 +417,7 @@ def _make_search_text(card: dict[str, Any]) -> str:
 
     parts = [f"[{category.upper()}] {title}"]
     if tags:
-        parts.append(f"Теги: {tags}")
+        parts.append(f"Направления и теги: {tags}")
     if summary:
         parts.append(f"Описание: {summary[:600]}")
 
@@ -356,20 +426,38 @@ def _make_search_text(card: dict[str, Any]) -> str:
 
 def build_index(force: bool = False) -> int:
     """
-    Строит / обновляет векторный индекс карточек в памяти пакетом (векторизация батчами).
+    Строит / обновляет векторный индекс карточек в SQLite через sqlite-vec (vec_cards и rag_cards).
     Возвращает количество проиндексированных карточек.
     """
-    global _INDEX_CARDS, _INDEX_VECTORS, _LAST_BUILD_TS
+    global _INDEX_CARDS, _LAST_BUILD_TS
 
     with _LOCK:
         now = time.monotonic()
-        if not force and _INDEX_VECTORS is not None and (now - _LAST_BUILD_TS < _REBUILD_INTERVAL_SEC):
+        if not force and _INDEX_CARDS and (now - _LAST_BUILD_TS < _REBUILD_INTERVAL_SEC):
             return len(_INDEX_CARDS)
+
+        # Если в памяти пусто, но индекс уже есть в SQLite:
+        if not force and not _INDEX_CARDS and (now - _LAST_BUILD_TS < _REBUILD_INTERVAL_SEC):
+            try:
+                with database.get_connection() as conn:
+                    cnt = conn.execute("SELECT count(*) FROM vec_cards").fetchone()[0]
+                    if cnt > 0:
+                        rows = conn.execute("SELECT data FROM rag_cards").fetchall()
+                        _INDEX_CARDS = [json.loads(r["data"]) for r in rows]
+                        _LAST_BUILD_TS = now
+                        return len(_INDEX_CARDS)
+            except Exception:
+                pass
 
         cards = _load_all_cards_from_db()
         if not cards:
             _INDEX_CARDS = []
-            _INDEX_VECTORS = np.empty((0, config.VECTOR_DIM), dtype=np.float32)
+            try:
+                with database.get_connection() as conn:
+                    conn.execute("DELETE FROM vec_cards")
+                    conn.execute("DELETE FROM rag_cards")
+            except Exception:
+                pass
             _LAST_BUILD_TS = now
             return 0
 
@@ -377,23 +465,47 @@ def build_index(force: bool = False) -> int:
         raw_vectors = dedup.batch_texts_to_vectors(texts)
 
         valid_cards = []
-        vectors = []
+        vec_entries = []
+        rag_entries = []
+
         for c, vec in zip(cards, raw_vectors):
-            norm = np.linalg.norm(vec)
-            if norm > 0:
-                vectors.append((vec / norm).astype(np.float32))
-                valid_cards.append(c)
+            if not vec or len(vec) != config.VECTOR_DIM:
+                continue
+            card_key = c.get("id")
+            if not card_key:
+                continue
+            cat = (c.get("category") or "").strip().lower()
+            blob = dedup.serialize_float32(vec)
+            card_json = json.dumps(c, ensure_ascii=False)
+            title = c.get("title", "")
+            url = c.get("url", "")
 
-        if vectors:
-            _INDEX_VECTORS = np.vstack(vectors).astype(np.float32)
+            valid_cards.append(c)
+            vec_entries.append((card_key, cat, blob))
+            rag_entries.append((card_key, cat, title, url, card_json))
+
+        try:
+            with database.get_connection() as conn:
+                conn.execute("DELETE FROM vec_cards")
+                conn.execute("DELETE FROM rag_cards")
+                if vec_entries:
+                    conn.executemany(
+                        "INSERT INTO vec_cards(card_key, category, embedding) VALUES (?, ?, ?)",
+                        vec_entries,
+                    )
+                    conn.executemany(
+                        "INSERT INTO rag_cards(card_key, category, title, url, data) VALUES (?, ?, ?, ?, ?)",
+                        rag_entries,
+                    )
             _INDEX_CARDS = valid_cards
-        else:
-            _INDEX_VECTORS = np.empty((0, config.VECTOR_DIM), dtype=np.float32)
-            _INDEX_CARDS = []
-
-        _LAST_BUILD_TS = now
-        logger.info(f"Векторный индекс построен: {len(_INDEX_CARDS)} карточек")
-        return len(_INDEX_CARDS)
+            _LAST_BUILD_TS = now
+            logger.info(f"Векторный индекс sqlite-vec построен: {len(_INDEX_CARDS)} карточек")
+            return len(_INDEX_CARDS)
+        except Exception as e:
+            logger.error(f"Ошибка сохранения индекса в sqlite-vec: {e}")
+            _INDEX_CARDS = valid_cards
+            _LAST_BUILD_TS = now
+            return len(_INDEX_CARDS)
 
 
 def get_card_by_title_or_id(
@@ -412,7 +524,7 @@ def get_card_by_title_or_id(
     if not cleaned_target:
         return None
 
-    if _INDEX_VECTORS is None or len(_INDEX_CARDS) == 0:
+    if not _INDEX_CARDS:
         build_index()
 
     # 1. Поиск в загруженных карточках в памяти
@@ -625,62 +737,225 @@ def search_cards(
     limit = max_sources if max_sources is not None else top_k
 
     # Если индекс еще не построен — строим
-    if _INDEX_VECTORS is None or len(_INDEX_VECTORS) == 0:
+    if not _INDEX_CARDS:
         build_index()
     else:
-        # Фоновое фоновое обновление при устаревании (не блокируя текущий поиск)
+        # Фоновое обновление при устаревании (не блокируя текущий поиск)
         now = time.monotonic()
         if now - _LAST_BUILD_TS > _REBUILD_INTERVAL_SEC:
             threading.Thread(target=build_index, daemon=True).start()
 
-    if not _INDEX_CARDS or _INDEX_VECTORS is None or len(_INDEX_VECTORS) == 0:
+    if not _INDEX_CARDS:
         return []
 
-    # Получаем вектор запроса и нормализуем
-    query_vec = dedup.text_to_vector(query.strip())
-    q_norm = np.linalg.norm(query_vec)
-    if q_norm == 0:
+    # 1. Очистка запроса от разговорных фраз и приветствий
+    raw_query = query.strip()
+    clean_q = re.sub(
+        r"^(?:привет|здравствуй|здравствуйте|добрый день|хай|hello|hi|йоу)[,\s!.]*",
+        "",
+        raw_query,
+        flags=re.IGNORECASE,
+    )
+    clean_q = re.sub(
+        r"^(?:подскажи|расскажи|покажи|найди|интересует|хочу узнать(?: про)?|что есть по|посоветуй)[,\s!:]*",
+        "",
+        clean_q.strip(),
+        flags=re.IGNORECASE,
+    ).strip()
+
+    search_query = clean_q if len(clean_q) >= 3 else raw_query
+
+    # 2. Обогащение запроса ключевыми синонимами предметных областей
+    enriched_query = search_query
+    low_q = search_query.lower()
+    if ("компьютерн" in low_q and "зрен" in low_q) or ("cv" in low_q.split()):
+        enriched_query += " computer vision cv визуальные модели зрение сегментация детекция"
+    elif "медицин" in low_q or "здравоохран" in low_q:
+        enriched_query += " healthcare medical health_ai биомедицина"
+    elif "аудио" in low_q or "звук" in low_q or "реч" in low_q:
+        enriched_query += " audio speech ASR распознавание звука"
+    elif "робототехник" in low_q or "робот" in low_q:
+        enriched_query += " robotics автономные системы"
+    elif "агент" in low_q:
+        enriched_query += " agents мультиагентные системы tool calling"
+
+    query_vec = dedup.text_to_vector(enriched_query)
+    if not query_vec:
         return []
-    query_vec = (query_vec / q_norm).astype(np.float32)
 
-    # Скалярное произведение нормализованных векторов = косинусное сходство (мгновенно на BLAS/numpy)
-    scores = np.dot(_INDEX_VECTORS, query_vec)
-
-    # Фильтрация по категории и порогу сходства
     category_filter = category.strip().lower() if category else "all"
-    results = []
+    max_distance = max(0.0, min(2.0, 1.0 - min_score))
+    query_blob = dedup.serialize_float32(query_vec)
 
-    for idx, score in enumerate(scores):
-        if score < min_score:
+    # 3. Векторный KNN-поиск через sqlite-vec (запрашиваем широкий пул кандидатов для дедупликации)
+    candidate_k = max(limit * 8, 50)
+    raw_candidates = []
+
+    try:
+        with database.get_connection() as conn:
+            if category_filter == "all":
+                cursor = conn.execute(
+                    """
+                    SELECT v.card_key, v.category, v.distance, c.data
+                    FROM vec_cards v
+                    JOIN rag_cards c ON v.card_key = c.card_key
+                    WHERE v.embedding MATCH ?
+                      AND k = ?
+                      AND v.distance <= ?
+                    ORDER BY v.distance ASC
+                    """,
+                    (query_blob, candidate_k, max_distance),
+                )
+            else:
+                cursor = conn.execute(
+                    """
+                    SELECT v.card_key, v.category, v.distance, c.data
+                    FROM vec_cards v
+                    JOIN rag_cards c ON v.card_key = c.card_key
+                    WHERE v.embedding MATCH ?
+                      AND k = ?
+                      AND v.category = ?
+                      AND v.distance <= ?
+                    ORDER BY v.distance ASC
+                    """,
+                    (query_blob, candidate_k, category_filter, max_distance),
+                )
+
+            rows = cursor.fetchall()
+            for r in rows:
+                dist = float(r["distance"])
+                score = max(0.0, min(1.0, 1.0 - dist))
+                if score < min_score:
+                    continue
+                try:
+                    card = json.loads(r["data"])
+                    raw_candidates.append({
+                        "card": card,
+                        "score": score,
+                    })
+                except Exception:
+                    continue
+    except Exception as e:
+        logger.warning(f"Поиск через sqlite-vec не сработал ({e}), fallback на чистый Python...")
+        raw_candidates = []
+        for c in _INDEX_CARDS:
+            c_cat = (c.get("category") or "").lower()
+            if category_filter != "all" and c_cat != category_filter:
+                continue
+            c_text = _make_search_text(c)
+            c_vec = dedup.text_to_vector(c_text)
+            sim = dedup.cosine_similarity(query_vec, c_vec)
+            if sim >= min_score:
+                raw_candidates.append({"card": c, "score": sim})
+        raw_candidates.sort(key=lambda x: x["score"], reverse=True)
+
+    # 4. Строгая дедупликация кандидатов по нормализованному названию и URL
+    seen_titles: set[str] = set()
+    seen_urls: set[str] = set()
+    deduped_candidates = []
+
+    for item in raw_candidates:
+        c = item["card"]
+        title_raw = str(c.get("title") or "").strip()
+        title_norm = re.sub(r"[^\w\s]", "", title_raw.lower()).strip()
+        url_norm = str(c.get("url") or "").strip().rstrip("/").lower()
+
+        if not title_norm:
             continue
-        card = _INDEX_CARDS[idx]
-        c_cat = card.get("category", "").lower()
-
-        if category_filter != "all" and c_cat != category_filter:
+        if title_norm in seen_titles or (url_norm and url_norm in seen_urls):
             continue
 
-        results.append({
-            "card": card,
-            "score": float(score),
-        })
+        seen_titles.add(title_norm)
+        if url_norm:
+            seen_urls.add(url_norm)
 
-    # Сортировка по убыванию релевантности
-    results.sort(key=lambda x: x["score"], reverse=True)
-    return results[:limit]
+        deduped_candidates.append(item)
+
+    if not deduped_candidates:
+        return []
+
+    # 5. Балансировка разнообразия при category="all"
+    if category_filter == "all" and len(deduped_candidates) > limit:
+        by_cat: dict[str, list[dict[str, Any]]] = {
+            "статья": [],
+            "модель": [],
+            "датасет": [],
+            "репозиторий": [],
+        }
+        for item in deduped_candidates:
+            cat = (item["card"].get("category") or "").lower()
+            if cat in by_cat:
+                by_cat[cat].append(item)
+            else:
+                by_cat.setdefault("другое", []).append(item)
+
+        selected: list[dict[str, Any]] = []
+
+        # а) До 2 лучших статей
+        selected.extend(by_cat.get("статья", [])[:2])
+
+        # б) До 2 лучших моделей (сначала реальные модели из hf_trending, затем arena)
+        models_hf = [m for m in by_cat.get("модель", []) if not str(m["card"].get("id", "")).startswith("lb_")]
+        models_lb = [m for m in by_cat.get("модель", []) if str(m["card"].get("id", "")).startswith("lb_")]
+        selected.extend((models_hf + models_lb)[:2])
+
+        # в) До 1 лучшего датасета или репозитория
+        if by_cat.get("датасет"):
+            selected.append(by_cat["датасет"][0])
+        elif by_cat.get("репозиторий"):
+            selected.append(by_cat["репозиторий"][0])
+
+        # г) Добираем оставшиеся слоты лучшими по score из общего списка
+        chosen_ids = {c["card"]["id"] for c in selected}
+        for item in deduped_candidates:
+            if len(selected) >= limit:
+                break
+            if item["card"]["id"] not in chosen_ids:
+                selected.append(item)
+                chosen_ids.add(item["card"]["id"])
+
+        selected.sort(key=lambda x: x["score"], reverse=True)
+        return selected[:limit]
+
+    return deduped_candidates[:limit]
 
 
 def get_catalog_stats() -> dict[str, int]:
     """Возвращает агрегированную статистику проиндексированных карточек."""
     build_index()
     stats = {
-        "всего": len(_INDEX_CARDS),
+        "всего": 0,
         "модели": 0,
         "датасеты": 0,
         "репозитории": 0,
         "статьи": 0,
     }
+    try:
+        with database.get_connection() as conn:
+            rows = conn.execute("SELECT category, count(*) FROM rag_cards GROUP BY category").fetchall()
+            total = 0
+            for r in rows:
+                cat = (r[0] or "").lower()
+                cnt = int(r[1])
+                total += cnt
+                if cat == "модель":
+                    stats["модели"] += cnt
+                elif cat == "датасет":
+                    stats["датасеты"] += cnt
+                elif cat == "репозиторий":
+                    stats["репозитории"] += cnt
+                else:
+                    stats["статьи"] += cnt
+            stats["всего"] = total
+            if total > 0:
+                return stats
+    except Exception:
+        pass
+
+    # Fallback на _INDEX_CARDS
+    stats["всего"] = len(_INDEX_CARDS)
     for c in _INDEX_CARDS:
-        cat = c.get("category", "").lower()
+        cat = (c.get("category") or "").lower()
         if cat == "модель":
             stats["модели"] += 1
         elif cat == "датасет":

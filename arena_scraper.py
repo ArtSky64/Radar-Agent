@@ -1,3 +1,4 @@
+import concurrent.futures
 import datetime
 import json
 import logging
@@ -307,20 +308,27 @@ def collect_all_categories(category_urls=None, limit: int = 25) -> dict:
     fetched_at = datetime.datetime.now().isoformat()
     all_data = {}
 
-    print(f"\n[Арена] Сбор данных через официальный API lmarena-ai (Hugging Face)...")
+    print(f"\n[Арена] Параллельный сбор данных через официальный API lmarena-ai (Hugging Face)...")
     total_cats = len(CATEGORY_MAP)
-    for idx, (cat_name, hf_config) in enumerate(CATEGORY_MAP.items(), start=1):
-        try:
-            models = fetch_category_from_hf(hf_config, limit=limit)
-            if models:
-                all_data[cat_name] = models
-                top1 = models[0]
-                print(f"[{idx}/{total_cats}] [OK] {cat_name:<15} ({len(models)} моделей) -> #1 {top1['name']} ({top1['rating']})")
-            else:
-                logger.warning(f"Категория '{cat_name}' вернула пустой список.")
-        except Exception as e:
-            logger.warning(f"Ошибка при получении '{cat_name}' через HF: {e}")
-            print(f"[{idx}/{total_cats}] [ОШИБКА HF] {cat_name}: {e}")
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, total_cats)) as pool:
+        future_to_cat = {
+            pool.submit(fetch_category_from_hf, hf_config, limit=limit): cat_name
+            for cat_name, hf_config in CATEGORY_MAP.items()
+        }
+        for future in concurrent.futures.as_completed(future_to_cat):
+            cat_name = future_to_cat[future]
+            try:
+                models = future.result()
+                if models:
+                    all_data[cat_name] = models
+                    top1 = models[0]
+                    print(f"[OK] {cat_name:<15} ({len(models)} моделей) -> #1 {top1['name']} ({top1['rating']})")
+                else:
+                    logger.warning(f"Категория '{cat_name}' вернула пустой список.")
+            except Exception as e:
+                logger.warning(f"Ошибка при получении '{cat_name}' через HF: {e}")
+                print(f"[ОШИБКА HF] {cat_name}: {e}")
 
     # Резервный Playwright (если HF полностью упал и ничего не вернул)
     if not all_data and sync_playwright is not None:

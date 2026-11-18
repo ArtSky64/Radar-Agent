@@ -96,6 +96,14 @@ def _clean_qwen_output(text: str) -> str:
         flags=re.IGNORECASE,
     )
 
+    # 4. Срезаем оправдательные фразы о неподходящих материалах из базы
+    cleaned = re.sub(
+        r"\n*\s*(?:Остальные|Другие)\s+материалы\s+из\s+базы[^\n]*?(?:относятся\s+к|выходят\s+за\s+рамки|не\s+являются)[^\n]*?(?:\n|$)",
+        "\n",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+
     return cleaned.strip() if cleaned.strip() else text
 
 
@@ -1168,12 +1176,17 @@ def process_dialogue(
 
     found_cards: list[dict[str, Any]] = []
     cards_context_list = []
+    seen_titles_ui: set[str] = set()
 
     for r in results:
         c = dict(r["card"])
         score_val = float(r.get("score", 0.0))
         c["similarity"] = score_val
         formatted = _format_single_card_for_ui(c)
+        t_norm = re.sub(r"[^\w\s]", "", formatted["title"].lower()).strip()
+        if t_norm in seen_titles_ui:
+            continue
+        seen_titles_ui.add(t_norm)
         found_cards.append(formatted)
         cards_context_list.append(
             f"- [{formatted['title']}]({formatted['url']}) | Тип: {formatted['category']} | Описание: {formatted['summary']}"

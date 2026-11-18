@@ -1,8 +1,24 @@
 import os
 import sqlite3
 import json
+import logging
+import struct
 from datetime import datetime, timedelta, timezone
 from contextlib import contextmanager
+
+logger = logging.getLogger("database")
+
+try:
+    import sqlite_vec
+    HAS_SQLITE_VEC = True
+except ImportError:
+    HAS_SQLITE_VEC = False
+
+def serialize_float32(vector: list[float]) -> bytes:
+    """Сериализует список чисел с плавающей точкой в бинарный формат float32 для sqlite-vec."""
+    if HAS_SQLITE_VEC and hasattr(sqlite_vec, "serialize_float32"):
+        return sqlite_vec.serialize_float32(vector)
+    return struct.pack(f"{len(vector)}f", *vector)
 
 # Московский часовой пояс (UTC+3)
 MSK_TZ = timezone(timedelta(hours=3))
@@ -19,6 +35,13 @@ def get_connection():
         os.makedirs(db_dir, exist_ok=True)
     conn = sqlite3.connect(DB_NAME)
     conn.row_factory = sqlite3.Row
+    if HAS_SQLITE_VEC:
+        try:
+            conn.enable_load_extension(True)
+            sqlite_vec.load(conn)
+            conn.enable_load_extension(False)
+        except Exception as e:
+            logger.debug(f"Не удалось подключить расширение sqlite-vec: {e}")
     try:
         yield conn
         conn.commit()
@@ -321,6 +344,60 @@ def init_db():
             cursor.execute("ALTER TABLE hf_trending ADD COLUMN rank_ru INTEGER NOT NULL DEFAULT 0")
         if 'trending_score' not in trending_cols:
             cursor.execute("ALTER TABLE hf_trending ADD COLUMN trending_score REAL NOT NULL DEFAULT 0.0")
+
+        # Индексы для ускорения поиска по URL и типам материалов (устранение full-table scan)
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_articles_source_url ON articles(source_url)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_articles_source_type ON articles(source_type)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_hf_trending_name ON hf_trending(model_name)")
+        cursor.execute("CREATE INDEX IF NOT EXISTS idx_github_trending_url ON github_trending(source_url)")
+
+        # Таблицы sqlite-vec для векторного поиска и дедупликации
+        try:
+            cursor.execute(f"""
+                CREATE VIRTUAL TABLE IF NOT EXISTS vec_vectors USING vec0(
+                    embedding float[{config.VECTOR_DIM}] distance_metric=cosine,
+                    +added_at text
+                );
+            """)
+            cursor.execute(f"""
+                CREATE VIRTUAL TABLE IF NOT EXISTS vec_cards USING vec0(
+                    card_key text primary key,
+                    category text,
+                    embedding float[{config.VECTOR_DIM}] distance_metric=cosine
+                );
+            """)
+        except Exception as e:
+            logger.debug(f"Инициализация vec0 таблиц пропущена: {e}")
+
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS rag_cards (
+                card_key TEXT PRIMARY KEY,
+                category TEXT NOT NULL,
+                title TEXT NOT NULL,
+                url TEXT NOT NULL DEFAULT '',
+                data TEXT NOT NULL,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+
+        # Автомиграция старых векторов из таблицы vectors в vec_vectors
+        try:
+            vec_count = cursor.execute("SELECT count(*) FROM vec_vectors").fetchone()[0]
+            if vec_count == 0:
+                old_vectors = cursor.execute("SELECT rowid, vector_data, added_at FROM vectors").fetchall()
+                for r in old_vectors:
+                    try:
+                        raw = json.loads(r["vector_data"])
+                        if len(raw) == config.VECTOR_DIM:
+                            cursor.execute(
+                                "INSERT INTO vec_vectors(embedding, added_at) VALUES (?, ?)",
+                                (serialize_float32(raw), r["added_at"] or "")
+                            )
+                    except Exception:
+                        continue
+        except Exception as e:
+            logger.debug(f"Миграция старых векторов в vec_vectors пропущена: {e}")
+
         conn.commit()
 
 
@@ -329,15 +406,68 @@ def init_db():
 # ==========================================
 
 def save_vector(vector: list[float]) -> None:
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     with get_connection() as conn:
-        conn.execute('INSERT INTO vectors (vector_data) VALUES (?)', (json.dumps(vector),))
+        if len(vector) == config.VECTOR_DIM:
+            try:
+                conn.execute(
+                    "INSERT INTO vec_vectors (embedding, added_at) VALUES (?, ?)",
+                    (serialize_float32(vector), now_str)
+                )
+            except Exception as e:
+                logger.debug(f"Ошибка сохранения вектора в vec_vectors: {e}")
+        try:
+            conn.execute("INSERT INTO vectors (vector_data, added_at) VALUES (?, ?)", (json.dumps(vector), now_str))
+        except Exception:
+            pass
+
+
+def is_vector_duplicate_db(new_vector: list[float], threshold: float | None = None) -> bool:
+    """
+    Проверяет наличие дубликата вектора напрямую в базе SQLite через sqlite-vec (distance_metric=cosine).
+    distance = 1.0 - cosine_similarity.
+    Дубликат, если distance <= 1.0 - threshold.
+    """
+    if len(new_vector) != config.VECTOR_DIM:
+        return False
+    if threshold is None:
+        threshold = config.DUPLICATE_THRESHOLD
+    max_distance = max(0.0, 1.0 - threshold)
+    blob = serialize_float32(new_vector)
+    try:
+        with get_connection() as conn:
+            row = conn.execute(
+                """
+                SELECT rowid, distance
+                FROM vec_vectors
+                WHERE embedding MATCH ?
+                  AND k = 1
+                  AND distance <= ?
+                """,
+                (blob, max_distance),
+            ).fetchone()
+            return row is not None
+    except Exception as e:
+        logger.debug(f"Проверка в vec_vectors не удалась: {e}")
+        return False
 
 
 def get_all_vectors():
     with get_connection() as conn:
-        cursor = conn.execute('SELECT vector_data FROM vectors')
+        try:
+            cursor = conn.execute("SELECT embedding FROM vec_vectors")
+            rows = cursor.fetchall()
+            if rows:
+                for row in rows:
+                    blob = row["embedding"]
+                    dim = len(blob) // 4
+                    yield list(struct.unpack(f"{dim}f", blob))
+                return
+        except Exception:
+            pass
+        cursor = conn.execute("SELECT vector_data FROM vectors")
         for row in cursor:
-            yield json.loads(row['vector_data'])
+            yield json.loads(row["vector_data"])
 
 
 def save_article(article: dict) -> None:
@@ -497,6 +627,49 @@ def get_all_articles() -> list[dict]:
         return articles
 
 
+def get_existing_article_urls() -> set[str]:
+    """
+    Возвращает множество всех существующих source_url из таблицы articles
+    в нормализованном виде (со слэшем и без), чтобы мгновенно проверять
+    наличие материала в памяти O(1) до запуска векторизации и LLM.
+    """
+    init_db()
+    with get_connection() as conn:
+        cursor = conn.execute("SELECT source_url FROM articles WHERE source_url != ''")
+        urls = set()
+        for (u,) in cursor.fetchall():
+            if not u:
+                continue
+            clean_u = u.strip().rstrip("/")
+            urls.add(clean_u)
+            urls.add(f"{clean_u}/")
+        return urls
+
+
+def get_existing_hf_models_map() -> dict[str, dict]:
+    """
+    Возвращает словарь ранее сохранённых и проанализированных моделей из hf_trending.
+    Позволяет мгновенно переиспользовать summary, tags, directions, task_types и parameters,
+    избегая повторных тяжелых запросов в LLM на каждом прогоне.
+    """
+    init_db()
+    with get_connection() as conn:
+        cursor = conn.execute("SELECT * FROM hf_trending WHERE summary IS NOT NULL AND summary != ''")
+        res = {}
+        for row in cursor.fetchall():
+            m = dict(row)
+            m_name = m.get("model_name")
+            if m_name:
+                for k in ("tags", "directions", "task_types"):
+                    if k in m and isinstance(m[k], str):
+                        try:
+                            m[k] = json.loads(m[k])
+                        except Exception:
+                            pass
+                res[m_name] = m
+        return res
+
+
 def get_article_by_url(source_url: str) -> dict | None:
     """Ищет статью/репозиторий в базе по URL (с нормализацией слэшей)."""
     if not source_url:
@@ -556,9 +729,16 @@ def clear_leaderboard() -> None:
 
 
 def delete_old_vectors(days: int = 14) -> None:
-    cutoff_date = (datetime.utcnow() - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
+    cutoff_date = (datetime.now(timezone.utc) - timedelta(days=days)).strftime('%Y-%m-%d %H:%M:%S')
     with get_connection() as conn:
-        conn.execute('DELETE FROM vectors WHERE added_at < ?', (cutoff_date,))
+        try:
+            conn.execute('DELETE FROM vec_vectors WHERE added_at < ?', (cutoff_date,))
+        except Exception:
+            pass
+        try:
+            conn.execute('DELETE FROM vectors WHERE added_at < ?', (cutoff_date,))
+        except Exception:
+            pass
 
 
 # ==========================================
@@ -942,7 +1122,7 @@ if __name__ == '__main__':
     })
 
     # Добавляем вектор
-    save_vector([0.1, 0.2, 0.3])
+    save_vector([0.1] * config.VECTOR_DIM)
 
     # Добавляем 3 слепка лидерборда (чтобы проверить ротацию).
     # Старый "Слепок 1" должен автоматически удалиться!

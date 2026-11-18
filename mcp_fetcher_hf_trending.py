@@ -15,7 +15,7 @@ from agent_manager import (
     clean_model_tags,
     extract_model_parameters,
 )
-from database import save_trending_models, init_db
+from database import save_trending_models, init_db, get_existing_hf_models_map
 
 logger = logging.getLogger("hf_trending_fetcher")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -185,12 +185,17 @@ async def fetch_trending_models_async(limit: int = 50) -> list[dict]:
         final_models = []
         fetched_at = datetime.now(MSK_TZ).isoformat()
 
-        # Шаг 5: Загрузка карточек, порезка тегов, извлечение параметров и ИИ-анализ
-        for idx, entry in enumerate(candidates, start=1):
+        # Шаг 5: Загрузка карточек, порезка тегов, извлечение параметров и ИИ-анализ (с кэшированием в БД и параллелизацией)
+        existing_cache = get_existing_hf_models_map()
+        logger.info(f"Найдено ранее проанализированных моделей в БД: {len(existing_cache)}")
+
+        sem = asyncio.Semaphore(4)
+
+        async def _process_candidate(idx: int, entry: dict):
             item = entry["raw"]
             m_id = item.get("id") or item.get("modelId")
             if not m_id:
-                continue
+                return None
 
             rank_g = global_ranks.get(m_id, 0)
             rank_r = ru_ranks.get(m_id, 0)
@@ -212,90 +217,122 @@ async def fetch_trending_models_async(limit: int = 50) -> list[dict]:
             variant = ",".join(variant_parts)
             lang = "ru" if entry["is_ru"] else ""
 
-            try:
-                # Получаем карточку модели с HF
-                card_data = await _fetch_model_card(client, m_id)
-                pipeline_tag = card_data.get("pipeline_tag") or item.get("pipeline_tag", "")
-
-                # Извлечение лицензии
-                license_tag = next(
-                    (t.replace("license:", "") for t in raw_tags if str(t).startswith("license:")),
-                    "",
-                )
-
-                # Извлечение текста README из cardData
-                readme_obj = card_data.get("cardData", {})
-                if isinstance(readme_obj, dict):
-                    readme_text = json.dumps(readme_obj, ensure_ascii=False)
-                else:
-                    readme_text = str(readme_obj or "")
-
-                # Извлечение параметров (например, '27B', '7B', '600M')
-                extracted_params = extract_model_parameters(m_id, raw_tags, card_data)
-
-                # ИИ-анализ через Qwen / PydanticAI
-                logger.info(
-                    f"[{idx}/{len(candidates)}] Анализ модели '{m_id}' (Params: {extracted_params or 'N/A'}, Type: {pipeline_tag or 'unknown'})..."
-                )
-                card: HFModelCard = await analyze_hf_model_async(
-                    model_name=m_id,
-                    pipeline_tag=pipeline_tag,
-                    tags=cleaned_tags,
-                    card_description=readme_text,
-                )
-
-                final_params = card.parameters or extracted_params
-
-                model_dict = {
+            # 1. Проверяем кэш базы данных: если модель уже была проанализирована ранее
+            cached = existing_cache.get(m_id)
+            if cached and cached.get("summary") and len(str(cached.get("summary")).strip()) > 20:
+                logger.info(f"[{idx}/{len(candidates)}] [КЭШ БД] Модель '{m_id}' уже проанализирована — берем готовую карточку.")
+                return {
                     "name": m_id,
                     "model_name": m_id,
                     "downloads": downloads,
                     "likes": likes,
                     "trending_score": trending_score,
-                    "tags": card.tags or cleaned_tags,
+                    "tags": cached.get("tags") or cleaned_tags,
                     "url": f"https://huggingface.co/{m_id}",
                     "source_url": f"https://huggingface.co/{m_id}",
-                    "summary": card.summary,
-                    "pipeline_tag": pipeline_tag,
-                    "license": license_tag,
-                    "card_description": readme_text[:2000],
+                    "summary": cached.get("summary"),
+                    "pipeline_tag": cached.get("pipeline_tag") or item.get("pipeline_tag", ""),
+                    "license": cached.get("license") or "",
+                    "card_description": cached.get("card_description") or "",
                     "language": lang,
                     "variant": variant,
-                    "directions": card.directions,
-                    "task_types": card.task_types,
-                    "parameters": final_params,
+                    "directions": cached.get("directions") or [],
+                    "task_types": cached.get("task_types") or [],
+                    "parameters": cached.get("parameters") or extract_model_parameters(m_id, raw_tags),
                     "rank_global": rank_g,
                     "rank_ru": rank_r,
                     "fetched_at": fetched_at,
                 }
-                final_models.append(model_dict)
-            except Exception as e:
-                logger.error(f"Ошибка при обработке модели '{m_id}': {e}. Применяем надежный фолбэк.")
-                pipeline_tag = item.get("pipeline_tag", "")
-                fallback_params = extract_model_parameters(m_id, raw_tags)
-                fallback_model = {
-                    "name": m_id,
-                    "model_name": m_id,
-                    "downloads": downloads,
-                    "likes": likes,
-                    "trending_score": trending_score,
-                    "tags": cleaned_tags or ["AI-Model"],
-                    "url": f"https://huggingface.co/{m_id}",
-                    "source_url": f"https://huggingface.co/{m_id}",
-                    "summary": f"Трендовая модель {m_id} с Hugging Face.",
-                    "pipeline_tag": pipeline_tag,
-                    "license": "",
-                    "card_description": "",
-                    "language": lang,
-                    "variant": variant,
-                    "directions": ["nlp_llm"],
-                    "task_types": ["generation"],
-                    "parameters": fallback_params,
-                    "rank_global": rank_g,
-                    "rank_ru": rank_r,
-                    "fetched_at": fetched_at,
-                }
-                final_models.append(fallback_model)
+
+            # 2. Новая модель: параллельный запрос карточки и анализ через LLM
+            async with sem:
+                try:
+                    # Получаем карточку модели с HF
+                    card_data = await _fetch_model_card(client, m_id)
+                    pipeline_tag = card_data.get("pipeline_tag") or item.get("pipeline_tag", "")
+
+                    # Извлечение лицензии
+                    license_tag = next(
+                        (t.replace("license:", "") for t in raw_tags if str(t).startswith("license:")),
+                        "",
+                    )
+
+                    # Извлечение текста README из cardData
+                    readme_obj = card_data.get("cardData", {})
+                    if isinstance(readme_obj, dict):
+                        readme_text = json.dumps(readme_obj, ensure_ascii=False)
+                    else:
+                        readme_text = str(readme_obj or "")
+
+                    # Извлечение параметров (например, '27B', '7B', '600M')
+                    extracted_params = extract_model_parameters(m_id, raw_tags, card_data)
+
+                    # ИИ-анализ через Qwen / PydanticAI
+                    logger.info(
+                        f"[{idx}/{len(candidates)}] [НОВАЯ] Анализ модели '{m_id}' (Params: {extracted_params or 'N/A'}, Type: {pipeline_tag or 'unknown'})..."
+                    )
+                    card: HFModelCard = await analyze_hf_model_async(
+                        model_name=m_id,
+                        pipeline_tag=pipeline_tag,
+                        tags=cleaned_tags,
+                        card_description=readme_text,
+                    )
+
+                    final_params = card.parameters or extracted_params
+
+                    return {
+                        "name": m_id,
+                        "model_name": m_id,
+                        "downloads": downloads,
+                        "likes": likes,
+                        "trending_score": trending_score,
+                        "tags": card.tags or cleaned_tags,
+                        "url": f"https://huggingface.co/{m_id}",
+                        "source_url": f"https://huggingface.co/{m_id}",
+                        "summary": card.summary,
+                        "pipeline_tag": pipeline_tag,
+                        "license": license_tag,
+                        "card_description": readme_text[:2000],
+                        "language": lang,
+                        "variant": variant,
+                        "directions": card.directions,
+                        "task_types": card.task_types,
+                        "parameters": final_params,
+                        "rank_global": rank_g,
+                        "rank_ru": rank_r,
+                        "fetched_at": fetched_at,
+                    }
+                except Exception as e:
+                    logger.error(f"Ошибка при обработке модели '{m_id}': {e}. Применяем надежный фолбэк.")
+                    pipeline_tag = item.get("pipeline_tag", "")
+                    fallback_params = extract_model_parameters(m_id, raw_tags)
+                    return {
+                        "name": m_id,
+                        "model_name": m_id,
+                        "downloads": downloads,
+                        "likes": likes,
+                        "trending_score": trending_score,
+                        "tags": cleaned_tags or ["AI-Model"],
+                        "url": f"https://huggingface.co/{m_id}",
+                        "source_url": f"https://huggingface.co/{m_id}",
+                        "summary": f"Трендовая модель {m_id} с Hugging Face.",
+                        "pipeline_tag": pipeline_tag,
+                        "license": "",
+                        "card_description": "",
+                        "language": lang,
+                        "variant": variant,
+                        "directions": ["nlp_llm"],
+                        "task_types": ["generation"],
+                        "parameters": fallback_params,
+                        "rank_global": rank_g,
+                        "rank_ru": rank_r,
+                        "fetched_at": fetched_at,
+                    }
+
+        processed_models = await asyncio.gather(
+            *[_process_candidate(idx, entry) for idx, entry in enumerate(candidates, start=1)]
+        )
+        final_models = [m for m in processed_models if m is not None]
 
         # Шаг 6: Сохранение в базу данных
         save_trending_models(final_models)
