@@ -401,10 +401,6 @@ def init_db():
         conn.commit()
 
 
-# ==========================================
-# ОСНОВНОЕ ХРАНИЛИЩЕ (Векторы и Статьи)
-# ==========================================
-
 def save_vector(vector: list[float]) -> None:
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
     with get_connection() as conn:
@@ -716,11 +712,6 @@ def repo_exists_in_db(repo_url_or_name: str) -> bool:
 
 
 
-def clear_articles() -> None:
-    with get_connection() as conn:
-        conn.execute('DELETE FROM articles')
-
-
 def clear_leaderboard() -> None:
     """Полностью очищает таблицы лидерборда Arena и ИИ-анализа."""
     with get_connection() as conn:
@@ -741,15 +732,10 @@ def delete_old_vectors(days: int = 14) -> None:
             pass
 
 
-# ==========================================
-# ХРАНИЛИЩЕ ЛИДЕРБОРДА (arena.ai)
-# ==========================================
-
 def save_leaderboard_data(data: dict) -> None:
     fetched_at = data['fetched_at']
     records_to_insert = []
 
-    # 1. Разворачиваем структуру categories в плоский список записей с расширенными метаданными
     for category, models in data['categories'].items():
         for model in models:
             m_name = (model.get('name') or model.get('model_name') or '').strip()
@@ -836,16 +822,13 @@ def save_leaderboard_data(data: dict) -> None:
         except Exception as e:
             logger.debug(f"Миграция пустых summary в leaderboard пропущена: {e}")
 
-        # 3. Проверка текущего объема (ищем уникальные даты)
         cursor = conn.execute('SELECT DISTINCT fetched_at FROM leaderboard ORDER BY fetched_at DESC')
         dates = [row['fetched_at'] for row in cursor.fetchall()]
 
-        # 4. Условие удаления: берет самую старую и полностью удаляет
         if len(dates) >= 2:
             oldest_date = dates[-1]
             conn.execute('DELETE FROM leaderboard WHERE fetched_at = ?', (oldest_date,))
 
-        # 5. Массовая вставка всех записей одной операцией
         conn.executemany('''
             INSERT INTO leaderboard (category, model_name, rating, fetched_at, organization, license, vote_count, summary)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?)
@@ -1104,60 +1087,13 @@ def get_all_leaderboard_snapshots() -> list[dict]:
     return list(snapshots_map.values())
 
 
-# ==========================================
-# БЛОК ДЛЯ ТЕСТИРОВАНИЯ И ПРОСМОТРА ТАБЛИЦ
-# ==========================================
 if __name__ == '__main__':
-    print("--- ИНИЦИАЛИЗАЦИЯ БАЗЫ ДАННЫХ ---")
     init_db()
-    print("Таблицы успешно созданы.\n")
-
-    print("--- СОХРАНЕНИЕ ТЕСТОВЫХ ДАННЫХ ---")
-    # Добавляем статью
     save_article({
-        "title": "GPT-5 взломал Пентагон",
-        "summary": "Шуточная статья для теста.",
-        "source_url": "https://test.com",
-        "tags": ["ии", "новости"]
+        "title": "Тестовая статья",
+        "summary": "Пример описания для проверки БД.",
+        "source_url": "https://example.com/test",
+        "tags": ["ии", "тест"]
     })
-
-    # Добавляем вектор
     save_vector([0.1] * config.VECTOR_DIM)
-
-    # Добавляем 3 слепка лидерборда (чтобы проверить ротацию).
-    # Старый "Слепок 1" должен автоматически удалиться!
-    snapshot_1 = {"fetched_at": "2026-07-01", "categories": {"text": [{"name": "Model-A", "rating": 1000}]}}
-    snapshot_2 = {"fetched_at": "2026-07-02", "categories": {"text": [{"name": "Model-B", "rating": 1100}]}}
-    snapshot_3 = {"fetched_at": "2026-07-03", "categories": {"text": [{"name": "Model-C", "rating": 1200}]}}
-
-    save_leaderboard_data(snapshot_1)
-    save_leaderboard_data(snapshot_2)
-    save_leaderboard_data(snapshot_3)  # Тут сработает удаление первого слепка
-    print("Данные сохранены! Ротация лидерборда отработала.\n")
-
-    print("    ВИЗУАЛИЗАЦИЯ ТАБЛИЦ ИЗ БАЗЫ ДАННЫХ    ")
-
-    # 1. Показываем статьи
-    print(">>> ТАБЛИЦА: articles")
-    articles = get_all_articles()
-    for a in articles:
-        print(f"[{a.get('added_at', 'Только что')}] {a['title']} | Теги: {a['tags']} | Ссылка: {a['source_url']}")
-    print("-" * 40)
-
-    # 2. Показываем векторы
-    print("\n>>> ТАБЛИЦА: vectors")
-    with get_connection() as conn:
-        for row in conn.execute('SELECT * FROM vectors'):
-            print(f"[{row['added_at']}] Вектор: {row['vector_data']}")
-    print("-" * 40)
-
-    # 3. Показываем лидерборд
-    print("\n>>> ТАБЛИЦА: leaderboard (Максимум 2 слепка!)")
-    snapshots = get_all_leaderboard_snapshots()
-    for snap in snapshots:
-        print(f"Слепок от: {snap['fetched_at']}")
-        for cat, models in snap['categories'].items():
-            print(f"  Категория '{cat}':")
-            for m in models:
-                print(f"    - Модель: {m['name']}, Рейтинг: {m['rating']}")
-    print("==========================================")
+    print("Инициализация базы данных и проверка записи завершены успешно.")

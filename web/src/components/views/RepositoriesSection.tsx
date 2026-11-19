@@ -37,7 +37,7 @@ export const RepositoriesSection: React.FC<RepositoriesSectionProps> = ({
   const [periodFilter, setPeriodFilter] = useState<'all' | 'weekly' | 'monthly'>('all');
   const [selectedDirections, setSelectedDirections] = useState<string[]>([]);
   const [selectedTaskTypes, setSelectedTaskTypes] = useState<string[]>([]);
-  const [sortBy, setSortBy] = useState<'stars' | 'newest' | 'name'>('stars');
+  const [sortBy, setSortBy] = useState<'trending' | 'stars' | 'newest' | 'name'>('trending');
   const [refreshMessage, setRefreshMessage] = useState<string | null>(null);
 
   // Нормализуем репозитории
@@ -46,6 +46,7 @@ export const RepositoriesSection: React.FC<RepositoriesSectionProps> = ({
       const repoName = r.repo_name || r.title || 'Unknown/Repo';
       const url = r.url || r.source_url || `https://github.com/${repoName}`;
       const stars = Number(r.stars || 0);
+      const starsPeriod = Number(r.stars_this_period || 0);
       const isNew = Boolean(r.is_new);
       const summary = r.summary || r.description || '';
       const directions: string[] = Array.isArray(r.directions) ? r.directions : [];
@@ -63,6 +64,7 @@ export const RepositoriesSection: React.FC<RepositoriesSectionProps> = ({
         repo_name: repoName,
         url,
         stars,
+        stars_this_period: starsPeriod,
         is_new: isNew,
         summary,
         directions,
@@ -142,7 +144,9 @@ export const RepositoriesSection: React.FC<RepositoriesSectionProps> = ({
   // Сортировка
   const sortedRepos = useMemo(() => {
     const list = [...filteredRepos];
-    if (sortBy === 'stars') {
+    if (sortBy === 'trending') {
+      list.sort((a, b) => (a.rowid || 0) - (b.rowid || 0));
+    } else if (sortBy === 'stars') {
       list.sort((a, b) => b.stars - a.stars);
     } else if (sortBy === 'newest') {
       list.sort((a, b) => (b.rowid || 0) - (a.rowid || 0));
@@ -332,8 +336,9 @@ export const RepositoriesSection: React.FC<RepositoriesSectionProps> = ({
               onChange={(e) => setSortBy(e.target.value as any)}
               className="w-full px-3 py-2 text-sm rounded-lg bg-[#0A0A0F] border border-[#2D1B4E] text-white focus:border-purple-500 focus:outline-none"
             >
-              <option value="stars">Сортировка: по звёздам (Stars)</option>
-              <option value="newest">Сортировка: сначала новые</option>
+              <option value="trending">Позиция в тренде (GitHub Trending)</option>
+              <option value="stars">Сортировка: по звёздам (всего)</option>
+              <option value="newest">Сортировка: сначала новые в базе</option>
               <option value="name">Сортировка: по имени (A-Z)</option>
             </select>
           </div>
@@ -465,9 +470,14 @@ export const RepositoriesSection: React.FC<RepositoriesSectionProps> = ({
 
                   {/* Звёзды */}
                   {repo.stars > 0 && (
-                    <span className="text-[11px] font-bold px-2.5 py-0.5 rounded-md bg-amber-950/60 text-amber-300 border border-amber-600/50 flex items-center gap-1">
+                    <span className="text-[11px] font-bold px-2.5 py-0.5 rounded-md bg-amber-950/60 text-amber-300 border border-amber-600/50 flex items-center gap-1.5">
                       <Star className="w-3 h-3 fill-amber-400 text-amber-400" />
-                      {repo.stars.toLocaleString()}
+                      <span>{repo.stars.toLocaleString()}</span>
+                      {repo.stars_this_period > 0 && (
+                        <span className="text-amber-400/90 font-medium">
+                          (+{repo.stars_this_period.toLocaleString()} {repo.period === 'monthly' || repo.period === 'month' ? 'в месяц' : 'в нед.'})
+                        </span>
+                      )}
                     </span>
                   )}
 

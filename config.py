@@ -1,48 +1,38 @@
 import os
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
 except ImportError:
     pass
 
-# --- Корень проекта и папка data/ ---
-# Всегда абсолютный путь к директории, где лежит этот файл (config.py).
-# Благодаря этому DB и логи создаются в правильном месте независимо от CWD.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = os.path.join(BASE_DIR, "data")
 
-VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://192.168.10.65:8901/v1")
+VLLM_BASE_URL = os.getenv("VLLM_BASE_URL", "http://127.0.0.1:2233/v1")
 VLLM_MODEL_NAME = os.getenv("VLLM_MODEL_NAME", "Qwen/Qwen3.6-27B")
 VLLM_API_KEY = os.getenv("VLLM_API_KEY", "not-needed")
 
-# --- Дедупликация / векторы ---
 DUPLICATE_THRESHOLD = float(os.getenv("DUPLICATE_THRESHOLD", "0.59"))
 VECTOR_DIM = int(os.getenv("VECTOR_DIM", "384"))
 
+
 def _abs_data_path(env_var: str, default_name: str) -> str:
-    """
-    Читает путь из env-переменной.
-    - Абсолютный путь → используем как есть.
-    - Относительный (в т.ч. просто 'app_database.db') → кладём в DATA_DIR.
-    """
     raw = os.getenv(env_var, "")
     if not raw:
         return os.path.join(DATA_DIR, default_name)
     if os.path.isabs(raw):
         return raw
-    # Убираем возможный data/ префикс, чтобы не получить data/data/...
     basename = os.path.basename(raw)
     return os.path.join(DATA_DIR, basename)
 
-# --- Логирование ---
+
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
-LOG_FILE       = _abs_data_path("LOG_FILE",       "app.log")
+LOG_FILE = _abs_data_path("LOG_FILE", "app.log")
 ERROR_LOG_FILE = _abs_data_path("ERROR_LOG_FILE", "errors.log")
 
-# --- База данных ---
 DB_NAME = _abs_data_path("DB_NAME", "app_database.db")
 
-# --- Papers (HF Papers + Papers with Code) ---
 PWC_MCP_URL = os.getenv("PWC_MCP_URL", "https://gateway.pipeworx.io/paperswithcode/mcp")
 PWC_TRENDING_TOOL = os.getenv("PWC_TRENDING_TOOL", "trending_papers")
 PWC_DETAIL_TOOL = os.getenv("PWC_DETAIL_TOOL", "get_paper")
@@ -52,7 +42,6 @@ PAPERS_LIMIT_HF = int(os.getenv("PAPERS_LIMIT_HF", "30"))
 PAPERS_LIMIT_PWC = int(os.getenv("PAPERS_LIMIT_PWC", "30"))
 PAPERS_LIMIT = int(os.getenv("PAPERS_LIMIT", "60"))
 
-# --- GitHub & HuggingFace ---
 GITHUB_TRENDING_PERIODS = ["daily", "weekly", "monthly"]
 GITHUB_TRENDING_URLS = [
     "https://github.com/trending/python?since=weekly",
@@ -60,7 +49,6 @@ GITHUB_TRENDING_URLS = [
 ]
 GITHUB_TRENDING_LIMIT = 30
 
-# Фиксированные списки тегов согласно ТЗ
 GITHUB_DIRECTIONS = {
     "health_ai": "Медицинский AI, биомедицина, анализ медицинских данных",
     "cv": "Computer Vision, анализ изображений и видео",
@@ -97,7 +85,6 @@ GITHUB_MAX_TASK_TYPES = 3
 HF_DATASET_MODES = ["trending", "trending_ru"]
 HF_MODEL_MODES = ["trending", "trending_ru"]
 
-# Фиксированные списки тегов для моделей Hugging Face согласно ТЗ куратора
 HF_DIRECTIONS = {
     "health_ai": "Медицинский AI, биомедицина, анализ медицинских данных",
     "cv": "Computer Vision, анализ изображений и видео",
@@ -127,16 +114,8 @@ HF_TRENDING_URL_RU_1 = "https://huggingface.co/models?language=ru&sort=trending"
 HF_TRENDING_URL_RU_2 = "https://huggingface.co/models?language=rus&sort=trending"
 HF_TRENDING_LIMIT = 50
 
-# --- Связанные сущности датасета: статьи, модели, спейсы (ТЗ п.3.1-3.2) ---
-# Прямая ссылка на статью по arXiv ID из тегов; paperswithcode_id обрабатывается отдельно как ID датасета в Papers With Code.
 HF_PAPER_URL_TEMPLATE = "https://huggingface.co/papers/{arxiv_id}"
-# Топ-3 модели, обученные на датасете, отсортированные по downloads.
 HF_DATASET_MODELS_API = "https://huggingface.co/api/models?filter=dataset:{dataset_id}&sort=downloads&direction=-1&limit=3"
-# Готовый отфильтрованный каталог моделей на сайте HF (смарт-кнопка "Обученные модели").
-# ВАЖНО: значение параметра dataset должно идти с префиксом "dataset:" — без него сайт
-# воспринимает его как обычный тег и показывает 0 результатов (в ТЗ п.3.2 префикса нет — ошибка ТЗ).
 HF_DATASET_MODELS_CATALOG_URL = "https://huggingface.co/models?dataset=dataset:{dataset_id}&sort=trending"
-# Топ-3 спейса, использующих датасет.
 HF_DATASET_SPACES_API = "https://huggingface.co/api/spaces?filter=dataset:{dataset_id}&limit=3"
-# Каталог спейсов на сайте HF (смарт-кнопка "Спейсы").
 HF_DATASET_SPACES_CATALOG_URL = "https://huggingface.co/spaces?dataset={dataset_id}"

@@ -14,6 +14,7 @@ import config
 from agent_manager import (
     GitHubRepoCard,
     analyze_github_repo,
+    analyze_github_repo_async,
     get_model,
 )
 
@@ -40,62 +41,6 @@ def _get_proxy_url() -> str | None:
         proxy_url = f"http://{proxy_url}"
     return proxy_url
 
-
-# === 1. СХЕМА ДЛЯ ИИ-ОТБОРЩИКА (для обратной совместимости) ===
-class SelectionResult(BaseModel):
-    selected_ids: list[str] = Field(
-        description="Список id (до 5) отобранных репозиториев вида author/repo"
-    )
-
-
-class MockRunResult:
-    def __init__(self, output_data: SelectionResult):
-        self.output = output_data
-
-
-class MockAgent:
-    async def run(self, prompt: str) -> MockRunResult:
-        logger.info("[MOCK] Агент получил промпт. Имитация генерации ответа (1 сек)...")
-        await asyncio.sleep(1)
-
-        test_id = "test-author/test-repo"
-        try:
-            json_str = prompt.split("Кандидаты для анализа:\n")[-1]
-            candidates = json.loads(json_str)
-            if candidates:
-                test_id = candidates[0]["id"]
-        except Exception:
-            pass
-
-        mock_data = SelectionResult(selected_ids=[test_id])
-        return MockRunResult(mock_data)
-
-
-def _get_github_agent():
-    if IS_TEST_MODE:
-        return MockAgent()
-
-    try:
-        from pydantic_ai import Agent
-        return Agent(
-            model=get_model(),
-            output_type=SelectionResult,
-            system_prompt=(
-                "Ты — Senior Developer. Тебе дают JSON со списком набирающих "
-                "популярность репозиториев на GitHub (id, title, full_text).\n"
-                "ТВОЯ ЗАДАЧА: отбери до 5 самых перспективных и релевантных "
-                "тематике AI/ML проектов. Верни только список их id. Текст "
-                "описания менять, переводить или пересказывать не нужно — "
-                "он используется как есть, в оригинале."
-            ),
-        )
-    except Exception:
-        return MockAgent()
-
-
-# ==============================================================
-# ПАРСИНГ HTML TRENDING И README
-# ==============================================================
 
 def _parse_trending_html(html: str) -> list[dict]:
     """Парсит HTML-страницу трендов GitHub (article.Box-row)."""
@@ -238,9 +183,6 @@ async def fetch_repo_readme(repo_name: str) -> str:
     return ""
 
 
-# ==============================================================
-# ПОЛНЫЙ ПАЙПЛАЙН ТРЕНДОВ GITHUB (ТЗ СОЗВОНА)
-# ==============================================================
 
 async def fetch_top_trending_repos(limit: int = 30) -> list[dict]:
     """
@@ -330,8 +272,29 @@ async def run_github_trending_pipeline_async(limit: int = 30) -> list[dict]:
         # Шаг 2: Проверить, есть ли в базе каждый репозиторий
         existing = get_article_by_url(repo_url)
 
-        if existing:
-            # Репозиторий уже есть в базе — повторно в LLM не отправляем!
+        # Проверяем, является ли текущее описание заглушкой от упавшего LLM:
+        is_mock_summary = bool(
+            existing and (
+                "ориентирован на решение прикладных задач в области AI/ML и разработки на Python" in (existing.get("summary") or "")
+                or "Репозиторий полезен инженерам и дата-сайентистам" in (existing.get("summary") or "")
+            )
+        )
+
+        # Репозиторий считается новым, если он только что добавлен или добавлен недавно (< 72 ч)
+        is_recently_added = False
+        if existing and existing.get("created_at"):
+            try:
+                created_str = str(existing["created_at"]).strip()
+                if "T" in created_str:
+                    c_dt = datetime.fromisoformat(created_str.replace("Z", "+00:00"))
+                else:
+                    c_dt = datetime.strptime(created_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+                is_recently_added = (datetime.now(timezone.utc) - c_dt).total_seconds() < 72 * 3600
+            except Exception:
+                is_recently_added = False
+
+        if existing and not is_mock_summary:
+            # Репозиторий уже есть в базе с качественным LLM-описанием — повторно в LLM не отправляем!
             existing_count += 1
             logger.info(f"[{idx}/{len(trending_candidates)}] [УЖЕ В БАЗЕ (В ТРЕНДЕ)] {repo_id}")
             item = {
@@ -346,20 +309,21 @@ async def run_github_trending_pipeline_async(limit: int = 30) -> list[dict]:
                 "stars": stars_total or existing.get("stars", 0),
                 "stars_this_period": stars_period,
                 "period": period,
-                "is_new": False,
+                "is_new": is_recently_added,
             }
             trending_results.append(item)
         else:
-            # Новый репозиторий:
+            # Новый репозиторий или репозиторий со старой заглушкой:
             new_count += 1
-            logger.info(f"[{idx}/{len(trending_candidates)}] [НОВЫЙ] {repo_id} — парсинг README.md...")
+            action_label = "[ОБНОВЛЕНИЕ LLM-КАРТОЧКИ]" if (existing and is_mock_summary) else "[НОВЫЙ]"
+            logger.info(f"[{idx}/{len(trending_candidates)}] {action_label} {repo_id} — парсинг README.md...")
 
             # Шаг 3: Спарсить информацию из readme.md
             readme_text = await fetch_repo_readme(repo_id)
 
             # Шаг 4 и 5: Отправить запрос в Qwen и получить карточку
             logger.info(f"Отправка запроса в Qwen для карточки '{repo_id}'...")
-            card: GitHubRepoCard = analyze_github_repo(
+            card: GitHubRepoCard = await analyze_github_repo_async(
                 repo_name=repo_id,
                 readme_text=readme_text or repo.get("description", ""),
                 description=repo.get("description", ""),
@@ -442,7 +406,7 @@ def print_trending_summary(trending_results: list[dict], fetched_at: str | None 
         dirs = ", ".join(r.get("directions") or []) or "нет"
         tasks = ", ".join(r.get("task_types") or []) or "нет"
         tags = ", ".join(r.get("tags") or []) or "нет"
-        stars_info = f"⭐ {r.get('stars', 0)}"
+        stars_info = f"Stars: {r.get('stars', 0)}"
         if r.get("stars_this_period"):
             stars_info += f" (+{r['stars_this_period']} {r.get('period', '')})"
 
@@ -455,149 +419,6 @@ def print_trending_summary(trending_results: list[dict], fetched_at: str | None 
     print("\n" + "=" * 90 + "\n")
 
 
-
-# ==============================================================
-# ОБРАТНАЯ СОВМЕСТИМОСТЬ ДЛЯ СТАРЫХ ВЫЗОВОВ И ТЕСТОВ
-# ==============================================================
-
-async def select_via_llm(candidates: list[dict], limit: int = 30) -> list[dict]:
-    """Отбирает топ репозиториев через LLM (для обратной совместимости)."""
-    if not candidates:
-        return []
-
-    fresh_candidates = candidates[:limit]
-    candidates_by_id = {c["id"]: c for c in fresh_candidates}
-
-    def _build_payload(ids: list[str]) -> list[dict]:
-        result = []
-        for sid in ids:
-            original = candidates_by_id.get(sid)
-            if not original:
-                continue
-            item = {
-                "title": f"[GitHub] {original['title']}",
-                "text": original.get("full_text", ""),
-                "source_url": original["url"],
-            }
-            if original.get("stars_this_period") is not None:
-                item["stars_this_period"] = original["stars_this_period"]
-            result.append(item)
-        return result
-
-    llm_input = [
-        {"id": c["id"], "title": c["title"], "full_text": c["full_text"]}
-        for c in fresh_candidates
-    ]
-    prompt = "Кандидаты для анализа:\n" + json.dumps(llm_input, ensure_ascii=False)
-
-    try:
-        agent = _get_github_agent()
-        res = await agent.run(prompt)
-        selected_ids = list(dict.fromkeys(res.output.selected_ids))[:5]
-        return _build_payload(selected_ids)
-    except Exception:
-        return _build_payload(list(candidates_by_id.keys())[:5])
-
-
-async def fetch_github_trending(days_back: int = 10, limit: int = 50, language: str = "Python") -> list[dict]:
-    """Search API метод (для обратной совместимости)."""
-    import httpx
-    date_cutoff = (datetime.now(timezone.utc) - timedelta(days=days_back)).strftime('%Y-%m-%d')
-    query = f"created:>{date_cutoff}"
-    if language:
-        query += f" language:{language}"
-
-    url = "https://api.github.com/search/repositories"
-    params = {"q": query, "sort": "stars", "order": "desc", "per_page": limit}
-    headers = {"Accept": "application/vnd.github.v3+json"}
-    token = os.getenv("GITHUB_TOKEN")
-    if token:
-        headers["Authorization"] = f"token {token}"
-
-    try:
-        async with httpx.AsyncClient(timeout=15.0, trust_env=False, proxy=_get_proxy_url()) as client:
-            response = await client.get(url, params=params, headers=headers, follow_redirects=True)
-            if response.status_code == 200:
-                items = response.json().get("items", [])
-                candidates = []
-                for item in items:
-                    name = item.get("full_name")
-                    desc = item.get("description") or "Нет описания."
-                    stars = item.get("stargazers_count", 0)
-                    lang = item.get("language") or "Не указан"
-                    candidates.append({
-                        "id": name,
-                        "title": name,
-                        "full_text": f"Language: {lang} | Stars: {stars}\nDescription: {desc}",
-                        "url": item.get("html_url"),
-                    })
-                return candidates
-    except Exception as e:
-        logger.error(f"Search API error: {e}")
-    return []
-
-
-def filter_seen(candidates: list[dict], seen_ids: set[str]) -> list[dict]:
-    return [c for c in candidates if c["id"] not in seen_ids]
-
-
-def _repo_id_from_url(url: str) -> str:
-    return url.removeprefix("https://github.com/")
-
-
-def stream_github_articles(days_back: int = 10, limit: int = 50, language: str = "Python"):
-    async def _run():
-        cands = await fetch_github_trending(days_back, limit, language)
-        return await select_via_llm(cands)
-    for a in asyncio.run(_run()):
-        yield a
-
-
-def stream_github_articles_v2(days_back: int = 10, limit: int = 50, language: str = "Python",
-                              seen_ids: set[str] | None = None):
-    async def _run():
-        cands = await fetch_github_trending(days_back, limit, language)
-        if seen_ids is not None:
-            cands = filter_seen(cands, seen_ids)
-        selected = await select_via_llm(cands)
-        if seen_ids is not None:
-            seen_ids.update(_repo_id_from_url(a["source_url"]) for a in selected)
-        return selected
-    for a in asyncio.run(_run()):
-        yield a
-
-
-def stream_github_trending_page_articles(period: str, language: str = "python",
-                                         seen_ids: set[str] | None = None):
-    async def _run():
-        cands = await fetch_github_trending_page(period, language)
-        if seen_ids is not None:
-            cands = filter_seen(cands, seen_ids)
-        selected = await select_via_llm(cands)
-        if seen_ids is not None:
-            seen_ids.update(_repo_id_from_url(a["source_url"]) for a in selected)
-        return selected
-    for a in asyncio.run(_run()):
-        yield a
-
-
-def stream_github_trending_pipeline_articles(limit: int = 30):
-    """Генератор карточек актуального трендового списка для пайплайна."""
-    results = run_github_trending_pipeline(limit=limit)
-    for r in results:
-        yield {
-            "title": r.get("title") or f"[GitHub] {r['repo_name']}",
-            "summary": r["summary"],
-            "text": r["summary"],
-            "source_url": r["source_url"],
-            "tags": r.get("tags", []),
-            "directions": r.get("directions", []),
-            "task_types": r.get("task_types", []),
-            "source_type": "репозиторий",
-            "stars": r.get("stars", 0),
-            "period": r.get("period", ""),
-            "is_new": r.get("is_new", False),
-        }
 
 
 if __name__ == "__main__":

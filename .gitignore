@@ -8,5 +8,6 @@ errors.log
 *.db
 data/
 .embeddings_cache/
+.pytest_cache/
 run_all.pid
 hf-trending-mcp/

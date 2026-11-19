@@ -1,7 +1,7 @@
 import asyncio
 import pytest
 from unittest.mock import AsyncMock, patch
-from mcp_fetcher_kaggle import (
+from kaggle_fetcher import (
     _extract_tags,
     _extract_kernel_count,
     _extract_vote_count,
@@ -72,7 +72,7 @@ def test_selection_result_schema():
 
 def test_fetch_trending_kaggle_datasets_mocked():
     async def _test():
-        with patch("mcp_fetcher_kaggle._collect_trending_dataset_candidates", new_callable=AsyncMock) as mock_collect:
+        with patch("kaggle_fetcher._collect_trending_dataset_candidates", new_callable=AsyncMock) as mock_collect:
             mock_collect.return_value = [
                 {
                     "id": "dataset:testuser/test-dataset",

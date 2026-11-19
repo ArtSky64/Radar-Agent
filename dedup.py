@@ -1,11 +1,9 @@
-# в этом файле хранятся функции инструменты, в дальнейшем используемые test_dedup.py, это нужно чтобы банально не нагромождать их в main.py
 import atexit
 import hashlib
 import json
 import logging
 import math
 import os
-import struct
 import threading
 import uuid
 from pathlib import Path
@@ -16,29 +14,22 @@ import database
 
 logger = logging.getLogger("dedup")
 
+
 def serialize_float32(vector: list[float]) -> bytes:
-    """Сериализует вектор в байты float32 для передачи в sqlite-vec."""
     return database.serialize_float32(vector)
+
 
 CACHE_DIR = Path(__file__).parent / ".embeddings_cache"
 CACHE_FILE = CACHE_DIR / "cache.json"
 
-# Потокобезопасный лок для предотвращения гонок внутри одного процесса
 _CACHE_LOCK = threading.Lock()
-
-# Модель грузится лениво (только при первом реальном вызове text_to_vector),
-# чтобы просто импортировать dedup.py (например, в тестах на цельность
-# косинусного сходства) не тянуло за собой загрузку модели в память.
 _model = None
-
-# In-memory кэш эмбеддингов, подгружается с диска при первом обращении.
 _cache: dict | None = None
 _unsaved_updates_count: int = 0
 _CACHE_FLUSH_INTERVAL: int = 30
 
 
 def flush_embeddings_cache() -> None:
-    """Сбрасывает накопленный кэш эмбеддингов на диск."""
     global _unsaved_updates_count, _cache
     with _CACHE_LOCK:
         if _cache is not None and _unsaved_updates_count > 0:
@@ -50,26 +41,13 @@ atexit.register(flush_embeddings_cache)
 
 
 def _get_model():
-    """
-    Ленивая инициализация модели эмбеддингов.
-    Используем fastembed (ONNX Runtime) вместо sentence-transformers —
-    та тянет за собой torch, а torch на PyPI по умолчанию тащит ещё и
-    CUDA-библиотеки для GPU (гигабайты веса), которые на CPU-only
-    машине не нужны и только рвут скачивание на нестабильной сети.
-
-    Модель sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2:
-    384-мерные векторы (совпадает с VECTOR_DIM), поддерживает русский
-    язык (мультиязычная, ~50 языков), работает полностью локально
-    после первого скачивания весов.
-    """
     global _model
     if _model is None:
         from fastembed import TextEmbedding
-        logger.info("Загружаю модель эмбеддингов paraphrase-multilingual-MiniLM-L12-v2...")
+        logger.info("Загрузка модели эмбеддингов paraphrase-multilingual-MiniLM-L12-v2...")
         _model = TextEmbedding(
             model_name="sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
         )
-        logger.info("Модель эмбеддингов загружена.")
     return _model
 
 
@@ -90,12 +68,6 @@ def _load_cache() -> dict:
 
 
 def _save_cache(cache: dict) -> None:
-    """
-    Безопасное атомарное сохранение кэша на диск.
-    Использует уникальный временный файл с PID и UUID,
-    чтобы исключить состояние гонки (race condition) между
-    фоновым пайплайном сбора и FastAPI API сервисом.
-    """
     tmp_file = None
     try:
         CACHE_DIR.mkdir(parents=True, exist_ok=True)
@@ -117,14 +89,6 @@ def _save_cache(cache: dict) -> None:
 
 
 def text_to_vector(text: str) -> list[float]:
-    """
-    Реальный эмбеддинг текста через fastembed.
-    Возвращает список float32 размерности config.VECTOR_DIM (без numpy).
-
-    Результат кэшируется на диск по sha256-хэшу текста — если статья
-    уже встречалась (тот же текст), эмбеддинг не пересчитывается заново,
-    а берётся из кэша.
-    """
     global _cache
     with _CACHE_LOCK:
         if _cache is None:
@@ -153,13 +117,6 @@ def text_to_vector(text: str) -> list[float]:
 
 
 def batch_texts_to_vectors(texts: list[str]) -> list[list[float]]:
-    """
-    Высокопроизводительная пакетная векторизация списка текстов:
-    - Проверяет кэш в памяти.
-    - Для отсутствующих текстов выполняет model.embed(..., batch_size=64) в ОДИН проход.
-    - Сохраняет кэш на диск ОДИН раз за весь пакет, а не на каждом элементе.
-    Возвращает список векторов list[float] (без numpy).
-    """
     if not texts:
         return []
 
@@ -201,7 +158,6 @@ def batch_texts_to_vectors(texts: list[str]) -> list[list[float]]:
 
 
 def cosine_similarity(a: list[float] | Any, b: list[float] | Any) -> float:
-    """Вычисляет косинусное сходство между двумя векторами (чистый Python, без numpy)."""
     if hasattr(a, "tolist"):
         a = a.tolist()
     if hasattr(b, "tolist"):
@@ -216,10 +172,6 @@ def cosine_similarity(a: list[float] | Any, b: list[float] | Any) -> float:
 
 
 def is_duplicate(new_vector: list[float] | Any, memory_vectors: list[list[float] | Any] | None = None) -> bool:
-    """
-    Сравнивает new_vector с векторами в памяти,
-    либо напрямую проверяет через sqlite-vec в базе данных.
-    """
     if memory_vectors:
         for vec in memory_vectors:
             if cosine_similarity(new_vector, vec) >= config.DUPLICATE_THRESHOLD:

@@ -192,9 +192,6 @@ def normalize_arxiv_id(raw_id: str) -> str:
     return text.strip("/")
 
 
-# ==========================================
-# 1. HUGGING FACE PAPERS (REST API)
-# ==========================================
 
 async def fetch_hf_daily_papers_for_date(client: httpx.AsyncClient | None, date_str: str) -> list[dict]:
     """
@@ -395,9 +392,6 @@ async def fetch_hf_paper_details(arxiv_id: str, client: httpx.AsyncClient | None
     return {}
 
 
-# ==========================================
-# 2. PAPERS WITH CODE (MCP STREAMABLE HTTP)
-# ==========================================
 
 def _safe_parse_mcp_output(raw: str):
     """Парсинг JSON/Python-литерала из ответа тула MCP."""
@@ -547,9 +541,6 @@ async def fetch_pwc_trending(days: int = config.PAPERS_WINDOW_DAYS) -> list[dict
         return await _inspect_and_call_trending(session, days)
 
 
-# ==========================================
-# 3. ТЕМАТИЧЕСКИЕ СРЕЗЫ (ТЗ 1.4)
-# ==========================================
 
 def _is_valid_topic_paper(slug: str, title: str, abstract: str) -> bool:
     """Проверяет релевантность статьи выбранной медицинской/биологической теме и отсекает стоп-слова."""
@@ -724,9 +715,6 @@ async def fetch_papers_by_topic(slug: str, session: ClientSession | None = None)
     return await _fetch_hf_papers_by_query(slug, limit=50)
 
 
-# ==========================================
-# 4. СЛИЯНИЕ, РАНЖИРОВАНИЕ, ДООБОГАЩЕНИЕ
-# ==========================================
 
 def merge_papers(*lists_of_papers) -> list[dict]:
     """
@@ -878,11 +866,6 @@ def _rank_balanced(
     return list(final_dict.values())
 
 
-def _rank(papers: list[dict], limit: int = config.PAPERS_LIMIT) -> list[dict]:
-    """Fallback-ранжирование по upvotes."""
-    return sorted(papers, key=lambda x: x.get("upvotes", 0), reverse=True)[:limit]
-
-
 async def _fill_missing_abstracts(papers: list[dict], session: ClientSession | None = None) -> list[dict]:
     """
     ТЗ 1.2: Точечное докачивание абстрактов для топ-N кандидатов (параллельно через Semaphore).
@@ -994,9 +977,6 @@ async def _enrich_related_links(papers: list[dict], session: ClientSession | Non
     return papers
 
 
-# ==========================================
-# 5. ГЛАВНЫЙ АСИНХРОННЫЙ ПАЙПЛАЙН И ГЕНЕРАТОР
-# ==========================================
 
 async def fetch_papers_pipeline(
     days: int = config.PAPERS_WINDOW_DAYS,

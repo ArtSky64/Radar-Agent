@@ -1,3 +1,5 @@
+import asyncio
+import concurrent.futures
 import logging
 import os
 import re
@@ -5,6 +7,7 @@ import threading
 import time
 
 import httpx
+from openai import AsyncOpenAI
 from pydantic import BaseModel, Field
 from pydantic_ai import Agent
 from pydantic_ai.models.openai import OpenAIChatModel
@@ -20,10 +23,6 @@ from tenacity import (
 import config
 
 logger = logging.getLogger("agent_manager")
-
-import asyncio
-import concurrent.futures
-import threading
 
 _RATE_LIMIT_LOCK = threading.Lock()
 _last_call_ts = 0.0
@@ -43,6 +42,9 @@ def _throttle() -> None:
         _last_call_ts = time.monotonic()
 
 
+_AGENT_SYNC_POOL = concurrent.futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="agent_sync")
+
+
 def _safe_run_agent_sync(agent: Agent, prompt: str):
     """
     Безопасно запускает agent.run_sync:
@@ -55,8 +57,7 @@ def _safe_run_agent_sync(agent: Agent, prompt: str):
         loop = None
 
     if loop is not None and loop.is_running():
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            return pool.submit(agent.run_sync, prompt).result()
+        return _AGENT_SYNC_POOL.submit(agent.run_sync, prompt).result()
     else:
         return agent.run_sync(prompt)
 
@@ -81,14 +82,14 @@ def get_model() -> OpenAIChatModel:
             "VLLM_BASE_URL не найден. Создай файл .env на основе .env.example "
             "и укажи там адрес своего vLLM (например, http://127.0.0.1:2233/v1)."
         )
-    http_client = httpx.AsyncClient(timeout=180.0)
+    client = AsyncOpenAI(
+        base_url=config.VLLM_BASE_URL,
+        api_key=config.VLLM_API_KEY or "dummy",
+        timeout=180.0,
+    )
     return OpenAIChatModel(
         config.VLLM_MODEL_NAME,
-        provider=OpenAIProvider(
-            base_url=config.VLLM_BASE_URL,
-            api_key=config.VLLM_API_KEY,
-            http_client=http_client,
-        ),
+        provider=OpenAIProvider(openai_client=client),
     )
 
 
@@ -122,10 +123,6 @@ def _is_retryable_error(exception: BaseException) -> bool:
     return "429" in text or "rate limit" in text
 
 
-# Оставлено для обратной совместимости (использовалось в старых импортах).
-_is_rate_limit_error = _is_retryable_error
-
-
 @retry(
     retry=retry_if_exception(_is_retryable_error),
     stop=stop_after_attempt(7),
@@ -136,7 +133,7 @@ _is_rate_limit_error = _is_retryable_error
 def _call_agent(prompt: str):
     """Внутренний вызов агента с retry+backoff только на 429 (rate limit)."""
     _throttle()
-    return _get_article_agent().run_sync(prompt)
+    return _safe_run_agent_sync(_get_article_agent(), prompt)
 
 
 class LeaderboardAnalysis(BaseModel):
@@ -183,7 +180,7 @@ def _get_leaderboard_agent() -> Agent:
 )
 def _call_leaderboard_agent(prompt: str):
     _throttle()
-    return _get_leaderboard_agent().run_sync(prompt)
+    return _safe_run_agent_sync(_get_leaderboard_agent(), prompt)
 
 
 def _format_snapshot(snapshot: dict | None, top_k: int = 5) -> str:
@@ -232,13 +229,13 @@ def _mock_leaderboard_analysis(current_snapshot: dict, previous_snapshot: dict |
     )
 
     trends = [
-        f"🎯 Для веб-разработки и кодинга (Webdev): Лидер — {webdev_leader} ({webdev_rating} Elo). Подходит для сквозной разработки сервисов, рефакторинга монолитов, исправления багов и генерации сложного фронтенд/бэкенд стека.",
-        f"🤖 Для автономных ИИ-агентов (Agent & Tools): Лидер — {agent_leader}. Наиболее надежна в удержании инструкций, многошаговом планировании и безошибочном вызове внешних API (Function Calling).",
-        f"🧠 Для сложных рассуждений и аналитики (Reasoning): Лидер — {text_leader} ({text_rating} Elo). Лучший выбор для глубокого логического вывода, математических доказательств, анализа научных статей и синтеза данных.",
-        f"👁️ Для визуального анализа и документов (Vision & Document): Лидер — {vision_leader} ({vision_rating} Elo). Максимальная точность распознавания плотных PDF, таблиц, финансовых отчетов и инженерных схем.",
-        f"🎬 Для медиагенерации (Video & Image): Лидеры — {video_leader} (видео) и {image_leader} (изображения). Кинематографическая детализация, стабильная физика движения и точное следование композиции.",
-        "⚡ Открытые веса для локального инференса (Open-Weights): Семейства MiMo-V2.6-Pro, GLM-4.7 и DeepSeek-V4 показывают уровень ведущих коммерческих моделей и готовы для автономного развертывания через vLLM/Ollama без передачи данных в сторонние облака.",
-        "💡 Практическая рекомендация: Для разработки и продакшен-кода оптимальна связка Claude Opus / GPT, для аналитики и глубоких рассуждений — передовые reasoning-модели, а для приватных контуров предприятия — открытые веса MiMo/GLM/DeepSeek."
+        f"Для веб-разработки и кодинга (Webdev): Лидер — {webdev_leader} ({webdev_rating} Elo). Подходит для сквозной разработки сервисов, рефакторинга монолитов, исправления багов и генерации сложного фронтенд/бэкенд стека.",
+        f"Для автономных ИИ-агентов (Agent & Tools): Лидер — {agent_leader}. Наиболее надежна в удержании инструкций, многошаговом планировании и безошибочном вызове внешних API (Function Calling).",
+        f"Для сложных рассуждений и аналитики (Reasoning): Лидер — {text_leader} ({text_rating} Elo). Лучший выбор для глубокого логического вывода, математических доказательств, анализа научных статей и синтеза данных.",
+        f"Для визуального анализа и документов (Vision & Document): Лидер — {vision_leader} ({vision_rating} Elo). Максимальная точность распознавания плотных PDF, таблиц, финансовых отчетов и инженерных схем.",
+        f"Для медиагенерации (Video & Image): Лидеры — {video_leader} (видео) и {image_leader} (изображения). Кинематографическая детализация, стабильная физика движения и точное следование композиции.",
+        "Открытые веса для локального инференса (Open-Weights): Семейства MiMo-V2.6-Pro, GLM-4.7 и DeepSeek-V4 показывают уровень ведущих коммерческих моделей и готовы для автономного развертывания через vLLM/Ollama без передачи данных в сторонние облака.",
+        "Практическая рекомендация: Для разработки и продакшен-кода оптимальна связка Claude Opus / GPT, для аналитики и глубоких рассуждений — передовые reasoning-модели, а для приватных контуров предприятия — открытые веса MiMo/GLM/DeepSeek.",
     ]
 
     return LeaderboardAnalysis(summary=summary, trends=trends)
@@ -267,64 +264,6 @@ def analyze_leaderboard(
     except Exception as e:
         logger.warning(f"vLLM недоступен для анализа лидерборда ({e}). Применяем автоматический аналитический фоллбэк.")
         return _mock_leaderboard_analysis(current_snapshot, previous_snapshot)
-
-
-def generate_arena_model_summary(
-    name: str,
-    org: str = "",
-    category: str = "",
-    rating: float = 0.0,
-    license_str: str = "",
-    vote_count: int = 0
-) -> str:
-    """Генерирует структурированное описание (breakdown) модели лидерборда Arena."""
-    try:
-        from arena_scraper import generate_model_breakdown
-        return generate_model_breakdown(
-            name=name,
-            org=org,
-            category=category,
-            rating=rating,
-            license_str=license_str,
-            vote_count=vote_count
-        )
-    except Exception:
-        org_title = org or "ведущей AI-лаборатории"
-        return f"Модель от {org_title} для глубоких логических рассуждений, анализа сложного контекста и прикладных задач."
-
-
-class TrendingModelSummary(BaseModel):
-    """Короткое саммари для карточки трендовой модели HF."""
-    summary: str = Field(description="1-2 предложения о том, что это за модель и для чего она нужна")
-
-
-TRENDING_MODEL_SYSTEM_PROMPT = """
-Ты — эксперт по машинному обучению. Тебе дают название модели с Hugging Face,
-её теги (архитектура, задача, библиотека и т.п.) и выдержку из её карточки (README).
-Твоя задача — кратко (1-2 предложения) объяснить на русском языке, что это
-за модель и для чего она обычно используется. Выделяй главное.
-Отвечай строго по существу, без лишнего текста.
-"""
-
-
-def _get_trending_model_agent() -> Agent:
-    return Agent(
-        model=get_model(),
-        output_type=TrendingModelSummary,
-        system_prompt=TRENDING_MODEL_SYSTEM_PROMPT,
-    )
-
-
-@retry(
-    retry=retry_if_exception(_is_retryable_error),
-    stop=stop_after_attempt(7),
-    wait=wait_exponential(multiplier=1, min=1, max=60),
-    before_sleep=before_sleep_log(logger, logging.WARNING),
-    reraise=True,
-)
-def _call_trending_model_agent(prompt: str):
-    _throttle()
-    return _get_trending_model_agent().run_sync(prompt)
 
 
 class HFModelCard(BaseModel):
@@ -605,25 +544,6 @@ async def analyze_hf_model_async(
 
 
 
-def summarize_trending_model(name: str, tags: list[str], card_description: str = "") -> str:
-    """
-    Генерирует короткое саммари для трендовой модели HF по названию, тегам и карточке.
-    """
-    try:
-        card = analyze_hf_model(name, tags=tags, card_description=card_description)
-        return card.summary
-    except Exception:
-        tags_str = ", ".join(tags) if tags else "(теги отсутствуют)"
-        prompt = f"Название модели: {name}\nТеги: {tags_str}\n\nОписание карточки:\n{card_description[:2500]}"
-        try:
-            result = _call_trending_model_agent(prompt)
-            return result.output.summary
-        except Exception as e:
-            logger.error(f"Ошибка саммари трендовой модели '{name}': {e!r}")
-            return f"Модель {name} для задач машинного обучения."
-
-
-
 def analyze_article(title: str, text: str) -> ArticleAnalysis:
     """
     Синхронная обертка над агентом.
@@ -731,7 +651,19 @@ def _get_github_repo_agent() -> Agent:
 )
 def _call_github_repo_agent(prompt: str):
     _throttle()
-    return _get_github_repo_agent().run_sync(prompt)
+    return _safe_run_agent_sync(_get_github_repo_agent(), prompt)
+
+
+@retry(
+    retry=retry_if_exception(_is_retryable_error),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=1, max=30),
+    before_sleep=before_sleep_log(logger, logging.WARNING),
+    reraise=True,
+)
+async def _call_github_repo_agent_async(prompt: str):
+    _throttle()
+    return await _get_github_repo_agent().run(prompt)
 
 
 def sanitize_repo_card(card: GitHubRepoCard) -> GitHubRepoCard:
@@ -797,7 +729,7 @@ def _mock_github_repo_card(repo_name: str, readme_text: str, description: str = 
 
 def analyze_github_repo(repo_name: str, readme_text: str, description: str = "") -> GitHubRepoCard:
     """
-    Анализирует репозиторий GitHub через Qwen / PydanticAI.
+    Анализирует репозиторий GitHub через Qwen / PydanticAI (синхронно).
     Возвращает карточку с 3-4 предложениями описания, тегами, 0-4 направлениями и 0-3 типами задач.
     При недоступности LLM возвращает качественный эвристический фолбэк.
     """
@@ -808,6 +740,25 @@ def analyze_github_repo(repo_name: str, readme_text: str, description: str = "")
     )
     try:
         result = _call_github_repo_agent(prompt)
+        return sanitize_repo_card(result.output)
+    except Exception as e:
+        logger.warning(f"LLM-анализ недоступен для '{repo_name}' ({type(e).__name__}: {e}). Используем фолбэк-карточку.")
+        return _mock_github_repo_card(repo_name, readme_text, description)
+
+
+async def analyze_github_repo_async(repo_name: str, readme_text: str, description: str = "") -> GitHubRepoCard:
+    """
+    Асинхронный анализ репозитория GitHub через Qwen / PydanticAI для работы в корутинах.
+    Возвращает карточку с 3-4 предложениями описания, тегами, 0-4 направлениями и 0-3 типами задач.
+    При недоступности LLM возвращает качественный эвристический фолбэк.
+    """
+    prompt = (
+        f"Репозиторий: {repo_name}\n"
+        f"Краткое описание GitHub: {description or '(нет)'}\n\n"
+        f"Выдержка из README.md:\n{readme_text[:4000]}"
+    )
+    try:
+        result = await _call_github_repo_agent_async(prompt)
         return sanitize_repo_card(result.output)
     except Exception as e:
         logger.warning(f"LLM-анализ недоступен для '{repo_name}' ({type(e).__name__}: {e}). Используем фолбэк-карточку.")

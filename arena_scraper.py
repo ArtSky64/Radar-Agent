@@ -388,60 +388,6 @@ def save_to_db(data: dict) -> None:
     print("[АНАЛИЗ] Готово.")
 
 
-def format_cat_plural(n: int) -> str:
-    """Склонение слова 'категория' в русском языке."""
-    if 11 <= n % 100 <= 14:
-        return "категорий"
-    last = n % 10
-    if last == 1:
-        return "категория"
-    if 2 <= last <= 4:
-        return "категории"
-    return "категорий"
-
-
-def aggregate_all_categories(records: list[dict], method: str = "avg") -> list[dict]:
-    """
-    Агрегация «Все категории» лидерборда Arena.
-    Группирует записи по model_name и вычисляет средний или максимальный рейтинг.
-    """
-    by_model = defaultdict(list)
-    for r in records:
-        name = (r.get("model_name") or "").strip()
-        if name:
-            by_model[name].append(r)
-
-    aggregated = []
-    for name, rows in by_model.items():
-        valid_ratings = []
-        for r in rows:
-            val = r.get("rating")
-            try:
-                valid_ratings.append(float(val))
-            except (ValueError, TypeError):
-                pass
-
-        if not valid_ratings:
-            continue
-
-        if method == "max":
-            chosen_rating = max(valid_ratings)
-        else:
-            chosen_rating = round(sum(valid_ratings) / len(valid_ratings), 1)
-
-        cats = sorted({r.get("category", "") for r in rows if r.get("category")})
-        aggregated.append({
-            "model_name": name,
-            "rating": chosen_rating,
-            "categories": cats,
-            "category": f"{len(cats)} {format_cat_plural(len(cats))}",
-            "is_aggregated": True,
-        })
-
-    aggregated.sort(key=lambda x: x["rating"], reverse=True)
-    return aggregated
-
-
 def main():
     print("Запуск сбора лидерборда LMSYS Arena (через Hugging Face)...")
     data = collect_all_categories()
